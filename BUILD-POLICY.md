@@ -31,6 +31,9 @@ Install these before any development work. This section exists so a new machine 
 - Stylelint with `stylelint-config-standard` (per-project devDependency) -- CSS structural validation (duplicate selectors, deprecated properties)
 - Semgrep (`brew install semgrep`) -- static application security testing
 - Socket CLI (`npm install -g @socketsecurity/cli`) -- supply chain security
+- Gitleaks (per-project devDependency) -- secret scanning (API keys, tokens, passwords in git history)
+- license-checker (per-project devDependency) -- production dependency license compliance (fail on GPL/AGPL)
+- Husky (per-project devDependency) -- git hooks (pre-commit runs validate + secrets)
 
 ### AI Tools
 
@@ -42,6 +45,7 @@ Install these before any development work. This section exists so a new machine 
 
 - `~/.npmrc`: set `min-release-age=1` (blocks packages published <24h ago)
 - Socket wrapper: `socket wrapper on` (auto-scans every `npm install`)
+- GitHub Actions: CI workflow for automated quality gates on push and PR
 
 ---
 
@@ -63,11 +67,11 @@ AI tools should apply this automatically when launching agents -- use the lighte
 
 These apply across the entire workflow, not to any single phase.
 
-**Cross-project learning.** When a gap, fix, or improvement is discovered in one project (e.g. a missing `dependabot.yml`, a better script configuration, a security pattern), do not apply it only to that project. Update the shared standard so all projects benefit. Flag the change to the developer. One project's fix is every project's fix.
+**Cross-project learning.** When a gap, fix, or improvement is discovered in one project (e.g. a missing `dependabot.yml`, a better script configuration, a security pattern), do not apply it only to that project. Update the shared standard so all projects benefit. One project's fix is every project's fix.
 
-**App icons.** Every app must have its icon set up correctly. Electron apps: `build/icon.png` (512x512 PNG, electron-builder converts to `.icns`). PM2/web apps: PWA icon set in `public/` with `manifest.json`.
+**App icons.** Every app must have its icon set up correctly. Electron apps: `build/icon.png` (512x512 PNG, electron-builder converts to `.icns`). Web apps: PWA icon set in `public/` with `manifest.json`. Generate from your brand asset.
 
-**Marketing site dependency.** When any commercial or public app ships a new version, changes features, or updates its changelog, the marketing/portfolio site must also be updated. An app release is not complete until the public-facing site reflects it.
+**Marketing site dependency.** When any commercial or public app ships a new version, changes features, or updates its changelog, the marketing/portfolio site must also be updated: version info, changelog, app listing. An app release is not complete until the public-facing site reflects it.
 
 ---
 
@@ -127,11 +131,17 @@ Forty-three steps across eight phases. Each step is numbered for reference. Step
 | 19 | Format check | `prettier --check .` | Yes |
 | 20 | SAST scan | `semgrep scan --config auto` | Yes |
 | 21 | Dependency audit | `npm audit --audit-level=high` | Yes |
+| 21a | Secret scanning | `npm run secrets` | Yes |
+| 21b | License compliance | `npm run licenses` | Yes |
 | 22 | Build | `vite build` (or equivalent) | Yes |
 | 23 | Smoke tests | `npm run test:smoke` | Yes (requires running server) |
 | 24 | Integration tests | `npm run test:integration` | Yes (commercial/complex apps) |
 
-Projects should wire steps 17--22 into a single command: `npm run quality`. Steps 23--24 run separately as they require a running server.
+Projects should wire steps 17--21b into a single command: `npm run quality`. Steps 22--24 run separately as they require a build or running server.
+
+**Pre-commit enforcement:** Husky runs `npm run validate && npm run secrets` before every commit -- the fast checks (lint, HTML/CSS validation, format, type-check, secret scan). The full `npm run quality` pipeline (including SAST and npm audit) runs manually before commit or in CI.
+
+**CI as safety net:** GitHub Actions runs a subset of the quality gates (steps 17--19, 21, 21b) on every push and PR, plus `gitleaks-action` for secret scanning. Tools that require local binaries (Semgrep SAST) and tests that need a running server (smoke/integration) run locally only. See `project-standards.md` for the exact CI template and what-runs-where table.
 
 **Any AI tool or human can run these.** They are CLI commands.
 
@@ -145,13 +155,13 @@ Projects should wire steps 17--22 into a single command: `npm run quality`. Step
 
 **Smoke tests are non-destructive** -- they only read from the live server. Integration tests run against an isolated server instance with a temporary data directory, so they cannot touch production data under any circumstances.
 
-**Integration tests MUST be isolated from production data.** The test harness starts a separate server instance on a dedicated port with a temporary data directory. Production data is never read, modified, or at risk. This is a hard requirement learned from a real incident where test cleanup accidentally deleted user data.
+**Integration tests MUST be isolated from production data.** The test harness starts a separate server instance on a dedicated port with a temporary data directory. Production data is never read, modified, or at risk. This is a hard requirement to prevent accidental data loss.
 
 ### Phase 5 -- Review
 
 | # | Step | Mandatory | Who |
 |---|---|---|---|
-| 25 | AI code review on all changes. Address all critical and high-severity findings. | Yes | AI review tool |
+| 25 | AI code review on all changes. Address all critical and high-severity findings. | Yes | Code review tool |
 | 26 | Security review for changes touching auth, data handling, payment, CORS/CSP, or secret storage. | Yes (security areas) | AI tool + developer |
 | 27 | Developer review -- verify the change locally, test in the UI, confirm it does what it should. | Yes | Developer |
 
@@ -167,7 +177,7 @@ Projects should wire steps 17--22 into a single command: `npm run quality`. Step
 | 29 | Update `README.md` if the change affects setup instructions, features, usage, configuration, or dependencies. | Yes (when relevant) | AI tool |
 | 30 | Verify semver -- check last-released version before choosing a bump. Follow semver strictly. Bump the version in `package.json` (and any other version references) when preparing a release. | Yes (releases) | AI tool + developer |
 | 31 | Conventional commit: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:` | Yes | Developer (AI prepares, human commits) |
-| 32 | Feature branch: `{username}/{issue-id}-{short-description}` | Yes | AI tool or developer |
+| 32 | Feature branch: `your-username/{issue-id}-{short-description}` | Yes | AI tool or developer |
 | 33 | Update issue tracker -- comment with implementation summary, update status. | Per-project | AI tool |
 
 **Important:** The developer is the one who commits. The AI prepares the changes, runs quality gates, and presents the diff for review. The developer reviews and commits after confirming the changes are correct. This is the human gate.
@@ -184,7 +194,7 @@ Projects should wire steps 17--22 into a single command: `npm run quality`. Step
 | 35 | **Stale build detection:** compare source mtimes against `.last-build`. Show warning banner if source files are newer than last build. | Automatic | System |
 | 36 | **Electron apps:** `npm run electron:build` -- builds renderer, signs with Developer ID, notarizes with Apple, outputs DMG. Only run after all changes are committed and quality gates have passed. | Yes (Electron) | AI tool or developer |
 | 37 | **Verify signing:** `codesign --verify --deep --strict` on the built `.app` bundle. | Yes (Electron) | AI tool or developer |
-| 38 | **Distribution** (commercial apps) -- upload release to distribution platform. | Yes (commercial) | Developer |
+| 38 | **Distribution** (commercial apps) -- upload release to your distribution platform (e.g. app store, Gumroad). | Yes (commercial) | Developer |
 | 39 | **Update marketing site** -- for any commercial or public app release: update version info, changelog, and listing/description if features changed. An app release is not complete until the public-facing site reflects it. | Yes (commercial/public) | AI tool + developer |
 
 ### Phase 8 -- Maintenance
@@ -195,7 +205,7 @@ Projects should wire steps 17--22 into a single command: `npm run quality`. Step
 |---|---|---|---|
 | 40 | **Review GitHub issues** -- check open issues on each project repo. Triage: label, prioritise, close stale issues, and schedule work for valid bugs or feature requests. | Yes | Developer + AI tool |
 | 41 | **Review Dependabot PRs** -- check each project for open Dependabot dependency update PRs. Dependabot is configured to only open PRs for minor and patch bumps (major version bumps are ignored -- handle those as planned work). For each PR: review the change on GitHub, pull the branch locally, run supply chain security scan, and merge only if clean. | Yes | Developer + AI tool |
-| 42 | **Review infrastructure alerts** -- for cloud/SaaS projects: check for automated PRs and dashboard alerts (security, performance, billing). | Yes (cloud apps) | Developer + AI tool |
+| 42 | **Review infrastructure alerts** -- for cloud/SaaS projects deployed on a platform (e.g. Cloudflare, Vercel, AWS): check for automated PRs (platform updates) and review dashboard alerts (security, performance, billing). | Yes (cloud apps) | Developer + AI tool |
 | 43 | **Dependency health check** -- run `npm audit` and supply chain scan across all active projects. Address any new high or critical vulnerabilities. | Yes | AI tool or developer |
 
 **Multi-tool usage:** Maintenance triage is well-suited to secondary AI tools -- reviewing PRs, checking issue lists, and running scans are well-scoped tasks that don't require deep architectural context.

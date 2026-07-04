@@ -260,6 +260,19 @@ npm run sast        # semgrep scan --config auto
 - Config: extend `stylelint-config-standard`, suppress stylistic rules
 - Wire into validate/quality scripts as `lint:css`
 
+**Required secret scanning:**
+- `gitleaks` -- detects API keys, tokens, passwords, and other secrets in git history
+- Wire into quality script as `npm run secrets`
+
+**Required license compliance:**
+- `license-checker` -- validates that production dependencies use approved licenses (GPL/AGPL must fail)
+- Wire into quality script as `npm run licenses`
+
+**Required git hooks:**
+- `husky` -- enforces pre-commit quality checks (runs `npm run validate && npm run secrets`)
+- Wire into package.json with `"prepare": "husky"` script
+- Pre-commit runs the fast checks (lint, html-validate, stylelint, format, type-check, secret scan) -- not the full `npm run quality` pipeline (SAST and npm audit are slower and run manually or in CI)
+
 **TypeScript strict settings:**
 - `strict: true` in `tsconfig.json`
 - `noUncheckedIndexedAccess: true`
@@ -277,11 +290,14 @@ npm run sast        # semgrep scan --config auto
   "type-check": "tsc --noEmit",
   "security": "npm audit --audit-level=high",
   "sast": "semgrep scan --config auto --quiet",
+  "secrets": "gitleaks detect --source . --verbose",
+  "licenses": "license-checker --production --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary",
   "check": "npm run lint && npm run lint:html && npm run lint:css && npm run format:check && npm run type-check",
-  "quality": "npm run check && npm run sast && npm run security",
+  "quality": "npm run check && npm run sast && npm run security && npm run secrets && npm run licenses",
   "test:smoke": "node tests/smoke.js",
   "test:integration": "node tests/harness.js integration",
   "test": "npm run test:smoke && npm run test:integration",
+  "prepare": "husky",
   "build": "tsc --noEmit && vite build"
 }
 ```
@@ -542,6 +558,75 @@ Major version bumps are ignored -- they often include breaking changes that requ
 
 **Minimum Release Age:**
 Set `min-release-age=1` in `~/.npmrc`. npm will refuse to resolve any package version published less than 24 hours ago. This filters out the riskiest window for supply chain attacks.
+
+### GitHub Actions CI
+
+All projects with a GitHub repo should have `.github/workflows/ci.yml` to run quality gates on every push and pull request.
+
+CI runs a subset of the local quality pipeline -- tools that require local-only binaries (Semgrep, gitleaks CLI) are either replaced with GitHub Actions equivalents or run locally only. The CI template uses individual named steps for clearer failure diagnostics:
+
+```yaml
+name: Quality Gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: HTML validation
+        run: npm run lint:html
+
+      - name: CSS validation
+        run: npm run lint:css
+
+      - name: Format check
+        run: npm run format:check
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Dependency audit
+        run: npm run security
+
+      - name: License check
+        run: npm run licenses
+
+      - name: Secret scanning
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+**What runs where:**
+
+| Check | Local (`npm run quality`) | CI (GitHub Actions) |
+|---|---|---|
+| Lint, format, type-check | Yes | Yes |
+| HTML/CSS validation | Yes | Yes |
+| npm audit | Yes | Yes |
+| License compliance | Yes | Yes |
+| SAST (Semgrep) | Yes (local install) | No (requires local binary) |
+| Secret scanning | Yes (gitleaks CLI) | Yes (gitleaks-action) |
+| Smoke/integration tests | Yes (needs running server) | No (needs server lifecycle) |
+
+This is a safety net -- the full pipeline runs locally via `npm run quality` and husky pre-commit hooks before any code reaches GitHub. CI catches what slips through.
 
 ### File Uploads (when applicable)
 - Per-file size limit (e.g. 5MB)
