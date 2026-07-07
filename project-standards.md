@@ -148,7 +148,7 @@ Checklist of what "done" looks like.
 ### Electron Desktop Apps (macOS)
 - Vite + React + TypeScript + Tailwind CSS (renderer)
 - Express backend bundled in the app (ES modules, serves dist/ + /api)
-- Electron main process: find free port -> start Express -> load window from localhost
+- **Dynamic port (mandatory):** The Electron main process MUST use `findFreePort()` (bind to port 0, read the assigned port, close, then pass it to Express). Never hardcode a port — it will collide with any other local server on that port, silently connecting to the wrong process and potentially corrupting data.
 - Zustand for state management
 - `contextIsolation: true`, `nodeIntegration: false`
 - **PDF export:** use **pdfmake** (pure JS, no Chromium dependency). Do NOT use Puppeteer -- it bundles a ~150MB Chromium binary unnecessarily since Electron already IS Chromium.
@@ -262,6 +262,7 @@ npm run sast        # semgrep scan --config auto
 
 **Required secret scanning:**
 - `gitleaks` -- detects API keys, tokens, passwords, and other secrets in git history
+- **Homebrew only** (`brew install gitleaks`). Do not install via npm — the npm `gitleaks` package is an unrelated name-squatted package that provides no binary. In CI, use `gitleaks/gitleaks-action@v2`.
 - Wire into quality script as `npm run secrets`
 
 **Required license compliance:**
@@ -524,6 +525,15 @@ These patterns apply to all local-first apps that store data as JSON files.
 
 Use Socket CLI or equivalent to scan every `npm install` for malicious packages, typosquatting, and supply chain risks.
 
+**Package verification — before every install:**
+Before installing any npm package, verify it is the genuine upstream package:
+- Check the publisher/org on npmjs.com matches the real project maintainers
+- Check the repository URL points to the official project repo
+- Check download count and version history — a single v1.0.0 with no updates is a red flag
+- Check the package description and README match the tool's actual purpose
+- If a tool is primarily distributed outside npm (Homebrew, GitHub releases, Go binary), do not assume an npm package with the same name is an official wrapper — verify explicitly
+- Socket's automatic scanning catches malicious packages but does not catch name-squatted packages that are merely useless or misleading
+
 **When to be extra cautious:**
 - Starting a new project (`npm install` pulls many packages at once)
 - Swapping out dependencies when something doesn't work
@@ -558,6 +568,51 @@ Major version bumps are ignored -- they often include breaking changes that requ
 
 **Minimum Release Age:**
 Set `min-release-age=1` in `~/.npmrc`. npm will refuse to resolve any package version published less than 24 hours ago. This filters out the riskiest window for supply chain attacks.
+
+### Dependency Allowlist
+
+Every project maintains an `allowed-packages.json` in its root. Only packages on this list may appear in `package.json`. The allowlist check runs as part of `npm run quality` — any unapproved package fails the gate.
+
+**Allowlist format:**
+```json
+{
+  "express": {
+    "repo": "https://github.com/expressjs/express",
+    "publisher": "wesleytodd",
+    "weeklyDownloads": 106634055,
+    "versions": 288,
+    "verified": "2026-07-07"
+  }
+}
+```
+
+**Adding a new package:**
+1. Run `npm run deps:verify <package-name>` — queries npm registry and Socket for metadata, flags risks
+2. A security-focused agent independently reviews the verification output
+3. The primary agent reviews the security agent's findings and the raw data
+4. Only if both reviewers approve, add the entry to `allowed-packages.json`
+5. Both the verification output and the allowlist diff are visible to the developer at commit time
+
+**Dual-reviewer requirement:** No package may be added to the allowlist by a single reviewer. The verification script provides the data; a security agent and the primary agent must independently confirm the package is legitimate. This catches name-squatted, abandoned, or unnecessary packages that automated scanners miss.
+
+**Scripts (shared in `build-policy/scripts/`):**
+```bash
+node ../build-policy/scripts/verify-package.js <name>   # Verify a package before adding
+node ../build-policy/scripts/check-allowlist.js .        # Check all deps against allowlist
+node ../build-policy/scripts/bootstrap-allowlist.js .    # Generate initial allowlist from package.json
+```
+
+**Standard package.json scripts:**
+```json
+{
+  "deps:check": "node ../build-policy/scripts/check-allowlist.js .",
+  "deps:verify": "node ../build-policy/scripts/verify-package.js"
+}
+```
+
+Wire `deps:check` into `npm run quality`. Dependabot PRs only bump versions of already-approved packages, so they pass automatically.
+
+**Bootstrap:** For existing projects, run the bootstrap script to generate the initial allowlist from current dependencies. Review the output for any flagged packages before committing.
 
 ### GitHub Actions CI
 

@@ -1,7 +1,7 @@
 # Build & Development Policy
 
 **Version:** 1.4
-**Last updated:** 2026-07-04
+**Last updated:** 2026-07-07
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
 
@@ -31,7 +31,7 @@ Install these before any development work. This section exists so a new machine 
 - Stylelint with `stylelint-config-standard` (per-project devDependency) -- CSS structural validation (duplicate selectors, deprecated properties)
 - Semgrep (`brew install semgrep`) -- static application security testing
 - Socket CLI (`npm install -g @socketsecurity/cli`) -- supply chain security
-- Gitleaks (per-project devDependency) -- secret scanning (API keys, tokens, passwords in git history)
+- Gitleaks (`brew install gitleaks`) -- secret scanning (API keys, tokens, passwords in git history). **Not an npm package** -- the npm `gitleaks` package is an unrelated name-squatted package. Install via Homebrew only. In CI, use `gitleaks/gitleaks-action@v2`.
 - license-checker (per-project devDependency) -- production dependency license compliance (fail on GPL/AGPL)
 - Husky (per-project devDependency) -- git hooks (pre-commit runs validate + secrets)
 
@@ -72,7 +72,6 @@ These apply across the entire workflow, not to any single phase.
 **App icons.** Every app must have its icon set up correctly. Electron apps: `build/icon.png` (512x512 PNG, electron-builder converts to `.icns`). Web apps: PWA icon set in `public/` with `manifest.json`. Generate from your brand asset.
 
 **Marketing site dependency.** When any commercial or public app ships a new version, changes features, or updates its changelog, the marketing/portfolio site must also be updated: version info, changelog, app listing. An app release is not complete until the public-facing site reflects it.
-
 ---
 
 ## The Workflow
@@ -133,11 +132,12 @@ Forty-three steps across eight phases. Each step is numbered for reference. Step
 | 21 | Dependency audit | `npm audit --audit-level=high` | Yes |
 | 21a | Secret scanning | `npm run secrets` | Yes |
 | 21b | License compliance | `npm run licenses` | Yes |
+| 21c | Dependency allowlist | `npm run deps:check` | Yes |
 | 22 | Build | `vite build` (or equivalent) | Yes |
 | 23 | Smoke tests | `npm run test:smoke` | Yes (requires running server) |
 | 24 | Integration tests | `npm run test:integration` | Yes (commercial/complex apps) |
 
-Projects should wire steps 17--21b into a single command: `npm run quality`. Steps 22--24 run separately as they require a build or running server.
+Projects should wire steps 17--21c into a single command: `npm run quality`. Steps 22--24 run separately as they require a build or running server.
 
 **Pre-commit enforcement:** Husky runs `npm run validate && npm run secrets` before every commit -- the fast checks (lint, HTML/CSS validation, format, type-check, secret scan). The full `npm run quality` pipeline (including SAST and npm audit) runs manually before commit or in CI.
 
@@ -321,7 +321,7 @@ This is guidance, not a hard rule. The developer chooses based on the task, cost
 
 | Version | Date | Changes |
 |---|---|---|
-| 1.4 | 2026-07-04 | Added Stylelint CSS validation, testing tiers (smoke + integration), test isolation requirement, quality gate checkpoints during implementation (step 14), renumbered steps for consistency |
+| 1.4 | 2026-07-07 | Corrected gitleaks as Homebrew-only (not npm), added dependency allowlist system (verify-package, check-allowlist, bootstrap-allowlist scripts), dual-reviewer requirement for new packages, added step 21c to quality gates |
 | 1.3 | 2026-06-28 | Added model strategy, standing rules (cross-project learning, app icons, marketing site dependency), expanded compliance check |
 | 1.2 | 2026-06-28 | Added code quality principles, cleanup pass (step 16) before quality gates |
 | 1.1 | 2026-06-28 | Added project compliance check (step 6), corrected deploy order (commit before build), made changelog/version/README updates automatic, clarified developer as committer |
