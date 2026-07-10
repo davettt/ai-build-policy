@@ -1,7 +1,7 @@
 # Build & Development Policy
 
-**Version:** 1.4
-**Last updated:** 2026-07-07
+**Version:** 1.5
+**Last updated:** 2026-07-10
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
 
@@ -31,7 +31,7 @@ Install these before any development work. This section exists so a new machine 
 - Stylelint with `stylelint-config-standard` (per-project devDependency) -- CSS structural validation (duplicate selectors, deprecated properties)
 - Semgrep (`brew install semgrep`) -- static application security testing
 - Socket CLI (`npm install -g @socketsecurity/cli`) -- supply chain security
-- Gitleaks (`brew install gitleaks`) -- secret scanning (API keys, tokens, passwords in git history). **Not an npm package** -- the npm `gitleaks` package is an unrelated name-squatted package. Install via Homebrew only. In CI, use `gitleaks/gitleaks-action@v2`.
+- Betterleaks (`brew install betterleaks`) -- secret scanning (API keys, tokens, passwords in git history). The official successor to Gitleaks by the same author. Install via Homebrew only. In CI, use `gitleaks/gitleaks-action@v2` until a Betterleaks action is available.
 - license-checker (per-project devDependency) -- production dependency license compliance (fail on GPL/AGPL)
 - Husky (per-project devDependency) -- git hooks (pre-commit runs validate + secrets)
 
@@ -59,7 +59,7 @@ Not every task needs the most expensive model. When spawning agents or delegatin
 | Standard | General implementation, code review, moderate fixes |
 | Light | Simple lookups, formatting, repetitive single-file changes, search |
 
-AI tools should apply this automatically when launching agents -- use the lightest model that can handle the task. When in doubt, use the standard tier, not the heavy tier.
+AI tools should apply this automatically when launching agents -- use the lightest model that can handle the task. The developer does not need to specify the model for each agent. When in doubt, use the standard tier, not the heavy tier.
 
 ---
 
@@ -67,16 +67,17 @@ AI tools should apply this automatically when launching agents -- use the lighte
 
 These apply across the entire workflow, not to any single phase.
 
-**Cross-project learning.** When a gap, fix, or improvement is discovered in one project (e.g. a missing `dependabot.yml`, a better script configuration, a security pattern), do not apply it only to that project. Update the shared standard so all projects benefit. One project's fix is every project's fix.
+**Cross-project learning.** When a gap, fix, or improvement is discovered in one project (e.g. a missing `dependabot.yml`, a better script configuration, a security pattern), do not apply it only to that project. Update the shared standard so all projects benefit. Flag the change to the developer. One project's fix is every project's fix.
 
-**App icons.** Every app must have its icon set up correctly. Electron apps: `build/icon.png` (512x512 PNG, electron-builder converts to `.icns`). Web apps: PWA icon set in `public/` with `manifest.json`. Generate from your brand asset.
+**App icons.** Every app must have its icon set up correctly. Electron apps: `build/icon.png` (512x512 PNG, electron-builder converts to `.icns`). Web apps: PWA icon set in `public/` with `manifest.json`. Generate from your brand asset. This is part of the compliance check (step 6) and new project setup.
 
-**Marketing site dependency.** When any commercial or public app ships a new version, changes features, or updates its changelog, the marketing/portfolio site must also be updated: version info, changelog, app listing. An app release is not complete until the public-facing site reflects it.
+**Marketing site dependency.** When any commercial or public app ships a new version, changes features, or updates its changelog, the marketing/portfolio site must also be updated: version info, changelog page, and app listing/description if features changed. This is not optional -- an app release is not complete until the public-facing site reflects it.
+
 ---
 
 ## The Workflow
 
-Forty-three steps across eight phases. Each step is numbered for reference. Steps marked **(mandatory)** must not be skipped. Steps marked with a tool name indicate which AI tools can perform that step.
+Forty-four steps across eight phases. Each step is numbered for reference. Steps marked **(mandatory)** must not be skipped. Steps marked with a tool name indicate which AI tools can perform that step.
 
 ### Phase 1 -- Context Loading
 
@@ -89,7 +90,7 @@ Forty-three steps across eight phases. Each step is numbered for reference. Step
 | 3 | Read the target project's context file for its stack, architecture, key files, and known patterns. If no context file exists, create one before starting feature work. | Yes | AI tool |
 | 4 | Load persistent context -- memory files, project notes, or equivalent for the tool in use. | Yes | AI tool |
 | 5 | Activate quality tooling -- code review plugins, security scanners, supply chain tools. | Yes | AI tool |
-| 6 | **Project compliance check** -- verify the project is inline with this build policy and `project-standards.md`. Check for and fix: missing `eslint-plugin-security`, missing `npm run sast` / `npm run quality` scripts, missing `.github/dependabot.yml`, missing Semgrep config, missing or outdated `CHANGELOG.md`, missing app icon, version in `package.json` matching last release, any other gaps. Fix them before starting feature work. | Yes | AI tool |
+| 6 | **Project compliance check** -- verify the project is inline with this build policy and `project-standards.md`. Check for and fix: missing `eslint-plugin-security`, missing `npm run sast` / `npm run quality` scripts, missing `.github/dependabot.yml`, missing Semgrep config, missing or outdated `CHANGELOG.md`, missing app icon (`build/icon.png` for Electron, PWA icons for web apps), version in `package.json` matching last release, any other gaps. Fix them before starting feature work. If any gap found here also applies to other projects, update the shared standards (see Standing Rules). | Yes | AI tool |
 
 ### Phase 2 -- Planning
 
@@ -133,15 +134,16 @@ Forty-three steps across eight phases. Each step is numbered for reference. Step
 | 21a | Secret scanning | `npm run secrets` | Yes |
 | 21b | License compliance | `npm run licenses` | Yes |
 | 21c | Dependency allowlist | `npm run deps:check` | Yes |
+| 21d | CodeRabbit review | `npm run review` (`coderabbit review --agent`) | Yes |
 | 22 | Build | `vite build` (or equivalent) | Yes |
 | 23 | Smoke tests | `npm run test:smoke` | Yes (requires running server) |
 | 24 | Integration tests | `npm run test:integration` | Yes (commercial/complex apps) |
 
-Projects should wire steps 17--21c into a single command: `npm run quality`. Steps 22--24 run separately as they require a build or running server.
+Projects should wire steps 17--21d into a single command: `npm run quality`. Steps 22--24 run separately as they require a build or running server.
 
 **Pre-commit enforcement:** Husky runs `npm run validate && npm run secrets` before every commit -- the fast checks (lint, HTML/CSS validation, format, type-check, secret scan). The full `npm run quality` pipeline (including SAST and npm audit) runs manually before commit or in CI.
 
-**CI as safety net:** GitHub Actions runs a subset of the quality gates (steps 17--19, 21, 21b) on every push and PR, plus `gitleaks-action` for secret scanning. Tools that require local binaries (Semgrep SAST) and tests that need a running server (smoke/integration) run locally only. See `project-standards.md` for the exact CI template and what-runs-where table.
+**CI as safety net:** GitHub Actions runs a subset of the quality gates (steps 17--19, 21, 21b) on every push and PR, plus `gitleaks-action` for secret scanning (betterleaks is used locally via `npm run secrets`; CI uses `gitleaks-action` until a Betterleaks action is available). Tools that require local binaries (Semgrep SAST) and tests that need a running server (smoke/integration) run locally only. See `project-standards.md` for the exact CI template and what-runs-where table.
 
 **Any AI tool or human can run these.** They are CLI commands.
 
@@ -151,7 +153,7 @@ Projects should wire steps 17--21c into a single command: `npm run quality`. Ste
 |---|---|---|---|
 | 1 -- Smoke | Health check + hit every API endpoint, verify no 500s | All projects with a server | `npm run test:smoke` |
 | 2 -- Integration | CRUD operations, data persistence, settings round-trip | Commercial apps, complex projects | `npm run test:integration` |
-| 3 -- E2E | Playwright browser-driven UI flows | Commercial apps with complex UI | `npm run test:e2e` |
+| 3 -- E2E | Playwright browser-driven UI flows | Future -- commercial apps with complex UI | `npm run test:e2e` |
 
 **Smoke tests are non-destructive** -- they only read from the live server. Integration tests run against an isolated server instance with a temporary data directory, so they cannot touch production data under any circumstances.
 
@@ -161,7 +163,7 @@ Projects should wire steps 17--21c into a single command: `npm run quality`. Ste
 
 | # | Step | Mandatory | Who |
 |---|---|---|---|
-| 25 | AI code review on all changes. Address all critical and high-severity findings. | Yes | Code review tool |
+| 25 | Address code review findings from step 21d. All critical and high-severity findings must be fixed before commit. Code review runs automatically as part of `npm run quality` — do not skip or defer its output. | Yes | AI tool |
 | 26 | Security review for changes touching auth, data handling, payment, CORS/CSP, or secret storage. | Yes (security areas) | AI tool + developer |
 | 27 | Developer review -- verify the change locally, test in the UI, confirm it does what it should. | Yes | Developer |
 
@@ -196,6 +198,7 @@ Projects should wire steps 17--21c into a single command: `npm run quality`. Ste
 | 37 | **Verify signing:** `codesign --verify --deep --strict` on the built `.app` bundle. | Yes (Electron) | AI tool or developer |
 | 38 | **Distribution** (commercial apps) -- upload release to your distribution platform (e.g. app store, Gumroad). | Yes (commercial) | Developer |
 | 39 | **Update marketing site** -- for any commercial or public app release: update version info, changelog, and listing/description if features changed. An app release is not complete until the public-facing site reflects it. | Yes (commercial/public) | AI tool + developer |
+| 40 | **Marketing** -- after release and site update, prep release marketing (social posts, launch email, other channels). Log the release with app name, version, date, and channel status. AI preps drafts; developer publishes. | Yes (commercial) | AI tool + developer |
 
 ### Phase 8 -- Maintenance
 
@@ -203,10 +206,10 @@ Projects should wire steps 17--21c into a single command: `npm run quality`. Ste
 
 | # | Step | Mandatory | Who |
 |---|---|---|---|
-| 40 | **Review GitHub issues** -- check open issues on each project repo. Triage: label, prioritise, close stale issues, and schedule work for valid bugs or feature requests. | Yes | Developer + AI tool |
-| 41 | **Review Dependabot PRs** -- check each project for open Dependabot dependency update PRs. Dependabot is configured to only open PRs for minor and patch bumps (major version bumps are ignored -- handle those as planned work). For each PR: review the change on GitHub, pull the branch locally, run supply chain security scan, and merge only if clean. | Yes | Developer + AI tool |
-| 42 | **Review infrastructure alerts** -- for cloud/SaaS projects deployed on a platform (e.g. Cloudflare, Vercel, AWS): check for automated PRs (platform updates) and review dashboard alerts (security, performance, billing). | Yes (cloud apps) | Developer + AI tool |
-| 43 | **Dependency health check** -- run `npm audit` and supply chain scan across all active projects. Address any new high or critical vulnerabilities. | Yes | AI tool or developer |
+| 41 | **Review GitHub issues** -- check open issues on each project repo. Triage: label, prioritise, close stale issues, and schedule work for valid bugs or feature requests. | Yes | Developer + AI tool |
+| 42 | **Review Dependabot PRs** -- check each project for open Dependabot dependency update PRs. Dependabot is configured to only open PRs for minor and patch bumps (major version bumps are ignored -- handle those as planned work). For each PR: review the change on GitHub, pull the branch locally, run supply chain security scan, and merge only if clean. | Yes | Developer + AI tool |
+| 43 | **Review infrastructure alerts** -- for cloud/SaaS projects deployed on a platform (e.g. Cloudflare, Vercel, AWS): check for automated PRs (platform updates) and review dashboard alerts (security, performance, billing). | Yes (cloud apps) | Developer + AI tool |
+| 44 | **Dependency health check** -- run `npm audit` and supply chain scan across all active projects. Address any new high or critical vulnerabilities. | Yes | AI tool or developer |
 
 **Multi-tool usage:** Maintenance triage is well-suited to secondary AI tools -- reviewing PRs, checking issue lists, and running scans are well-scoped tasks that don't require deep architectural context.
 
@@ -237,7 +240,6 @@ These apply to all local-first apps storing data as JSON files:
 - **Multi-file consistency** -- read all data upfront, compute changes in memory, write all files. Never interleave reads and writes.
 - **Cascade deletes** -- deleting a parent entity must clean up all child entities.
 - **Supply chain protection** -- Socket CLI wraps `npm install`. `min-release-age=1` in `~/.npmrc` blocks packages published less than 24 hours ago.
-- **Test isolation** -- integration tests must never run against production data. Use a separate server instance with a temporary data directory.
 
 ---
 
@@ -251,12 +253,42 @@ Different AI tools read different context files. Each project should maintain th
 | `AGENTS.md` | Codex, OpenCode | Projects where Codex/OpenCode will be used |
 | `project-standards.md` | All tools (via reference) | Single copy, referenced by all projects |
 | `BUILD-POLICY.md` | All tools (via reference) | This document |
+| `.claude/specs/` | All tools (via reference) | Per-project, created during planning |
 
 ### Keeping context files in sync
 
 `CLAUDE.md` and `AGENTS.md` for the same project must contain the same project-specific information: stack, architecture, key files, patterns, gotchas. Tool-specific instructions go only in the relevant file.
 
 When updating one, update the other. Both should reference `project-standards.md` and this build policy document.
+
+### AGENTS.md template
+
+For projects where Codex or another AI tool will be used, create an `AGENTS.md` in the project root with this structure:
+
+```markdown
+# {Project Name}
+
+Read BUILD-POLICY.md and project-standards.md before starting any work.
+
+## Stack
+{stack details}
+
+## Architecture
+{key directories, entry points, data flow}
+
+## Key Files
+{files that matter most, with one-line descriptions}
+
+## Patterns
+{patterns to follow, gotchas to avoid}
+
+## Quality
+Run `npm run quality` before every commit. All gates must pass.
+
+## Security
+See BUILD-POLICY.md § Security Exclusions. Do not modify auth, secrets,
+payment, or data-deletion logic without explicit developer approval.
+```
 
 ---
 
@@ -273,9 +305,10 @@ Every step in this workflow produces a traceable artifact. This matters for audi
 | Change record | Conventional commit message | Git history |
 | Version record | CHANGELOG entry | `CHANGELOG.md` in repo |
 | README updates | Setup/feature/config changes | `README.md` in repo |
+| Issue tracking | Implementation summary | Issue tracker comments |
 | Signing verification | codesign output | Build logs |
 | Maintenance triage | Issue/PR review decisions | GitHub issue comments, PR merge history |
-| Dependency updates | Dependabot PR + Socket scan result | GitHub PR history |
+| Dependency updates | Dependabot PR + Socket scan result | GitHub PR history, Socket dashboard |
 
 ### Mandatory checklist (every change)
 
@@ -321,7 +354,8 @@ This is guidance, not a hard rule. The developer chooses based on the task, cost
 
 | Version | Date | Changes |
 |---|---|---|
-| 1.4 | 2026-07-07 | Corrected gitleaks as Homebrew-only (not npm), added dependency allowlist system (verify-package, check-allowlist, bootstrap-allowlist scripts), dual-reviewer requirement for new packages, added step 21c to quality gates |
+| 1.5 | 2026-07-10 | Migrated local secret scanning from Gitleaks to Betterleaks (official successor by same author); CI retains gitleaks-action until Betterleaks action available. Fixed duplicate step numbering, corrected step count to 44 |
+| 1.4 | 2026-07-07 | Corrected gitleaks as Homebrew-only (not npm), added dependency allowlist system with dual-reviewer requirement (steps 21c–21d), integrated code review into automated quality pipeline (no longer manual-only), added shared scripts |
 | 1.3 | 2026-06-28 | Added model strategy, standing rules (cross-project learning, app icons, marketing site dependency), expanded compliance check |
 | 1.2 | 2026-06-28 | Added code quality principles, cleanup pass (step 16) before quality gates |
 | 1.1 | 2026-06-28 | Added project compliance check (step 6), corrected deploy order (commit before build), made changelog/version/README updates automatic, clarified developer as committer |

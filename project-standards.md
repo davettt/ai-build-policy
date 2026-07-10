@@ -111,6 +111,7 @@ Checklist of what "done" looks like.
 - Be specific: Show exact CLI commands, UI flows, JSON structures
 - Include error states and edge cases
 - Define data models upfront
+- List all AI prompts with expected response formats
 - No time estimates in specs
 
 ---
@@ -153,6 +154,7 @@ Checklist of what "done" looks like.
 - `contextIsolation: true`, `nodeIntegration: false`
 - **PDF export:** use **pdfmake** (pure JS, no Chromium dependency). Do NOT use Puppeteer -- it bundles a ~150MB Chromium binary unnecessarily since Electron already IS Chromium.
 - **Secret storage:** AES-256-CBC with a machine-derived key. Do NOT use Electron `safeStorage` -- its encrypted values go stale across app re-signs/updates.
+- **Native modules** (e.g. better-sqlite3): add `"postinstall": "npx @electron/rebuild -f -w <module>"` and `"asarUnpack": ["**/*.node"]` in electron-builder config.
 - **No in-app license gate** if using Gumroad/similar -- the download is the gate.
 - **Version check:** fetch a `version.json` from your site on launch; show update banner if newer version available.
 
@@ -225,7 +227,7 @@ These apply to all code changes, in every project, by every AI tool and human.
 
 **Small and focused.** Each function does one thing. Each file owns one concept. A function that needs scrolling is too long -- break it up. A file over ~300 lines should probably be split. A component that handles its own data fetching, state, layout, and business logic should be decomposed.
 
-**No feature creep.** A bug fix is a bug fix -- don't refactor the surrounding code or add features in the same change. Keep changes focused and reviewable.
+**No feature creep.** A bug fix is a bug fix -- don't refactor the surrounding code or add features in the same change. A feature is a feature -- don't fix unrelated bugs in the same PR. Keep changes focused and reviewable.
 
 **Clean as you go.** When touching a file, clean up what you find: unused imports, dead variables, stale comments, inconsistent formatting. Leave the file better than you found it, but don't rewrite it.
 
@@ -261,8 +263,8 @@ npm run sast        # semgrep scan --config auto
 - Wire into validate/quality scripts as `lint:css`
 
 **Required secret scanning:**
-- `gitleaks` -- detects API keys, tokens, passwords, and other secrets in git history
-- **Homebrew only** (`brew install gitleaks`). Do not install via npm — the npm `gitleaks` package is an unrelated name-squatted package that provides no binary. In CI, use `gitleaks/gitleaks-action@v2`.
+- `betterleaks` -- detects API keys, tokens, passwords, and other secrets in git history (official successor to Gitleaks, by the same author)
+- **Homebrew only** (`brew install betterleaks`). Do not install via npm -- betterleaks is not distributed via npm either; install via Homebrew only. In CI, use `gitleaks/gitleaks-action@v2` until a Betterleaks action is available.
 - Wire into quality script as `npm run secrets`
 
 **Required license compliance:**
@@ -291,10 +293,13 @@ npm run sast        # semgrep scan --config auto
   "type-check": "tsc --noEmit",
   "security": "npm audit --audit-level=high",
   "sast": "semgrep scan --config auto --quiet",
-  "secrets": "gitleaks detect --source . --verbose",
+  "secrets": "betterleaks git . -v",
   "licenses": "license-checker --production --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary",
+  "deps:check": "node ../build-policy/scripts/check-allowlist.js .",
+  "deps:verify": "node ../build-policy/scripts/verify-package.js",
+  "review": "coderabbit review --agent",
   "check": "npm run lint && npm run lint:html && npm run lint:css && npm run format:check && npm run type-check",
-  "quality": "npm run check && npm run sast && npm run security && npm run secrets && npm run licenses",
+  "quality": "npm run check && npm run sast && npm run security && npm run secrets && npm run licenses && npm run deps:check && npm run review",
   "test:smoke": "node tests/smoke.js",
   "test:integration": "node tests/harness.js integration",
   "test": "npm run test:smoke && npm run test:integration",
@@ -335,6 +340,7 @@ Before modifying or removing any code that enforces a constraint, cap, guard, or
 - Conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`
 - PR per feature/issue
 - AI code review required on all PRs
+- Comment on issue tracker with implementation summary before PR
 
 ---
 
@@ -518,9 +524,6 @@ These patterns apply to all local-first apps that store data as JSON files.
 **Cascade deletes:**
 - When deleting a parent entity, always clean up child entities. Orphaned records waste space and appear in backups.
 
-**Test isolation:**
-- Integration tests must never run against production data. Start a separate server instance on a dedicated test port with a temporary data directory. Tear down the temp directory after tests complete.
-
 ### Supply Chain Security
 
 Use Socket CLI or equivalent to scan every `npm install` for malicious packages, typosquatting, and supply chain risks.
@@ -568,6 +571,8 @@ Major version bumps are ignored -- they often include breaking changes that requ
 
 **Minimum Release Age:**
 Set `min-release-age=1` in `~/.npmrc`. npm will refuse to resolve any package version published less than 24 hours ago. This filters out the riskiest window for supply chain attacks.
+
+**Setup:** Free tier (1,000 scans/month). Run `socket login` to authenticate with your API token.
 
 ### Dependency Allowlist
 
@@ -618,7 +623,7 @@ Wire `deps:check` into `npm run quality`. Dependabot PRs only bump versions of a
 
 All projects with a GitHub repo should have `.github/workflows/ci.yml` to run quality gates on every push and pull request.
 
-CI runs a subset of the local quality pipeline -- tools that require local-only binaries (Semgrep, gitleaks CLI) are either replaced with GitHub Actions equivalents or run locally only. The CI template uses individual named steps for clearer failure diagnostics:
+CI runs a subset of the local quality pipeline -- tools that require local-only binaries (Semgrep, betterleaks) are either replaced with GitHub Actions equivalents or run locally only. The CI template uses individual named steps for clearer failure diagnostics:
 
 ```yaml
 name: Quality Gates
@@ -678,7 +683,7 @@ jobs:
 | npm audit | Yes | Yes |
 | License compliance | Yes | Yes |
 | SAST (Semgrep) | Yes (local install) | No (requires local binary) |
-| Secret scanning | Yes (gitleaks CLI) | Yes (gitleaks-action) |
+| Secret scanning | Yes (betterleaks CLI) | Yes (gitleaks-action) |
 | Smoke/integration tests | Yes (needs running server) | No (needs server lifecycle) |
 
 This is a safety net -- the full pipeline runs locally via `npm run quality` and husky pre-commit hooks before any code reaches GitHub. CI catches what slips through.
@@ -692,9 +697,15 @@ This is a safety net -- the full pipeline runs locally via `npm run quality` and
 ### API & Auth
 - Never rely on frontend route guards for access control -- protect every route server-side
 - Apply auth middleware at the router level (not per-route) to prevent gaps
-- Validate resource ownership server-side on every request (prevent IDOR)
+- Validate resource ownership server-side on every request (prevent IDOR -- never trust client-supplied IDs alone)
 - Store auth tokens in httpOnly cookies, not localStorage
 - Set expiry on all JWTs -- implement refresh token rotation for SaaS apps
+
+### SaaS / Cloud Apps
+- Auth token (JWT) verification on all API routes
+- Webhook signature verification (e.g. Stripe, LemonSqueezy)
+- Input validation on all endpoints (Zod schemas)
+- Subscription/access control middleware
 
 ---
 
