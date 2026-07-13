@@ -17,6 +17,7 @@ node ../build-policy/scripts/policy.js <command>
 
 | Command | What it does | When it runs |
 |---|---|---|
+| `setup-machine` | Installs per-machine wiring (hook script, hooks, agents) from `machine/` | New machine, once |
 | `doctor` | Machine setup checks: tools, npmrc, hooks, agents, notary profile | New machine; troubleshooting |
 | `check` | Project compliance: required scripts/files/configs, template drift, staleness | **Automatically at every session start** (Claude hook); after fixing gaps |
 | `scaffold` | Creates missing standard files and scripts; never overwrites | New projects; fixing `check` gaps |
@@ -156,9 +157,9 @@ Session model is the developer's choice (currently Claude Opus for Claude Code).
 
 ## Machine setup (one-time)
 
-Run `policy doctor` — it checks all of this and says what's missing:
+Run `policy setup-machine` — it installs the per-machine wiring from the canonical copies in `machine/` (session-start script, Claude Code hooks merged into `~/.claude/settings.json`, haiku agents) and prints the remaining manual steps. Then `policy doctor` verifies everything:
 
-Node LTS (nvm) · PM2 · git · Semgrep (brew) · Betterleaks (brew) · Socket CLI (`socket wrapper on`) · `~/.npmrc` `min-release-age=1` · Claude Code hooks (`~/.claude/settings.json` + `~/.claude/scripts/session-start.sh`) · haiku agents (`~/.claude/agents/`) · notary keychain profile (`xcrun notarytool store-credentials`). Per-project quality tooling is devDependencies, installed by scaffold + `npm install`.
+Node LTS (nvm) · PM2 · git · Semgrep (brew) · Betterleaks (brew) · Socket CLI (`socket wrapper on`) · `~/.npmrc` `min-release-age=1` · Claude Code hooks · haiku agents · notary keychain profile (`xcrun notarytool store-credentials`). Per-project quality tooling is devDependencies, installed by scaffold + `npm install`. The machine wiring lives in the repo, not in anyone's memory — a fresh computer is one command plus the printed manual steps away from fully enforced.
 
 ## Cross-LLM configuration
 

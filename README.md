@@ -13,6 +13,7 @@ This is the actual process used to build and maintain [Tiong Creative](https://t
 | [scripts/policy.js](scripts/policy.js) | The enforcement engine — compliance checks, quality gates, release verification, hooks |
 | [scripts/](scripts) | Dependency allowlist tooling (verify, check, bootstrap) |
 | [templates/](templates) | Canonical gitignore, CI workflow, Dependabot config, pre-commit hook, lint configs |
+| [machine/](machine) | Per-machine wiring: session-start script, Claude Code hooks, pinned-model agent definitions — installed by `policy.js setup-machine` |
 | [registry.json](registry.json) | Verified-dates registry — tooling decisions that expire and get re-checked on schedule |
 
 ## The core idea
@@ -53,8 +54,8 @@ The AI's cooperation becomes helpful, not load-bearing. The judgment steps that 
 Fork and adapt:
 
 1. Put this repo as a sibling of your projects (scripts assume `../build-policy/`)
-2. Run `node scripts/policy.js doctor` to see machine setup, `scaffold` in a project to set it up, `check` to see gaps
-3. Wire the hooks into your AI tool (Claude Code examples in BUILD-POLICY.md; the hook modes speak plain JSON on stdin/stdout)
+2. Run `node scripts/policy.js setup-machine` to install the Claude Code wiring (edit the paths in `machine/` first), then `doctor` to verify, `scaffold` in a project to set it up, `check` to see gaps
+3. For other AI tools, the hook modes speak plain JSON on stdin/stdout — wire them however your tool supports
 4. Replace registry values and stack preferences with your own; adjust the security standards for your threat model
 
 ## Version

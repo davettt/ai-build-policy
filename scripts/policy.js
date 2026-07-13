@@ -9,6 +9,7 @@
  *
  * Usage: node policy.js <command> [projectDir] [flags]
  *
+ *   setup-machine       Bootstrap a new machine: hook script, hooks, agents (from machine/)
  *   doctor              Machine-level setup checks (tools, npmrc, hooks, agents)
  *   check [dir]         Project compliance check (structure, scripts, drift, staleness)
  *   gates [dir]         Run quality gates in order; writes .policy/gates.json marker
@@ -768,12 +769,12 @@ function cmdDoctor() {
   const settingsStr = JSON.stringify(settings);
   if (settingsStr.includes('policy.js') || settingsStr.includes('session-start'))
     ok('Claude Code hooks configured in ~/.claude/settings.json');
-  else warn('Claude Code hooks not found in ~/.claude/settings.json — session enforcement inactive on this machine');
+  else warn('Claude Code hooks not wired — run: policy setup-machine');
 
   const agentsDir = path.join(os.homedir(), '.claude', 'agents');
   const agents = exists(agentsDir) ? fs.readdirSync(agentsDir).filter((f) => f.endsWith('.md')) : [];
   if (agents.length > 0) ok(`Claude agents present: ${agents.join(', ')}`);
-  else warn('No ~/.claude/agents definitions — haiku delegation agents missing on this machine');
+  else warn('No ~/.claude/agents definitions — run: policy setup-machine');
 
   const profile = loadRegistry().notaryKeychainProfile;
   if (profile) {
@@ -794,6 +795,73 @@ function cmdDoctor() {
       );
     }
   }
+  return finish();
+}
+
+// ------------------------------------------------------------ setup-machine
+
+/**
+ * Bootstrap a new machine from the canonical wiring in build-policy/machine/:
+ * session-start script, Claude Code hooks, haiku agent definitions.
+ * Idempotent — canonical files are (re)copied, hooks are merged only if the
+ * event doesn't already reference the policy. Finish with `policy doctor`.
+ */
+function cmdSetupMachine() {
+  const MACHINE = path.join(POLICY_ROOT, 'machine');
+  const claudeDir = path.join(os.homedir(), '.claude');
+  section('Machine setup from build-policy/machine/');
+
+  if (!exists(MACHINE)) {
+    fail(`Canonical wiring not found at ${MACHINE}`);
+    return finish();
+  }
+
+  // 1. Session-start script
+  const scriptsDir = path.join(claudeDir, 'scripts');
+  fs.mkdirSync(scriptsDir, { recursive: true });
+  const scriptDest = path.join(scriptsDir, 'session-start.sh');
+  fs.copyFileSync(path.join(MACHINE, 'session-start.sh'), scriptDest);
+  fs.chmodSync(scriptDest, 0o755);
+  ok(`Installed ${scriptDest}`);
+
+  // 2. Agent definitions
+  const agentsSrc = path.join(MACHINE, 'agents');
+  const agentsDest = path.join(claudeDir, 'agents');
+  fs.mkdirSync(agentsDest, { recursive: true });
+  for (const f of fs.readdirSync(agentsSrc).filter((n) => n.endsWith('.md'))) {
+    fs.copyFileSync(path.join(agentsSrc, f), path.join(agentsDest, f));
+  }
+  ok(`Installed agents to ${agentsDest}`);
+
+  // 3. Hooks — merge into settings.json, never clobber existing config
+  const settingsPath = path.join(claudeDir, 'settings.json');
+  const settings = readJSON(settingsPath) || {};
+  const canonical = readJSON(path.join(MACHINE, 'hooks.json')) || {};
+  settings.hooks = settings.hooks || {};
+  let merged = 0;
+  for (const [event, entries] of Object.entries(canonical)) {
+    if (event.startsWith('_')) continue;
+    const existing = JSON.stringify(settings.hooks[event] || '');
+    if (existing.includes('policy.js') || existing.includes('session-start')) {
+      ok(`Hook ${event}: already wired, left as-is`);
+      continue;
+    }
+    settings.hooks[event] = [...(settings.hooks[event] || []), ...entries];
+    merged++;
+  }
+  if (merged > 0) {
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+    ok(`Merged ${merged} hook event(s) into ${settingsPath}`);
+  }
+
+  console.log(
+    `\nRemaining manual steps (doctor checks all of these):\n` +
+      `  brew install semgrep betterleaks\n` +
+      `  npm install -g pm2 @socketsecurity/cli && socket wrapper on && socket login\n` +
+      `  echo 'min-release-age=1' >> ~/.npmrc  (if not present)\n` +
+      `  xcrun notarytool store-credentials <profile> --apple-id <id> --team-id <team> --password <app-specific>\n` +
+      `\nNow run: node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} doctor\n`,
+  );
   return finish();
 }
 
@@ -866,6 +934,8 @@ function main() {
   switch (command) {
     case 'doctor':
       return cmdDoctor();
+    case 'setup-machine':
+      return cmdSetupMachine();
     case 'check':
       return cmdCheck(dir);
     case 'gates':

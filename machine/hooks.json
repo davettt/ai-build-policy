@@ -1,0 +1,39 @@
+{
+  "_comment": "Canonical Claude Code hooks for the build policy. `policy setup-machine` merges these into ~/.claude/settings.json (skipping any event that already references the policy).",
+  "SessionStart": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "\"$HOME/.claude/scripts/session-start.sh\"",
+          "timeout": 10,
+          "statusMessage": "Running build policy compliance check..."
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node \"$HOME/path/to/build-policy/scripts/policy.js\" hook-stop",
+          "timeout": 10,
+          "statusMessage": "Checking CHANGELOG discipline..."
+        }
+      ]
+    }
+  ],
+  "PreToolUse": [
+    {
+      "matcher": "Bash",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node \"$HOME/path/to/build-policy/scripts/policy.js\" hook-pretool",
+          "timeout": 10
+        }
+      ]
+    }
+  ]
+}
