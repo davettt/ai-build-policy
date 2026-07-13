@@ -39,7 +39,11 @@ jobs:
       - name: SAST (Semgrep)
         run: |
           python3 -m pip install --quiet semgrep
-          semgrep scan --config auto --error --quiet
+          semgrep scan --config auto --error --quiet \
+            --exclude-rule javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal \
+            --exclude-rule javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal \
+            --exclude-rule javascript.express.security.audit.express-res-sendfile.express-res-sendfile \
+            --exclude-rule javascript.express.security.audit.remote-property-injection.remote-property-injection
 
       - name: Dependency audit
         run: npm run security

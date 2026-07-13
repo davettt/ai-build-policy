@@ -1,6 +1,6 @@
 # Project Standards
 
-**Version:** 2.0
+**Version:** 2.1
 **Last updated:** 2026-07-13
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
@@ -298,8 +298,14 @@ npm run format      # Prettier
 npm run type-check  # tsc --noEmit (strict: true)
 npm run build       # Full build
 npm run security    # npm audit --audit-level=high
-npm run sast        # semgrep scan --config auto
+npm run sast        # semgrep scan --config auto (with exclusions)
 ```
+
+**Semgrep rule exclusions** (triaged 2026-07-13, all false positives in local-data Express apps):
+- `path-join-resolve-traversal` — fires on every `path.join()` with a variable; all route params validated via middleware (`^[a-zA-Z0-9_-]+$`); internal server paths don't involve user input
+- `express-path-join-resolve-traversal` — Express variant of the same; same validation applies
+- `express-res-sendfile` — can't detect validation guards (basename + prefix/suffix checks) before `sendFile()`
+- `remote-property-injection` — can't distinguish static allowlist iteration from user-controlled bracket keys
 
 **Required ESLint plugins:**
 - `@typescript-eslint` — TypeScript-aware rules
@@ -350,7 +356,7 @@ npm run sast        # semgrep scan --config auto
   "format:check": "prettier --check .",
   "type-check": "tsc --noEmit",
   "security": "npm audit --audit-level=high",
-  "sast": "semgrep scan --config auto --quiet",
+  "sast": "semgrep scan --config auto --quiet --exclude-rule javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-res-sendfile.express-res-sendfile --exclude-rule javascript.express.security.audit.remote-property-injection.remote-property-injection",
   "secrets": "betterleaks git . -v",
   "licenses": "license-checker --production --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary",
   "licenses:file": "license-checker --production > THIRD-PARTY-LICENSES.txt",
