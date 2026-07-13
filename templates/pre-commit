@@ -1,0 +1,6 @@
+node ../build-policy/scripts/policy.js gates --fast || {
+  echo ""
+  echo "Pre-commit gates failed. Fix the issues above, or run:"
+  echo "  node ../build-policy/scripts/policy.js gates --fast"
+  exit 1
+}

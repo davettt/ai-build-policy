@@ -1,0 +1,71 @@
+{
+  "_comment": "Verified-date registry. `policy.js health` flags entries whose verified date is older than reviewEveryDays. When reviewing: web-search current state, update value + verified date, and propagate to shipping apps consistently.",
+  "socketOrg": "your-org",
+  "notaryKeychainProfile": "yourcompany",
+  "staleness": {
+    "healthRunDays": 30,
+    "registryReviewDays": 90
+  },
+  "entries": {
+    "anthropic-model-fast": {
+      "value": "claude-haiku-4-5-20251001",
+      "verified": "2026-06-28",
+      "reviewEveryDays": 90,
+      "notes": "BYOK fast tier in shipping apps. Copy exact ID from a-reference-app/server/ai.js."
+    },
+    "anthropic-model-smart": {
+      "value": "claude-sonnet-4-6",
+      "verified": "2026-06-28",
+      "reviewEveryDays": 90,
+      "notes": "BYOK smart tier in shipping apps."
+    },
+    "openai-model-fast": {
+      "value": "gpt-5.4-nano-2026-03-17",
+      "verified": "2026-06-28",
+      "reviewEveryDays": 90,
+      "notes": "BYOK fast tier in shipping apps."
+    },
+    "openai-model-smart": {
+      "value": "gpt-5.4-mini-2026-03-17",
+      "verified": "2026-06-28",
+      "reviewEveryDays": 90,
+      "notes": "BYOK smart tier in shipping apps. AEO also uses gpt-5.5-2026-04-23 top tier."
+    },
+    "node-lts": {
+      "value": "22",
+      "verified": "2026-07-13",
+      "reviewEveryDays": 180,
+      "notes": "CI setup-node version and local nvm target."
+    },
+    "gh-action-checkout": {
+      "value": "actions/checkout@v4",
+      "verified": "2026-07-13",
+      "reviewEveryDays": 180,
+      "notes": "On review: pin to commit SHA for supply-chain hardening."
+    },
+    "gh-action-setup-node": {
+      "value": "actions/setup-node@v4",
+      "verified": "2026-07-13",
+      "reviewEveryDays": 180,
+      "notes": "On review: pin to commit SHA for supply-chain hardening."
+    },
+    "gh-action-gitleaks": {
+      "value": "gitleaks/gitleaks-action@v2",
+      "verified": "2026-07-13",
+      "reviewEveryDays": 90,
+      "notes": "Replace with a Betterleaks action when one is published. Pin to SHA on review."
+    },
+    "secret-scanner": {
+      "value": "betterleaks",
+      "verified": "2026-07-13",
+      "reviewEveryDays": 180,
+      "notes": "Homebrew only. Successor to gitleaks by same author."
+    },
+    "claude-session-model": {
+      "value": "opus (developer preference)",
+      "verified": "2026-07-13",
+      "reviewEveryDays": 90,
+      "notes": "Session model is the developer's choice. Mechanical subagents are pinned to haiku via ~/.claude/agents/ definitions."
+    }
+  }
+}

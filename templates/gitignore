@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+
+# Build output (NOT build/ — for Electron apps build/ holds committed
+# source assets: icon.png and entitlements.mac.plist)
+dist/
+release/
+.last-build
+
+# Environment
+.env
+.env.*
+
+# Data
+local_data/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# AI tool context — local-only, carried between machines by file sync, never public
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+
+# Policy machinery state
+.policy/

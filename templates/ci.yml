@@ -1,0 +1,53 @@
+name: Quality Gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history for secret scanning
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: HTML validation
+        run: npm run lint:html --if-present
+
+      - name: CSS validation
+        run: npm run lint:css --if-present
+
+      - name: Format check
+        run: npm run format:check
+
+      - name: Type check
+        run: npm run type-check --if-present
+
+      - name: SAST (Semgrep)
+        run: |
+          python3 -m pip install --quiet semgrep
+          semgrep scan --config auto --error --quiet
+
+      - name: Dependency audit
+        run: npm run security
+
+      - name: License check
+        run: npm run licenses
+
+      - name: Secret scanning
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
