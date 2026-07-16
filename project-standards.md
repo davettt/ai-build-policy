@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.1
-**Last updated:** 2026-07-13
+**Version:** 2.2
+**Last updated:** 2026-07-16
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -183,7 +183,7 @@ Checklist of what "done" looks like.
 - **Secret storage:** AES-256-CBC with a machine-derived key (`SHA256(appname:hostname:username)`). Do NOT use Electron `safeStorage` — its encrypted values go stale across app re-signs/updates (see a-reference-app `server/ai.js` `isStaleSafeStorageKey` for the migration that moved off it).
 - **Native modules** (e.g. better-sqlite3): add `"postinstall": "npx @electron/rebuild -f -w <module>"` and `"asarUnpack": ["**/*.node"]` in electron-builder config.
 - **No in-app license gate** — Gumroad download is the gate (matches all shipping apps).
-- **Version check:** fetch `yourdomain.com/<app>/version.json` on launch with a cache-busting param (`?t=${Date.now()}`) so CDN caching can't hide a release; show update banner if newer version available (see a-reference-app `App.tsx` for the pattern). The semver comparison function gets a unit test in the integration tier; the live banner is verified once per release via the release checklist (`verify-ready --release`).
+- **Version check:** fetch `yourdomain.com/<app>/version.json` on launch with a cache-busting param (`?t=${Date.now()}`) so CDN caching can't hide a release; show the update banner on a **simple version mismatch** (`site.version !== APP_VERSION`), not a semver "newer than" comparison. The mismatch check is deliberate (decided 2026-07-15): it needs no comparison function, and it makes banner verification self-testing at every release — install the new DMG while the site still lists the old version and the banner MUST appear (same code path a user's old app hits); update the site and it MUST clear. Cosmetic trade-off accepted: during the upload window the developer's own new build shows a banner naming the older site version — nobody else ever sees that state. The live banner is verified twice per release via the release checklist (`verify-ready --release`). Apps still on a semver comparison (e.g. a-reference-app): migrate to the mismatch check when next touched.
 - **Data safety:** schema version + migration-on-load + pre-migration backups + downgrade guard are mandatory — see § Data Migration, Backups & Downgrade Guard.
 - **Diagnostics:** structured local logging + "Export diagnostics" — see § Diagnostics Logging.
 - **Privacy disclosure:** BYOK apps send user content to the configured AI provider — state this consistently in the app's settings UI, README/listing, and the site's terms page. No commercial release without the disclosure in place.
@@ -267,7 +267,24 @@ Icon: `build/icon.png` (512x512 PNG). electron-builder converts to `.icns` autom
 - Prefer the fast tier (Haiku) for app AI features; use the smart tier only when the task requires it
 - Implement caching to reduce API costs
 - Rate limiting on expensive endpoints
-- **Model IDs — the source of truth is `build-policy/registry.json`.** Never invent IDs; copy from the registry (which mirrors the shipping apps: `your shipping apps`). Each registry entry carries a `verified` date; `policy health`/`check` flag entries past their review window — when flagged, web-search the current models, update the registry and every shipping app consistently. Don't ship stale IDs.
+- **Model IDs — the source of truth is `build-policy/registry.json`.** Never invent IDs; copy from the registry (which mirrors the shipping apps). Each registry entry carries a `verified` date; `policy health`/`check` flag entries past their review window — when flagged, web-search the current models, update the registry and every shipping app consistently. Don't ship stale IDs.
+
+---
+
+## Mobile Access Strategy (local-first apps)
+
+Apps stay local-first; mobile access must never route data through our servers. The scope rule that keeps sync tractable for a solo developer: **capture and reference, not editing parity.**
+
+- **Append-only capture** (e.g. journal entries from a phone): new UUID+timestamped records merged into the Mac data — conflict-free by construction.
+- **Read-only reference** (e.g. client/invoice lookup on the road): the Mac is the only writer; the phone gets a snapshot — no sync conflicts exist.
+- Full bidirectional editing on mobile is out of scope until something forces it; that's where all the conflict complexity and cost lives.
+
+**The ladder (climb only on proven demand):**
+1. **No-app rungs first** — iOS Shortcut writing to an iCloud Drive inbox file the Mac app imports (capture), or an encrypted self-contained HTML snapshot exported to iCloud Drive (reference). Days of work, tests demand. Reference specs: `a-reference-app/.claude/specs/mobile-capture-spec.md`, `a-reference-app/.claude/specs/mobile-snapshot-spec.md`.
+2. **Free App Store companion** per app — iCloud Drive file sync via the user's own iCloud (Developer ID Mac apps cannot use CloudKit; plain files in iCloud Drive are the mechanism), QR-code pairing for E2E encryption, capture-and-reference scope. No unlock key: the companion is free and useless without the Mac app's data — the Gumroad download stays the gate, which also avoids App Store external-purchase review friction.
+3. **Hosted sync service — never by default.** It inverts the privacy positioning and creates data liability.
+
+**Rules for anything synced:** every synced record carries `schemaVersion` and `updatedAt`; the downgrade guard applies across devices (a phone snapshot is another "app version" reading the data); iCloud can sync files mid-write, so all readers must tolerate partial/garbled files without data loss; snapshots display their export timestamp.
 
 ---
 
@@ -298,14 +315,14 @@ npm run format      # Prettier
 npm run type-check  # tsc --noEmit (strict: true)
 npm run build       # Full build
 npm run security    # npm audit --audit-level=high
-npm run sast        # semgrep scan --config auto (with exclusions)
+npm run sast        # semgrep scan --config auto --error (with exclusions)
 ```
 
 **Semgrep rule exclusions** (triaged 2026-07-13, all false positives in local-data Express apps):
-- `path-join-resolve-traversal` — fires on every `path.join()` with a variable; all route params validated via middleware (`^[a-zA-Z0-9_-]+$`); internal server paths don't involve user input
+- `path-join-resolve-traversal` — fires on every `path.join()` with a variable; all route params validated via `validateParam` middleware (`^[a-zA-Z0-9_-]+$`); internal server paths don't involve user input
 - `express-path-join-resolve-traversal` — Express variant of the same; same validation applies
-- `express-res-sendfile` — can't detect validation guards (basename + prefix/suffix checks) before `sendFile()`
-- `remote-property-injection` — can't distinguish static allowlist iteration from user-controlled bracket keys
+- `express-res-sendfile` — can't detect validation guards (`isValidSafetyName` checks `basename === filename` + prefix/suffix) before `sendFile()`
+- `remote-property-injection` — can't distinguish static allowlist iteration (`for (const key of allowed)`) from user-controlled bracket keys
 
 **Required ESLint plugins:**
 - `@typescript-eslint` — TypeScript-aware rules
@@ -328,7 +345,7 @@ npm run sast        # semgrep scan --config auto (with exclusions)
 
 **Required secret scanning:**
 - `betterleaks` — detects API keys, tokens, passwords, and other secrets in git history (official successor to Gitleaks, by the same author)
-- **Homebrew only** (`brew install betterleaks`). Do not install via npm — betterleaks is also not distributed via npm, install via Homebrew only. In CI, use `gitleaks/gitleaks-action@v2` until a Betterleaks action is available.
+- **Homebrew only** (`brew install betterleaks`). Do not install via npm — betterleaks is also not distributed via npm, install via Homebrew only. In CI, use `gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9` (pinned to full commit SHA — third-party actions must be SHA-pinned against supply-chain attacks) until a Betterleaks action is available.
 - Wire into quality script as `npm run secrets`
 
 **Required license compliance:**
@@ -356,7 +373,7 @@ npm run sast        # semgrep scan --config auto (with exclusions)
   "format:check": "prettier --check .",
   "type-check": "tsc --noEmit",
   "security": "npm audit --audit-level=high",
-  "sast": "semgrep scan --config auto --quiet --exclude-rule javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-res-sendfile.express-res-sendfile --exclude-rule javascript.express.security.audit.remote-property-injection.remote-property-injection",
+  "sast": "semgrep scan --config auto --error --quiet --exclude-rule javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-res-sendfile.express-res-sendfile --exclude-rule javascript.express.security.audit.remote-property-injection.remote-property-injection",
   "secrets": "betterleaks git . -v",
   "licenses": "license-checker --production --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary",
   "licenses:file": "license-checker --production > THIRD-PARTY-LICENSES.txt",
@@ -735,7 +752,7 @@ Wire `deps:check` into `npm run quality`. Dependabot PRs only bump versions of a
 
 ### GitHub Actions CI
 
-All projects with a GitHub repo have `.github/workflows/ci.yml`. The canonical template is `build-policy/templates/ci.yml` — `policy scaffold` installs it and `policy check` flags drift from it. **CI is the transparency layer**: a timestamped, independent record showing that no code reached main without passing the gates.
+All projects with a GitHub repo have `.github/workflows/ci.yml`. The canonical template is `build-policy/templates/ci.yml` — `policy scaffold` installs it and `policy check` flags drift from it. **CI is the audit evidence layer**: timestamped, third-party-hosted proof that no code reached main without passing the gates.
 
 **What runs where:**
 

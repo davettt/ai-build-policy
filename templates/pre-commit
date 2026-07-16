@@ -1,3 +1,5 @@
+# Full gates must have passed on this exact tree before any source commit
+node ../build-policy/scripts/policy.js verify-marker || exit 1
 node ../build-policy/scripts/policy.js gates --fast || {
   echo ""
   echo "Pre-commit gates failed. Fix the issues above, or run:"

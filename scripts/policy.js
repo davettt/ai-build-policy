@@ -14,6 +14,8 @@
  *   check [dir]         Project compliance check (structure, scripts, drift, staleness)
  *   gates [dir]         Run quality gates in order; writes .policy/gates.json marker
  *                         --fast   pre-commit subset (validate + secrets)
+ *   verify-marker [dir] Pre-commit: block commit if source changed without a full-gates
+ *                         pass on this exact tree (called from .husky/pre-commit)
  *   verify-ready [dir]  Confirm gates marker matches current diff + changelog updated
  *                         --release      add release checks (version, attribution, checklist)
  *                         --ack-manual   record that manual release checks were performed
@@ -25,7 +27,9 @@
  * Hook modes (called by Claude Code hooks, not humans):
  *   check --hook        Terse output for SessionStart injection; always exits 0
  *   hook-stop           Stop hook: block turn-end if source changed without CHANGELOG entry
- *   hook-pretool        PreToolUse hook: block electron:build on a dirty tree
+ *                         or without a full-gates pass on the current tree
+ *   hook-pretool        PreToolUse hook: block electron:build on a dirty tree;
+ *                         redirect raw `semgrep scan` to `npm run sast`
  */
 
 'use strict';
@@ -130,7 +134,7 @@ function loadState(dir) {
 }
 function saveState(dir, state) {
   fs.mkdirSync(path.join(dir, '.policy'), { recursive: true });
-  fs.writeFileSync(statePath(dir), JSON.stringify(state, null, 2));
+  fs.writeFileSync(statePath(dir), JSON.stringify(state, null, 2) + '\n');
 }
 
 /**
@@ -207,14 +211,46 @@ function isSourceFile(f) {
   return SOURCE_PATTERNS.some((re) => re.test(f));
 }
 
+/**
+ * Versions that already have a built DMG in the release output — treated as
+ * shipped and frozen: new source work requires a version bump and a NEW
+ * CHANGELOG section, never amendments to a built version's entry.
+ */
+/** Top CHANGELOG entry's version, or null. */
+function changelogTopVersion(dir) {
+  const m = readFile(path.join(dir, 'CHANGELOG.md')).match(/^##\s*\[?(\d+\.\d+\.\d+)/m);
+  return m ? m[1] : null;
+}
+
+function builtDmgVersions(dir) {
+  const versions = new Set();
+  let entries = [];
+  try {
+    entries = fs.readdirSync(path.join(dir, 'release'));
+  } catch {
+    return versions;
+  }
+  for (const f of entries) {
+    const m = f.endsWith('.dmg') && f.match(/(\d+\.\d+\.\d+)/);
+    if (m) versions.add(m[1]);
+  }
+  return versions;
+}
+
 function diffHash(dir) {
-  const diff = sh('git diff HEAD', dir);
-  const status = sh('git status --porcelain', dir);
-  if (!diff.ok && !status.ok) return null;
-  return crypto
-    .createHash('sha256')
-    .update((diff.out || '') + '\n' + (status.out || ''))
-    .digest('hex');
+  // Hash the changed-file list + their current contents. Deliberately
+  // staging-invariant: `git add` must not invalidate a gates marker, so we
+  // hash file content directly rather than `git status`/`git diff` output
+  // (whose text changes between staged and unstaged states).
+  // .policy/ is gitignored in compliant projects, but exclude it explicitly —
+  // the gates marker written moments earlier must never invalidate itself.
+  const files = changedFiles(dir)
+    .filter((f) => !f.startsWith('.policy/'))
+    .sort();
+  const h = crypto.createHash('sha256');
+  h.update(files.join('\n'));
+  for (const f of files) h.update('\0' + readFile(path.join(dir, f)));
+  return h.digest('hex');
 }
 
 // ------------------------------------------------------------------- check
@@ -247,6 +283,9 @@ function cmdCheck(dir) {
   const missing = required.filter((s) => !scripts[s]);
   if (missing.length === 0) ok(`All ${required.length} required npm scripts present`);
   else fail(`Missing npm scripts: ${missing.join(', ')} (run: policy scaffold)`);
+  if (scripts.sast && !scripts.sast.includes('--error')) {
+    fail(`sast script missing --error — semgrep findings cannot fail the gate locally (CI will fail where local passed)`);
+  }
 
   // Required devDependencies
   const devDeps = proj.pkg.devDependencies || {};
@@ -262,6 +301,7 @@ function cmdCheck(dir) {
     ['CHANGELOG.md', 'changelog'],
     ['README.md', 'readme'],
     ['.husky/pre-commit', 'husky pre-commit hook'],
+    ['AGENTS.md', 'agent instructions (non-Claude agents)'],
   ];
   for (const [f, label] of requiredFiles) {
     if (exists(path.join(dir, f))) ok(`${label} present`);
@@ -270,7 +310,7 @@ function cmdCheck(dir) {
 
   // .gitignore rules
   const gi = readFile(path.join(dir, '.gitignore'));
-  for (const entry of ['.env', 'local_data', 'node_modules', '.claude']) {
+  for (const entry of ['.env', 'local_data', 'node_modules', '.claude', '.policy']) {
     if (!gi.includes(entry)) fail(`.gitignore missing entry: ${entry}`);
   }
   if (proj.isElectron && /^build\/?\s*$/m.test(gi)) {
@@ -291,6 +331,17 @@ function cmdCheck(dir) {
     else warn('No public/manifest.json — web apps should ship PWA icons');
   }
 
+  // Shipped version frozen: source changes on a version that already has a DMG
+  if (proj.pkg && proj.pkg.version && builtDmgVersions(dir).has(proj.pkg.version)) {
+    if (changedFiles(dir).filter(isSourceFile).length > 0) {
+      fail(
+        `Source changed but version ${proj.pkg.version} already has a built DMG (shipped = frozen) — bump the version and start a new CHANGELOG section`,
+      );
+    } else {
+      ok(`Version ${proj.pkg.version} shipped (DMG built), no new source changes`);
+    }
+  }
+
   // CHANGELOG freshness vs package version
   const cl = readFile(path.join(dir, 'CHANGELOG.md'));
   const topVersion = (cl.match(/^##\s*\[?(\d+\.\d+\.\d+)/m) || [])[1];
@@ -306,6 +357,24 @@ function cmdCheck(dir) {
     if (norm(readFile(ciPath)) !== norm(readFile(path.join(TEMPLATES, 'ci.yml')))) {
       warn('ci.yml differs from the current shared template (policy scaffold shows the diff source: templates/ci.yml)');
     } else ok('CI workflow matches shared template');
+  }
+
+  // Pre-commit hook template drift
+  const pcPath = path.join(dir, '.husky/pre-commit');
+  if (exists(pcPath)) {
+    const norm = (s) => s.replace(/\s+/g, ' ').trim();
+    if (norm(readFile(pcPath)) !== norm(readFile(path.join(TEMPLATES, 'pre-commit')))) {
+      warn('.husky/pre-commit differs from the current shared template (templates/pre-commit)');
+    } else ok('Pre-commit hook matches shared template');
+  }
+
+  // AGENTS.md template drift (non-Claude agents rely on this being current)
+  const agPath = path.join(dir, 'AGENTS.md');
+  if (exists(agPath)) {
+    const norm = (s) => s.replace(/\s+/g, ' ').trim();
+    if (norm(readFile(agPath)) !== norm(readFile(path.join(TEMPLATES, 'AGENTS.md')))) {
+      warn('AGENTS.md differs from the current shared template (templates/AGENTS.md)');
+    } else ok('AGENTS.md matches shared template');
   }
 
   // Uncommitted work notice (context for session start)
@@ -404,7 +473,10 @@ function cmdGates(dir, flags) {
       console.log(`${RED}FAIL${RESET} ${DIM}${secs}s${RESET}\n`);
       const tail = r.out.split('\n').slice(-40).join('\n');
       console.log(tail);
-      console.log(`\n${RED}${BOLD}Gate failed: ${g.name}.${RESET} Fix and re-run: policy gates${fast ? ' --fast' : ''}\n`);
+      console.log(
+        `\n${RED}${BOLD}Gate failed: ${g.name}.${RESET} Fix, then re-run FULL gates (a commit needs the full-gates marker): policy gates\n` +
+          (fast ? `${DIM}(--fast is only the pre-commit subset — it does not write the marker)${RESET}\n` : ''),
+      );
       process.exit(1);
     }
   }
@@ -412,9 +484,39 @@ function cmdGates(dir, flags) {
   if (!fast) {
     const marker = { diffHash: diffHash(dir), timestamp: new Date().toISOString(), gates: report.map((r) => r.gate) };
     fs.mkdirSync(path.join(dir, '.policy'), { recursive: true });
-    fs.writeFileSync(path.join(dir, '.policy', 'gates.json'), JSON.stringify(marker, null, 2));
+    // Trailing newline keeps the marker prettier-clean in projects where
+    // .policy/ isn't (yet) gitignored/prettierignored.
+    fs.writeFileSync(path.join(dir, '.policy', 'gates.json'), JSON.stringify(marker, null, 2) + '\n');
   }
   console.log(`\n${GREEN}${BOLD}All ${report.length} gates passed.${RESET}${fast ? '' : ' Marker written (.policy/gates.json).'}\n`);
+}
+
+// ----------------------------------------------------------- verify-marker
+
+/**
+ * Pre-commit enforcement: source files changed => full gates must have passed
+ * on this exact tree (.policy/gates.json diffHash matches). Doc-only commits
+ * pass without a marker. Exits 1 to block the commit otherwise.
+ */
+function cmdVerifyMarker(dir) {
+  guardLocalPath(dir);
+  const proj = detectProject(dir);
+  if (!proj.hasPkg || !proj.isGit) return;
+  const sourceChanged = changedFiles(dir).filter(isSourceFile);
+  if (sourceChanged.length === 0) return;
+  const marker = readJSON(path.join(dir, '.policy', 'gates.json'));
+  if (marker && marker.diffHash === diffHash(dir)) {
+    console.log(`${GREEN}✓${RESET} Full gates passed on this exact tree (${marker.timestamp})`);
+    return;
+  }
+  console.log(
+    `\n${RED}${BOLD}BUILD-POLICY: commit blocked.${RESET} ` +
+      (marker
+        ? `Source changed since full gates last passed (${marker.timestamp}).`
+        : 'Source changed but full quality gates have never passed on this tree.') +
+      `\nRun full gates, then commit:\n  node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} gates\n`,
+  );
+  process.exit(1);
 }
 
 // ------------------------------------------------------------ verify-ready
@@ -472,6 +574,11 @@ function cmdVerifyReady(dir, flags) {
   // 2. CHANGELOG updated alongside source changes
   const changed = changedFiles(dir);
   const sourceChanged = changed.filter(isSourceFile);
+  if (proj.pkg && proj.pkg.version && sourceChanged.length > 0 && builtDmgVersions(dir).has(proj.pkg.version)) {
+    fail(
+      `Version ${proj.pkg.version} already shipped as a DMG — bump the version and start a new CHANGELOG section before declaring ready`,
+    );
+  }
   if (sourceChanged.length > 0 && !changed.includes('CHANGELOG.md')) {
     fail(`${sourceChanged.length} source file(s) changed but CHANGELOG.md not updated`);
   } else if (sourceChanged.length > 0) {
@@ -480,14 +587,40 @@ function cmdVerifyReady(dir, flags) {
     ok('No uncommitted source changes');
   }
 
-  // 3. Smoke coverage for API routes (warn-level heuristic)
+  // 3. Smoke coverage for API routes — ratcheted: existing gaps are recorded
+  // as a baseline (debt, warned); NEW uncovered routes FAIL. The baseline
+  // auto-shrinks as tests are added, and can never grow.
   if (proj.hasServer) {
     const routes = apiRoutes(dir);
     const smoke = readFile(path.join(dir, 'tests', 'smoke.js'));
     if (routes.length > 0 && smoke) {
       const uncovered = routes.filter((r) => !smoke.includes(r.split('/:')[0]));
-      if (uncovered.length > 0) warn(`API routes with no smoke coverage: ${uncovered.join(', ')}`);
-      else ok(`All ${routes.length} detected API routes appear in smoke tests`);
+      const state = loadState(dir);
+      const baseline = state.smokeGapBaseline;
+      if (uncovered.length === 0) {
+        ok(`All ${routes.length} detected API routes appear in smoke tests`);
+        if (baseline && baseline.length > 0) {
+          state.smokeGapBaseline = [];
+          saveState(dir, state);
+        }
+      } else if (!baseline) {
+        state.smokeGapBaseline = uncovered.sort();
+        saveState(dir, state);
+        warn(
+          `API routes with no smoke coverage (recorded as debt baseline, new gaps will FAIL): ${uncovered.join(', ')}`,
+        );
+      } else {
+        const fresh = uncovered.filter((r) => !baseline.includes(r));
+        if (fresh.length > 0)
+          fail(`NEW API routes with no smoke coverage (cover them before shipping): ${fresh.join(', ')}`);
+        const remaining = uncovered.filter((r) => baseline.includes(r));
+        if (remaining.length < baseline.length) {
+          state.smokeGapBaseline = remaining.sort();
+          saveState(dir, state);
+        }
+        if (remaining.length > 0)
+          warn(`Smoke-coverage debt (baseline, shrink over time): ${remaining.length} route(s)`);
+      }
     }
   }
 
@@ -495,29 +628,45 @@ function cmdVerifyReady(dir, flags) {
   return finish();
 }
 
+// Banner verification exploits the deliberate mismatch check (app version !==
+// site version.json => banner): installing the new DMG while the site still
+// lists the old version proves the banner machinery fires; updating the site
+// then proves the match clears it. Same code path a real user's old app hits.
 const RELEASE_MANUAL_CHECKLIST = [
-  'Clean-account test: installed the PREVIOUS release DMG in the test account',
-  'Uploaded new DMG to Gumroad, then updated the site version.json',
-  'Update banner appeared in the previous version (test account, live site)',
-  'Installed new DMG over previous in test account: banner cleared, first-run + one core flow work',
-  'Dogfood: installed new DMG over your own real install; data migrated, settings intact',
+  'Installed new DMG over previous (dogfood): data migrated, settings intact, first-run + one core flow work',
+  'Update banner VISIBLE in the new build (site version.json still lists the previous version)',
+  'Uploaded new DMG to Gumroad, then updated site version.json + changelog + listing',
+  'Update banner CLEARED after site update (versions match; relaunch app to re-fetch)',
+  'Release marketing drafts prepped in app-marketing',
 ];
 
 function verifyRelease(dir, proj, flags) {
   section('Release checks');
 
-  // Version bumped vs last tag
+  // Version bumped vs last tag. Tag-at-release flow: pkg == tag is CORRECT
+  // when the tag sits at HEAD (this release, already tagged); it is a missed
+  // bump only when commits landed after the tag.
   const tag = sh('git describe --tags --abbrev=0', dir);
   if (tag.ok && proj.pkg) {
     const last = tag.out.replace(/^v/, '');
-    if (last === proj.pkg.version) fail(`package.json version (${proj.pkg.version}) equals last git tag — bump it`);
-    else ok(`Version bumped: ${last} -> ${proj.pkg.version}`);
-  } else warn('No git tags found — tag releases so version bumps are verifiable');
+    if (last === proj.pkg.version) {
+      const ahead = sh(`git rev-list ${safeToken(tag.out, 'git tag')}..HEAD --count`, dir);
+      if (ahead.ok && ahead.out.trim() === '0')
+        ok(`Release ${proj.pkg.version} tagged at HEAD (${tag.out})`);
+      else
+        fail(
+          `Commits exist after tag ${tag.out} but package.json is still ${proj.pkg.version} — bump it`,
+        );
+    } else ok(`Version bumped: ${last} -> ${proj.pkg.version}`);
+  } else warn('No git tags found — tag releases so version bumps are verifiable (git tag v<version> at each release commit)');
 
-  // CHANGELOG has an entry for this version
-  const cl = readFile(path.join(dir, 'CHANGELOG.md'));
-  if (proj.pkg && cl.includes(proj.pkg.version)) ok(`CHANGELOG has an entry for ${proj.pkg.version}`);
-  else fail(`CHANGELOG.md has no entry for version ${proj.pkg && proj.pkg.version}`);
+  // CHANGELOG top entry IS this version (includes() would match old entries)
+  const relTopVer = changelogTopVersion(dir);
+  if (proj.pkg && relTopVer === proj.pkg.version) ok(`CHANGELOG top entry matches release version (${relTopVer})`);
+  else
+    fail(
+      `CHANGELOG top entry (${relTopVer || 'none'}) is not the release version (${proj.pkg && proj.pkg.version}) — bump/align before shipping`,
+    );
 
   // Third-party attribution shipped
   if (proj.isElectron) {
@@ -592,7 +741,7 @@ const STANDARD_SCRIPTS = {
   format: 'prettier --write .',
   'format:check': 'prettier --check .',
   security: 'npm audit --audit-level=high',
-  sast: 'semgrep scan --config auto --quiet',
+  sast: 'semgrep scan --config auto --error --quiet',
   secrets: 'betterleaks git . -v',
   licenses: "license-checker --production --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary",
   'licenses:file': 'license-checker --production > THIRD-PARTY-LICENSES.txt',
@@ -621,6 +770,7 @@ function cmdScaffold(dir) {
   };
 
   copy('gitignore', '.gitignore');
+  copy('AGENTS.md', 'AGENTS.md');
   copy('dependabot.yml', '.github/dependabot.yml');
   copy('ci.yml', '.github/workflows/ci.yml');
   copy('pre-commit', '.husky/pre-commit');
@@ -875,7 +1025,9 @@ function readStdinJSON() {
   }
 }
 
-/** Stop hook: block turn-end when source changed without a CHANGELOG update. */
+/** Stop hook: block turn-end when source changed without a CHANGELOG update
+ *  or without a full-gates pass on the current tree. One combined block per
+ *  turn (stop_hook_active guard), so all reasons are reported together. */
 function cmdHookStop() {
   const input = readStdinJSON();
   if (input.stop_hook_active) process.exit(0); // never loop
@@ -884,39 +1036,124 @@ function cmdHookStop() {
   if (!proj.hasPkg || !proj.isGit) process.exit(0);
   const changed = changedFiles(dir);
   const sourceChanged = changed.filter(isSourceFile);
-  if (sourceChanged.length > 0 && !changed.includes('CHANGELOG.md') && exists(path.join(dir, 'CHANGELOG.md'))) {
+  if (sourceChanged.length === 0) process.exit(0);
+
+  const reasons = [];
+  if (!changed.includes('CHANGELOG.md') && exists(path.join(dir, 'CHANGELOG.md'))) {
+    reasons.push(
+      `CHANGELOG.md was not updated — every code change gets a changelog entry before the turn ends. ` +
+        `Update it now (or state why no entry is needed).`,
+    );
+  }
+  if (proj.pkg && proj.pkg.version && builtDmgVersions(dir).has(proj.pkg.version)) {
+    reasons.push(
+      `Version ${proj.pkg.version} already has a built DMG in release/ — it is shipped and FROZEN. ` +
+        `Bump the version in package.json (patch for fixes, minor for features) and start a NEW ` +
+        `CHANGELOG section for it. Never amend a shipped version's changelog entry.`,
+    );
+  }
+  const topVer = changelogTopVersion(dir);
+  if (proj.pkg && proj.pkg.version && topVer && topVer !== proj.pkg.version) {
+    reasons.push(
+      `CHANGELOG top entry is ${topVer} but package.json is ${proj.pkg.version} — they must move together. ` +
+        `A new CHANGELOG section means bumping package.json to match, in the same turn.`,
+    );
+  }
+  const marker = readJSON(path.join(dir, '.policy', 'gates.json'));
+  if (!marker || marker.diffHash !== diffHash(dir)) {
+    reasons.push(
+      `Full quality gates have NOT passed on the current tree` +
+        (marker ? ` (last pass: ${marker.timestamp}, tree has changed since)` : ' (no gates marker)') +
+        `. If you are presenting this work as ready or asking the developer to commit, run them now: ` +
+        `node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} gates — the pre-commit hook will reject the commit without this. ` +
+        `If you are mid-iteration and not presenting yet, state that explicitly and continue.`,
+    );
+  }
+  if (reasons.length > 0) {
     console.log(
       JSON.stringify({
         decision: 'block',
         reason:
-          `Source files changed (${sourceChanged.slice(0, 5).join(', ')}${sourceChanged.length > 5 ? ', ...' : ''}) ` +
-          `but CHANGELOG.md was not updated. BUILD-POLICY: every code change gets a changelog entry before the turn ends. ` +
-          `Update CHANGELOG.md now (or state why no entry is needed and proceed).`,
+          `Source files changed (${sourceChanged.slice(0, 5).join(', ')}${sourceChanged.length > 5 ? ', ...' : ''}). BUILD-POLICY:\n` +
+          reasons.map((r, i) => `${i + 1}. ${r}`).join('\n'),
       }),
     );
   }
   process.exit(0);
 }
 
-/** PreToolUse hook: block electron DMG builds while the working tree is dirty. */
+/** PreToolUse hook: block electron DMG builds while the working tree is dirty;
+ *  redirect raw semgrep invocations to the policy-defined script. */
 function cmdHookPretool() {
   const input = readStdinJSON();
   const cmd = (input.tool_input && input.tool_input.command) || '';
+  // --ack-manual is the developer's signature that manual release checks
+  // (dogfood install, banner, Gumroad upload) were personally performed. The
+  // AI cannot know that — it must never record the ack itself.
+  if (input.tool_name === 'Bash' && /--ack-manual/.test(cmd)) {
+    console.log(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            'BUILD-POLICY: --ack-manual is the DEVELOPER\'s signature that the manual release checks were personally performed — the AI must never run it. ' +
+            'Show the developer the checklist and ask them to run: node ../build-policy/scripts/policy.js verify-ready --release --ack-manual ' +
+            '(they can type it with a ! prefix to run it in this session).',
+        },
+      }),
+    );
+    process.exit(0);
+  }
+  // Raw `semgrep scan` drifts from the gate's flags (that drift is exactly how
+  // CI failed where local passed). Steer to the policy-defined invocation.
+  if (input.tool_name === 'Bash' && /\bsemgrep\s+scan\b/.test(cmd) && !/npm run sast/.test(cmd)) {
+    console.log(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            'BUILD-POLICY: do not invoke semgrep directly — flag drift between ad-hoc runs and the gate is how CI fails where local passed. ' +
+            'Use the policy-defined script: `npm run sast` (identical flags to CI). ' +
+            'Extra output flags go after --, e.g. `npm run sast -- --json`. ' +
+            'The full gate sequence is `node ../build-policy/scripts/policy.js gates`.',
+        },
+      }),
+    );
+    process.exit(0);
+  }
   if (input.tool_name === 'Bash' && /electron:build|electron-builder/.test(cmd)) {
     const dir = process.cwd();
-    const status = sh('git status --porcelain', dir);
-    if (status.ok && status.out.trim().length > 0) {
+    const deny = (reason) => {
       console.log(
         JSON.stringify({
           hookSpecificOutput: {
             hookEventName: 'PreToolUse',
             permissionDecision: 'deny',
-            permissionDecisionReason:
-              'BUILD-POLICY: never build a DMG with uncommitted changes. ' +
-              'The build order is gates -> review -> developer commits -> THEN build. ' +
-              'Commit (developer) or stash first, then rebuild.',
+            permissionDecisionReason: reason,
           },
         }),
+      );
+      process.exit(0);
+    };
+    const status = sh('git status --porcelain', dir);
+    if (status.ok && status.out.trim().length > 0) {
+      deny(
+        'BUILD-POLICY: never build a DMG with uncommitted changes. ' +
+          'The build order is gates -> review -> developer commits -> THEN build. ' +
+          'Commit (developer) or stash first, then rebuild.',
+      );
+    }
+    // Version consistency: the DMG bakes in package.json's version — building
+    // while the CHANGELOG top entry names a different version ships the wrong one.
+    const pkg = readJSON(path.join(dir, 'package.json'));
+    const topVer = changelogTopVersion(dir);
+    if (pkg && pkg.version && topVer && topVer !== pkg.version) {
+      deny(
+        `BUILD-POLICY: CHANGELOG top entry is ${topVer} but package.json is ${pkg.version} — ` +
+          `this build would produce a ${pkg.version} DMG for ${topVer}'s changes. ` +
+          `Bump package.json to ${topVer} (developer commits the bump), then build.`,
       );
     }
   }
@@ -940,6 +1177,8 @@ function main() {
       return cmdCheck(dir);
     case 'gates':
       return cmdGates(dir, flags);
+    case 'verify-marker':
+      return cmdVerifyMarker(dir);
     case 'verify-ready':
       return cmdVerifyReady(dir, flags);
     case 'health':
