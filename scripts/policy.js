@@ -412,6 +412,16 @@ function cmdCheck(dir) {
     } else ok('Pre-commit hook matches shared template');
   }
 
+  // Dependabot config template drift (quote-style-insensitive) — presence-only
+  // checking let projects fork on cooldown settings
+  const dbPath = path.join(dir, '.github/dependabot.yml');
+  if (exists(dbPath)) {
+    const norm = (s) => s.replace(/['"]/g, '').replace(/\s+/g, ' ').trim();
+    if (norm(readFile(dbPath)) !== norm(readFile(path.join(TEMPLATES, 'dependabot.yml')))) {
+      fail('dependabot.yml differs from the shared template — sync: cp ../build-policy/templates/dependabot.yml .github/dependabot.yml (deviations belong in the template)');
+    } else ok('Dependabot config matches shared template');
+  }
+
   // AGENTS.md template drift (non-Claude agents rely on this being current)
   const agPath = path.join(dir, 'AGENTS.md');
   if (exists(agPath)) {

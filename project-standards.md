@@ -324,11 +324,13 @@ npm run sast        # semgrep scan --config auto --error (with exclusions)
 - `express-res-sendfile` — can't detect validation guards (`isValidSafetyName` checks `basename === filename` + prefix/suffix) before `sendFile()`
 - `remote-property-injection` — can't distinguish static allowlist iteration (`for (const key of allowed)`) from user-controlled bracket keys
 
+These four are the ONLY sanctioned global exclusions. Anything else is suppressed per-line with `// nosemgrep: <rule-suffix>` on the specific finding (e.g. `unsafe-formatstring` on `console.error` of server-internal values), so each suppression stays visible in review. Never exclude `dependabot-missing-cooldown` — it means `.github/dependabot.yml` is missing the template's `cooldown:` block (valid keys are `default-days`/`semver-*-days`; bare `semver-minor:`/`semver-patch:` are invalid and break Dependabot).
+
 **Required ESLint plugins:**
 - `@typescript-eslint` — TypeScript-aware rules
 - `eslint-plugin-react-hooks` — React Hooks rules
 - `eslint-plugin-import` — Import ordering
-- `eslint-plugin-security` — Security anti-pattern detection (eval, non-literal require, regex DoS)
+- `eslint-plugin-security` — Security anti-pattern detection (eval, non-literal require, regex DoS). Sanctioned rule-offs (triaged, too noisy for local-data apps): `security/detect-object-injection`, `security/detect-non-literal-fs-filename`. All other security rules stay on, and the ESLint config must cover ALL first-party code — never add `server/` (or any source dir) to `ignores`.
 
 **Required Prettier plugins:**
 - `prettier-plugin-tailwindcss` — Tailwind class sorting
