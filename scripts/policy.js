@@ -308,11 +308,55 @@ function cmdCheck(dir) {
     else fail(`Missing ${label}: ${f} (run: policy scaffold)`);
   }
 
-  // .gitignore rules
-  const gi = readFile(path.join(dir, '.gitignore'));
-  for (const entry of ['.env', 'local_data', 'node_modules', '.claude', '.policy']) {
-    if (!gi.includes(entry)) fail(`.gitignore missing entry: ${entry}`);
+  // .gitignore effectiveness — some repos are public, so private context and
+  // data must be unpublishable. Test what git would actually ignore (pattern
+  // semantics), not what .gitignore happens to mention as a substring.
+  const privatePaths = [
+    '.env',
+    '.env.local',
+    'local_data/x',
+    'node_modules/x',
+    '.claude/x',
+    'CLAUDE.md',
+    'CLAUDE.local.md',
+    'AGENTS.md',
+    '.policy/x',
+  ];
+  if (proj.isGit) {
+    const ci = sh(`git check-ignore -- ${privatePaths.join(' ')}`, dir);
+    const ignored = new Set(ci.out.split('\n').filter(Boolean));
+    const unignored = privatePaths.filter((p) => !ignored.has(p));
+    if (unignored.length > 0) {
+      fail(
+        `.gitignore does not cover: ${unignored.map((p) => p.replace(/\/x$/, '/')).join(', ')} — a 'git add .' would stage private files. Sync with templates/gitignore`,
+      );
+    } else ok('.gitignore covers all private paths (verified via git check-ignore)');
+
+    // Ignoring is meaningless if the file is already tracked. Committed
+    // placeholders (.env.example/.env.template/.gitkeep) are fine by design.
+    const trackedRaw = sh(
+      `git ls-files -- .env '.env.*' .claude CLAUDE.md CLAUDE.local.md AGENTS.md local_data .policy`,
+      dir,
+    );
+    const tracked = {
+      ok: trackedRaw.ok,
+      out: trackedRaw.out
+        .split('\n')
+        .filter((f) => f && !/\.env\.(example|sample|template)$/.test(f) && !f.endsWith('.gitkeep'))
+        .join('\n'),
+    };
+    if (tracked.ok && tracked.out) {
+      fail(
+        `Private files are TRACKED in git (would publish with the repo): ${tracked.out.split('\n').join(', ')} — git rm --cached them (developer runs this) before any push`,
+      );
+    } else ok('No private files tracked in git');
+  } else {
+    const gi = readFile(path.join(dir, '.gitignore'));
+    for (const entry of ['.env', 'local_data', 'node_modules', '.claude', 'CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.md', '.policy']) {
+      if (!gi.includes(entry)) fail(`.gitignore missing entry: ${entry}`);
+    }
   }
+  const gi = readFile(path.join(dir, '.gitignore'));
   if (proj.isElectron && /^build\/?\s*$/m.test(gi)) {
     fail('.gitignore ignores build/ — Electron apps must commit build/icon.png and entitlements');
   }
@@ -355,7 +399,7 @@ function cmdCheck(dir) {
   if (exists(ciPath)) {
     const norm = (s) => s.replace(/\s+/g, ' ').trim();
     if (norm(readFile(ciPath)) !== norm(readFile(path.join(TEMPLATES, 'ci.yml')))) {
-      warn('ci.yml differs from the current shared template (policy scaffold shows the diff source: templates/ci.yml)');
+      fail('ci.yml differs from the shared template — sync it: cp ../build-policy/templates/ci.yml .github/workflows/ci.yml (deviations belong in the template, not the project)');
     } else ok('CI workflow matches shared template');
   }
 
@@ -364,7 +408,7 @@ function cmdCheck(dir) {
   if (exists(pcPath)) {
     const norm = (s) => s.replace(/\s+/g, ' ').trim();
     if (norm(readFile(pcPath)) !== norm(readFile(path.join(TEMPLATES, 'pre-commit')))) {
-      warn('.husky/pre-commit differs from the current shared template (templates/pre-commit)');
+      fail('.husky/pre-commit differs from the shared template — THIS PROJECT IS UNENFORCED (no verify-marker). Sync: cp ../build-policy/templates/pre-commit .husky/pre-commit');
     } else ok('Pre-commit hook matches shared template');
   }
 
@@ -373,7 +417,7 @@ function cmdCheck(dir) {
   if (exists(agPath)) {
     const norm = (s) => s.replace(/\s+/g, ' ').trim();
     if (norm(readFile(agPath)) !== norm(readFile(path.join(TEMPLATES, 'AGENTS.md')))) {
-      warn('AGENTS.md differs from the current shared template (templates/AGENTS.md)');
+      fail('AGENTS.md differs from the shared template — sync: cp ../build-policy/templates/AGENTS.md AGENTS.md');
     } else ok('AGENTS.md matches shared template');
   }
 
@@ -849,6 +893,21 @@ function cmdMirror() {
     else ok(`${doc} versions match (${ver(priv)})`);
   }
 
+  // Drift: scripts/ and templates/ are mirrored verbatim ("enforcement is
+  // publicly verifiable") — any byte difference means the mirror is stale.
+  for (const sub of ['scripts', 'templates']) {
+    const privDir = path.join(POLICY_ROOT, sub);
+    const pubDir = path.join(PUBLIC_ROOT, sub);
+    const list = (d) => (exists(d) ? fs.readdirSync(d).filter((f) => !f.startsWith('.')) : []);
+    const names = [...new Set([...list(privDir), ...list(pubDir)])].sort();
+    const stale = names.filter((f) => readFile(path.join(privDir, f)) !== readFile(path.join(pubDir, f)));
+    if (stale.length > 0) {
+      fail(
+        `${sub}/ drift vs public mirror: ${stale.join(', ')} — sync: cp ${stale.map((f) => `${sub}/${f}`).join(' ')} ../build-policy-public/${sub}/`,
+      );
+    } else ok(`${sub}/ matches public mirror (${names.length} files)`);
+  }
+
   // Leak scan: blocklist terms + generic patterns must not appear in public files.
   // '!'-prefixed terms are checked everywhere; others are exempt in README.md
   // (which carries deliberate branding).
@@ -857,7 +916,13 @@ function cmdMirror() {
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith('#'))
     .map((l) => (l.startsWith('!') ? { term: l.slice(1), everywhere: true } : { term: l, everywhere: false }));
-  const genericPatterns = [/\/Users\/[a-z]+/i, /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i];
+  // Third generic pattern: Apple app-specific password shape (xxxx-xxxx-xxxx-xxxx,
+  // lowercase letters) — covered here so the literal never lives in the blocklist.
+  const genericPatterns = [
+    /\/Users\/[a-z]+/i,
+    /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i,
+    /\b[a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4}\b/,
+  ];
   let leaks = 0;
   const walk = (d) => {
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
@@ -876,9 +941,14 @@ function cmdMirror() {
         }
         if (!isReadme) {
           for (const re of genericPatterns) {
-            const m = content.match(re);
-            if (m && !/^(your|you|user|name|example|placeholder|someone)@/i.test(m[0])) {
-              fail(`Leak in public mirror ${rel}: matches ${re} ("${m[0]}")`);
+            // Check every match, not just the first — a doc placeholder must
+            // not mask a real secret later in the same file.
+            const all = content.match(new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g')) || [];
+            const hit = all.find(
+              (s) => !/^(your|you|user|name|example|placeholder|someone)@/i.test(s) && s !== 'xxxx-xxxx-xxxx-xxxx',
+            );
+            if (hit) {
+              fail(`Leak in public mirror ${rel}: matches ${re} ("${hit}")`);
               leaks++;
             }
           }
