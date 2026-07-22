@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.2
-**Last updated:** 2026-07-16
+**Version:** 2.3
+**Last updated:** 2026-07-22
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -416,7 +416,10 @@ Before modifying or removing any code that enforces a constraint, cap, guard, or
 
 - All PRs reviewed by **CodeRabbit** before merge
 - Address all critical and high-severity findings
-- Use `coderabbit:review` skill for on-demand reviews during development
+- **The enforced path is the CLI, not the plugin:** `policy gates` runs `npm run review` (`coderabbit review --agent`) as a blocking gate, and the pre-commit verify-marker refuses commits without it. Never substitute a plugin/skill invocation for that gate — a skill runs only if the agent chooses to invoke it; the gate blocks.
+- Plugin skills are for the two things the CLI cannot do (it reviews the local working diff only):
+  - `coderabbit:autofix` — apply CodeRabbit feedback from **GitHub PR review threads**, per-change approval (use for Dependabot/PR follow-ups)
+  - `coderabbit:code-review` — ad-hoc mid-development review between gate runs
 - **Socket** scans dependencies for supply chain risks (separate from code review — see Security section)
 
 ---

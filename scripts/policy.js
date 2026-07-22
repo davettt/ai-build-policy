@@ -287,6 +287,18 @@ function cmdCheck(dir) {
     fail(`sast script missing --error — semgrep findings cannot fail the gate locally (CI will fail where local passed)`);
   }
 
+  // Prettier config — without one, prettier runs on defaults (double quotes)
+  // and the project's format style silently drifts from the portfolio
+  const prcPath = ['.prettierrc', '.prettierrc.json'].map((f) => path.join(dir, f)).find(exists);
+  if (!prcPath) {
+    fail('Missing .prettierrc — prettier formats on defaults, drifting from house style (run: policy scaffold)');
+  } else {
+    const prc = readJSON(prcPath);
+    if (!prc) fail(`${path.basename(prcPath)} is not valid JSON`);
+    else if (prc.singleQuote !== true) fail(`${path.basename(prcPath)} must set "singleQuote": true (house style)`);
+    else ok('Prettier config present (house style)');
+  }
+
   // Required devDependencies
   const devDeps = proj.pkg.devDependencies || {};
   for (const dep of ['eslint-plugin-security', 'husky', 'license-checker', 'prettier']) {
@@ -828,6 +840,7 @@ function cmdScaffold(dir) {
   copy('dependabot.yml', '.github/dependabot.yml');
   copy('ci.yml', '.github/workflows/ci.yml');
   copy('pre-commit', '.husky/pre-commit');
+  copy('prettierrc', '.prettierrc');
   if (proj.hasHTML) copy('htmlvalidate.json', '.htmlvalidate.json');
   if (proj.hasCSS) copy('stylelintrc.json', '.stylelintrc.json');
   if (proj.isElectron) copy('entitlements.mac.plist', 'build/entitlements.mac.plist');
