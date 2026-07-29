@@ -21,6 +21,9 @@
  *                         --ack-manual   record that manual release checks were performed
  *   health [dir]        Maintenance run: outdated, audit, registry staleness; records timestamp
  *                         --socket   include a Socket supply-chain scan (uses quota)
+ *   upgrade <pkg>       Ground a MAJOR dependency upgrade: pull real peer-dep constraints
+ *                         + migration source from npm, scaffold a decision record under
+ *                         .claude/specs/deps/. check/verify-ready FAIL on an un-recorded major.
  *   scaffold [dir]      Create missing standard files/scripts (never overwrites)
  *   mirror              Check public mirror for drift and private-detail leaks
  *
@@ -120,6 +123,60 @@ function readFile(p) {
 
 function daysSince(iso) {
   return Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
+}
+
+// Leading major version from an npm range ("^8.0.3" -> 8, "~3.2" -> 3).
+// Returns null for anything non-numeric (*, workspace:*, git urls) so those
+// never produce a false "major bump" signal.
+function semverMajor(range) {
+  if (!range || typeof range !== 'string') return null;
+  const m = range.replace(/^[\^~>=<\s]*/, '').match(/^(\d+)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+// Decision-record identity for a major upgrade. Both the writer (cmdUpgrade)
+// and the enforcement check derive the filename this way, so they always agree.
+// "@types/dompurify" @ major 3 -> "types-dompurify-v3"
+function depRecordSlug(pkg, major) {
+  return `${pkg.replace(/^@/, '').replace(/\//g, '-')}-v${major}`;
+}
+
+// Shared enforcement: any dependency whose major version increased in the
+// working tree (vs the committed package.json) MUST have a grounded decision
+// record before the change can be presented or committed. Scoped to the
+// dirty-tree window on purpose — check/verify-ready both run pre-commit (like
+// the CHANGELOG check), so a major cannot reach a commit without passing here.
+function auditMajorUpgrades(dir, proj) {
+  if (!proj.isGit || !proj.pkg) return;
+  const headRaw = sh('git show HEAD:package.json', dir);
+  if (!headRaw.ok) return; // no prior commit of package.json — nothing to diff
+  let headPkg = null;
+  try {
+    headPkg = JSON.parse(headRaw.out);
+  } catch {
+    return;
+  }
+  const merge = (p) => ({ ...(p.dependencies || {}), ...(p.devDependencies || {}) });
+  const cur = merge(proj.pkg);
+  const prev = merge(headPkg);
+  const bumps = [];
+  for (const [name, range] of Object.entries(cur)) {
+    const now = semverMajor(range);
+    const was = semverMajor(prev[name]);
+    if (now != null && was != null && now > was) bumps.push({ name, from: was, to: now });
+  }
+  if (bumps.length === 0) {
+    ok('No un-recorded major dependency upgrades in working tree');
+    return;
+  }
+  for (const b of bumps) {
+    const rec = path.join(dir, '.claude', 'specs', 'deps', `${depRecordSlug(b.name, b.to)}.md`);
+    if (exists(rec)) ok(`Major upgrade ${b.name} v${b.from}→v${b.to}: decision record present`);
+    else
+      fail(
+        `Major upgrade ${b.name} v${b.from}→v${b.to} has NO grounded decision record — run 'policy upgrade ${b.name}' and complete .claude/specs/deps/${depRecordSlug(b.name, b.to)}.md before committing`,
+      );
+  }
 }
 
 function loadRegistry() {
@@ -255,7 +312,84 @@ function diffHash(dir) {
 
 // ------------------------------------------------------------------- check
 
-const BASE_SCRIPTS = ['lint', 'format:check', 'validate', 'quality', 'secrets', 'licenses', 'deps:check', 'review'];
+// Prettier keys every project must share. Deliberately a baseline, not the
+// whole of templates/prettierrc: projects legitimately differ on plugins and
+// comma/paren taste, but these four govern line shape, and a project that
+// deviates cannot be formatted with any other project's config.
+const PRETTIER_BASELINE = { semi: true, singleQuote: true, tabWidth: 2, printWidth: 100 };
+
+const BASE_SCRIPTS = [
+  'lint',
+  'format:check',
+  'validate',
+  'quality',
+  'secrets',
+  'licenses',
+  'deps:check',
+  'review',
+];
+
+// The policy docs state their version in a header line, and BUILD-POLICY.md
+// also carries a version-history table. A patch row appended without bumping
+// the header leaves the document disagreeing with itself — and everything
+// downstream (commit messages, the mirror drift check, anyone citing "policy
+// v2.4") inherits the wrong number. The mirror check only compares the two
+// headers to EACH OTHER, so a stale header passes it. Enforced here instead:
+// the header must equal the highest version the history records, the history
+// must read newest-first, and project-standards.md must track the same version.
+function auditPolicyDocVersions(root, label) {
+  const headerVer = (s) => (s.match(/\*\*Version:\*\*\s*([\d.]+)/) || [])[1];
+
+  const bp = readFile(path.join(root, 'BUILD-POLICY.md'));
+  if (!bp) return fail(`${label}: BUILD-POLICY.md not found`);
+  const bpVer = headerVer(bp);
+  if (!bpVer) return fail(`${label}: BUILD-POLICY.md has no "**Version:**" header`);
+
+  const rows = [...bp.matchAll(/^\|\s*(\d+(?:\.\d+)*)\s*\|\s*\d{4}-\d{2}-\d{2}\s*\|/gm)].map(
+    (m) => m[1],
+  );
+  if (rows.length === 0) {
+    fail(`${label}: BUILD-POLICY.md version-history table has no parsable rows`);
+  } else {
+    const newest = rows.reduce((a, b) => (cmpSemver(b, a) > 0 ? b : a));
+    if (bpVer !== newest) {
+      fail(
+        `${label}: BUILD-POLICY.md header says ${bpVer} but the version history records ${newest} — ` +
+          `bump the header (a new history row without a header bump makes every citation of the version wrong)`,
+      );
+    } else ok(`${label}: BUILD-POLICY.md header matches version history (${bpVer})`);
+
+    const misordered = rows.findIndex((v, i) => i > 0 && cmpSemver(v, rows[i - 1]) > 0);
+    if (misordered > 0) {
+      fail(
+        `${label}: BUILD-POLICY.md version history is not newest-first — ${rows[misordered]} appears below ` +
+          `${rows[misordered - 1]}; the top row must be the current version`,
+      );
+    }
+  }
+
+  const ps = readFile(path.join(root, 'project-standards.md'));
+  if (!ps) fail(`${label}: project-standards.md not found`);
+  else {
+    const psVer = headerVer(ps);
+    if (psVer !== bpVer) {
+      fail(
+        `${label}: project-standards.md header says ${psVer} but BUILD-POLICY.md is ${bpVer} — ` +
+          `the two docs ship as one policy version`,
+      );
+    } else ok(`${label}: project-standards.md tracks the policy version (${psVer})`);
+  }
+}
+
+function cmpSemver(a, b) {
+  const key = (v) => {
+    const p = v.split('.').map(Number);
+    return [p[0] || 0, p[1] || 0, p[2] || 0];
+  };
+  const [x, y] = [key(a), key(b)];
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] - y[i];
+  return 0;
+}
 
 function cmdCheck(dir) {
   guardLocalPath(dir);
@@ -263,6 +397,9 @@ function cmdCheck(dir) {
   const reg = loadRegistry();
 
   section(`Compliance check: ${path.resolve(dir)}`);
+
+  // Running inside the policy repo itself: the docs are the deliverable.
+  if (path.resolve(dir) === POLICY_ROOT) auditPolicyDocVersions(POLICY_ROOT, 'policy docs');
 
   if (!proj.hasPkg) {
     ok('No package.json — documentation-only project, structural checks skipped');
@@ -284,19 +421,60 @@ function cmdCheck(dir) {
   if (missing.length === 0) ok(`All ${required.length} required npm scripts present`);
   else fail(`Missing npm scripts: ${missing.join(', ')} (run: policy scaffold)`);
   if (scripts.sast && !scripts.sast.includes('--error')) {
-    fail(`sast script missing --error — semgrep findings cannot fail the gate locally (CI will fail where local passed)`);
+    fail(
+      `sast script missing --error — semgrep findings cannot fail the gate locally (CI will fail where local passed)`,
+    );
+  }
+  // Semgrep exclusion creep — fewer exclusions than sanctioned is fine
+  // (per-line nosemgrep is stricter); an UNsanctioned global exclusion is not.
+  if (scripts.sast) {
+    const sanctioned = (STANDARD_SCRIPTS.sast.match(/--exclude-rule\s+(\S+)/g) || []).map(
+      (e) => e.split(/\s+/)[1],
+    );
+    const present = (scripts.sast.match(/--exclude-rule\s+(\S+)/g) || []).map(
+      (e) => e.split(/\s+/)[1],
+    );
+    const rogue = present.filter((r) => !sanctioned.includes(r));
+    if (rogue.length > 0) {
+      fail(
+        `sast script has unsanctioned global exclusion(s): ${rogue.map((r) => r.split('.').pop()).join(', ')} — only the four documented exclusions may be global; triage each finding and use per-line // nosemgrep instead (project-standards § Semgrep rule exclusions)`,
+      );
+    }
+  }
+  // Audit gate drift — sessions must not improvise scope or thresholds
+  if (scripts.security && scripts.security !== STANDARD_SCRIPTS.security) {
+    fail(
+      `security script is "${scripts.security}" — standard is "${STANDARD_SCRIPTS.security}" (gate = shipped deps at high; 'policy health' audits the full tree incl dev). Weakened audit levels are never sanctioned.`,
+    );
   }
 
   // Prettier config — without one, prettier runs on defaults (double quotes)
   // and the project's format style silently drifts from the portfolio
   const prcPath = ['.prettierrc', '.prettierrc.json'].map((f) => path.join(dir, f)).find(exists);
   if (!prcPath) {
-    fail('Missing .prettierrc — prettier formats on defaults, drifting from house style (run: policy scaffold)');
+    fail(
+      'Missing .prettierrc — prettier formats on defaults, drifting from house style (run: policy scaffold)',
+    );
   } else {
     const prc = readJSON(prcPath);
     if (!prc) fail(`${path.basename(prcPath)} is not valid JSON`);
-    else if (prc.singleQuote !== true) fail(`${path.basename(prcPath)} must set "singleQuote": true (house style)`);
-    else ok('Prettier config present (house style)');
+    else {
+      // Baseline, not template equality: these four keys decide how code is
+      // shaped line-by-line, so a project that differs cannot be formatted with
+      // another project's config without rewriting the whole file (that is how
+      // a stray `prettier --write` reflows 700 lines). Everything else —
+      // trailingComma, arrowParens, plugins, endOfLine — is the project's call.
+      const wrong = Object.entries(PRETTIER_BASELINE).filter(([k, v]) => prc[k] !== v);
+      if (wrong.length > 0) {
+        fail(
+          `${path.basename(prcPath)} differs from the house baseline: ` +
+            wrong
+              .map(([k, v]) => `${k} is ${JSON.stringify(prc[k])}, must be ${JSON.stringify(v)}`)
+              .join('; ') +
+            ` — fixing it reformats the codebase once (npx prettier --write .), after which cross-project formatting is safe. Keys outside the baseline stay yours.`,
+        );
+      } else ok('Prettier config meets house baseline');
+    }
   }
 
   // Required devDependencies
@@ -364,7 +542,16 @@ function cmdCheck(dir) {
     } else ok('No private files tracked in git');
   } else {
     const gi = readFile(path.join(dir, '.gitignore'));
-    for (const entry of ['.env', 'local_data', 'node_modules', '.claude', 'CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.md', '.policy']) {
+    for (const entry of [
+      '.env',
+      'local_data',
+      'node_modules',
+      '.claude',
+      'CLAUDE.md',
+      'CLAUDE.local.md',
+      'AGENTS.md',
+      '.policy',
+    ]) {
       if (!gi.includes(entry)) fail(`.gitignore missing entry: ${entry}`);
     }
   }
@@ -380,11 +567,42 @@ function cmdCheck(dir) {
     if (exists(path.join(dir, 'build/entitlements.mac.plist'))) ok('Entitlements present');
     else fail('Missing build/entitlements.mac.plist');
     const mac = proj.pkg.build && proj.pkg.build.mac;
-    if (mac && mac.notarize && mac.hardenedRuntime) ok('Signing config: notarize + hardenedRuntime set');
+    if (mac && mac.notarize && mac.hardenedRuntime)
+      ok('Signing config: notarize + hardenedRuntime set');
     else warn('electron-builder mac config missing notarize/hardenedRuntime');
   } else if (proj.hasServer) {
     if (exists(path.join(dir, 'public/manifest.json'))) ok('PWA manifest present');
     else warn('No public/manifest.json — web apps should ship PWA icons');
+  }
+
+  // Smoke/integration tiers must be real. `check` used to accept any script
+  // named test:smoke, so an `echo 'no tests'` or a bare `npm run build` passed
+  // the gate while exercising nothing — green with zero coverage is worse than
+  // an honest red. The tiers are also required to be self-contained: a script
+  // that fetches a port only passes when a server happens to be running, which
+  // is not a test. Standard shape: tests/smoke.js + isolated tests/harness.js
+  // (own port, temp data dir) — project-standards § Testing.
+  // A missing test:smoke is already reported by the required-scripts check —
+  // only judge the tiers when a script actually exists to judge.
+  if (proj.hasServer && scripts['test:smoke']) {
+    const stub = (s) => /^\s*(echo|exit\s+0|true)\b/.test(s) || /^\s*npm run build\s*$/.test(s);
+    if (stub(scripts['test:smoke'])) {
+      fail(
+        `test:smoke is a stub (${JSON.stringify(scripts['test:smoke'] || '')}) — it passes the gate without testing anything; write tests/smoke.js hitting every API route (project-standards § Testing)`,
+      );
+    } else {
+      for (const [file, tier] of [
+        ['tests/smoke.js', 'test:smoke'],
+        ['tests/harness.js', 'test:integration'],
+      ]) {
+        if (exists(path.join(dir, file))) ok(`${tier}: ${file} present`);
+        else {
+          fail(
+            `Missing ${file} — ${tier} must run against an isolated server (own port, temp data dir), not whatever is live on the dev port; production data must never be touched by a test`,
+          );
+        }
+      }
+    }
   }
 
   // Shipped version frozen: source changes on a version that already has a DMG
@@ -402,7 +620,8 @@ function cmdCheck(dir) {
   const cl = readFile(path.join(dir, 'CHANGELOG.md'));
   const topVersion = (cl.match(/^##\s*\[?(\d+\.\d+\.\d+)/m) || [])[1];
   if (topVersion && proj.pkg.version) {
-    if (topVersion === proj.pkg.version) ok(`CHANGELOG top entry matches package version (${topVersion})`);
+    if (topVersion === proj.pkg.version)
+      ok(`CHANGELOG top entry matches package version (${topVersion})`);
     else warn(`CHANGELOG top entry (${topVersion}) != package.json version (${proj.pkg.version})`);
   }
 
@@ -411,7 +630,9 @@ function cmdCheck(dir) {
   if (exists(ciPath)) {
     const norm = (s) => s.replace(/\s+/g, ' ').trim();
     if (norm(readFile(ciPath)) !== norm(readFile(path.join(TEMPLATES, 'ci.yml')))) {
-      fail('ci.yml differs from the shared template — sync it: cp ../build-policy/templates/ci.yml .github/workflows/ci.yml (deviations belong in the template, not the project)');
+      fail(
+        'ci.yml differs from the shared template — sync it: cp ../build-policy/templates/ci.yml .github/workflows/ci.yml (deviations belong in the template, not the project)',
+      );
     } else ok('CI workflow matches shared template');
   }
 
@@ -420,7 +641,9 @@ function cmdCheck(dir) {
   if (exists(pcPath)) {
     const norm = (s) => s.replace(/\s+/g, ' ').trim();
     if (norm(readFile(pcPath)) !== norm(readFile(path.join(TEMPLATES, 'pre-commit')))) {
-      fail('.husky/pre-commit differs from the shared template — THIS PROJECT IS UNENFORCED (no verify-marker). Sync: cp ../build-policy/templates/pre-commit .husky/pre-commit');
+      fail(
+        '.husky/pre-commit differs from the shared template — THIS PROJECT IS UNENFORCED (no verify-marker). Sync: cp ../build-policy/templates/pre-commit .husky/pre-commit',
+      );
     } else ok('Pre-commit hook matches shared template');
   }
 
@@ -430,7 +653,9 @@ function cmdCheck(dir) {
   if (exists(dbPath)) {
     const norm = (s) => s.replace(/['"]/g, '').replace(/\s+/g, ' ').trim();
     if (norm(readFile(dbPath)) !== norm(readFile(path.join(TEMPLATES, 'dependabot.yml')))) {
-      fail('dependabot.yml differs from the shared template — sync: cp ../build-policy/templates/dependabot.yml .github/dependabot.yml (deviations belong in the template)');
+      fail(
+        'dependabot.yml differs from the shared template — sync: cp ../build-policy/templates/dependabot.yml .github/dependabot.yml (deviations belong in the template)',
+      );
     } else ok('Dependabot config matches shared template');
   }
 
@@ -439,9 +664,14 @@ function cmdCheck(dir) {
   if (exists(agPath)) {
     const norm = (s) => s.replace(/\s+/g, ' ').trim();
     if (norm(readFile(agPath)) !== norm(readFile(path.join(TEMPLATES, 'AGENTS.md')))) {
-      fail('AGENTS.md differs from the shared template — sync: cp ../build-policy/templates/AGENTS.md AGENTS.md');
+      fail(
+        'AGENTS.md differs from the shared template — sync: cp ../build-policy/templates/AGENTS.md AGENTS.md',
+      );
     } else ok('AGENTS.md matches shared template');
   }
+
+  // Major dependency upgrades must carry a grounded decision record
+  auditMajorUpgrades(dir, proj);
 
   // Uncommitted work notice (context for session start)
   if (proj.isGit) {
@@ -459,13 +689,16 @@ function checkStaleness(dir, reg) {
   const healthDays = (reg.staleness && reg.staleness.healthRunDays) || 30;
   if (state.lastHealthRun) {
     const d = daysSince(state.lastHealthRun);
-    if (d > healthDays) warn(`Maintenance overdue: last 'policy health' run ${d} days ago (run: policy health)`);
+    if (d > healthDays)
+      warn(`Maintenance overdue: last 'policy health' run ${d} days ago (run: policy health)`);
     else ok(`Maintenance current (last health run ${d} days ago)`);
   } else {
     warn(`No maintenance record — run 'policy health' to establish one`);
   }
 
-  const stale = Object.entries(reg.entries || {}).filter(([, e]) => daysSince(e.verified) > (e.reviewEveryDays || 90));
+  const stale = Object.entries(reg.entries || {}).filter(
+    ([, e]) => daysSince(e.verified) > (e.reviewEveryDays || 90),
+  );
   if (stale.length > 0) {
     warn(
       `Registry entries need re-verification (web-search current state, update registry.json): ` +
@@ -541,20 +774,31 @@ function cmdGates(dir, flags) {
       console.log(tail);
       console.log(
         `\n${RED}${BOLD}Gate failed: ${g.name}.${RESET} Fix, then re-run FULL gates (a commit needs the full-gates marker): policy gates\n` +
-          (fast ? `${DIM}(--fast is only the pre-commit subset — it does not write the marker)${RESET}\n` : ''),
+          (fast
+            ? `${DIM}(--fast is only the pre-commit subset — it does not write the marker)${RESET}\n`
+            : ''),
       );
       process.exit(1);
     }
   }
 
   if (!fast) {
-    const marker = { diffHash: diffHash(dir), timestamp: new Date().toISOString(), gates: report.map((r) => r.gate) };
+    const marker = {
+      diffHash: diffHash(dir),
+      timestamp: new Date().toISOString(),
+      gates: report.map((r) => r.gate),
+    };
     fs.mkdirSync(path.join(dir, '.policy'), { recursive: true });
     // Trailing newline keeps the marker prettier-clean in projects where
     // .policy/ isn't (yet) gitignored/prettierignored.
-    fs.writeFileSync(path.join(dir, '.policy', 'gates.json'), JSON.stringify(marker, null, 2) + '\n');
+    fs.writeFileSync(
+      path.join(dir, '.policy', 'gates.json'),
+      JSON.stringify(marker, null, 2) + '\n',
+    );
   }
-  console.log(`\n${GREEN}${BOLD}All ${report.length} gates passed.${RESET}${fast ? '' : ' Marker written (.policy/gates.json).'}\n`);
+  console.log(
+    `\n${GREEN}${BOLD}All ${report.length} gates passed.${RESET}${fast ? '' : ' Marker written (.policy/gates.json).'}\n`,
+  );
 }
 
 // ----------------------------------------------------------- verify-marker
@@ -634,13 +878,23 @@ function cmdVerifyReady(dir, flags) {
   const marker = readJSON(path.join(dir, '.policy', 'gates.json'));
   if (!marker) fail(`No gates marker — run 'policy gates' first`);
   else if (marker.diffHash !== diffHash(dir))
-    fail(`Working tree changed since gates last passed (${marker.timestamp}) — re-run 'policy gates'`);
-  else ok(`Gates passed for the current working tree (${marker.gates.length} gates, ${marker.timestamp})`);
+    fail(
+      `Working tree changed since gates last passed (${marker.timestamp}) — re-run 'policy gates'`,
+    );
+  else
+    ok(
+      `Gates passed for the current working tree (${marker.gates.length} gates, ${marker.timestamp})`,
+    );
 
   // 2. CHANGELOG updated alongside source changes
   const changed = changedFiles(dir);
   const sourceChanged = changed.filter(isSourceFile);
-  if (proj.pkg && proj.pkg.version && sourceChanged.length > 0 && builtDmgVersions(dir).has(proj.pkg.version)) {
+  if (
+    proj.pkg &&
+    proj.pkg.version &&
+    sourceChanged.length > 0 &&
+    builtDmgVersions(dir).has(proj.pkg.version)
+  ) {
     fail(
       `Version ${proj.pkg.version} already shipped as a DMG — bump the version and start a new CHANGELOG section before declaring ready`,
     );
@@ -678,7 +932,9 @@ function cmdVerifyReady(dir, flags) {
       } else {
         const fresh = uncovered.filter((r) => !baseline.includes(r));
         if (fresh.length > 0)
-          fail(`NEW API routes with no smoke coverage (cover them before shipping): ${fresh.join(', ')}`);
+          fail(
+            `NEW API routes with no smoke coverage (cover them before shipping): ${fresh.join(', ')}`,
+          );
         const remaining = uncovered.filter((r) => baseline.includes(r));
         if (remaining.length < baseline.length) {
           state.smokeGapBaseline = remaining.sort();
@@ -689,6 +945,9 @@ function cmdVerifyReady(dir, flags) {
       }
     }
   }
+
+  // Major dependency upgrades must carry a grounded decision record
+  auditMajorUpgrades(dir, proj);
 
   if (release) verifyRelease(dir, proj, flags);
   return finish();
@@ -724,11 +983,15 @@ function verifyRelease(dir, proj, flags) {
           `Commits exist after tag ${tag.out} but package.json is still ${proj.pkg.version} — bump it`,
         );
     } else ok(`Version bumped: ${last} -> ${proj.pkg.version}`);
-  } else warn('No git tags found — tag releases so version bumps are verifiable (git tag v<version> at each release commit)');
+  } else
+    warn(
+      'No git tags found — tag releases so version bumps are verifiable (git tag v<version> at each release commit)',
+    );
 
   // CHANGELOG top entry IS this version (includes() would match old entries)
   const relTopVer = changelogTopVersion(dir);
-  if (proj.pkg && relTopVer === proj.pkg.version) ok(`CHANGELOG top entry matches release version (${relTopVer})`);
+  if (proj.pkg && relTopVer === proj.pkg.version)
+    ok(`CHANGELOG top entry matches release version (${relTopVer})`);
   else
     fail(
       `CHANGELOG top entry (${relTopVer || 'none'}) is not the release version (${proj.pkg && proj.pkg.version}) — bump/align before shipping`,
@@ -738,7 +1001,10 @@ function verifyRelease(dir, proj, flags) {
   if (proj.isElectron) {
     if (exists(path.join(dir, 'THIRD-PARTY-LICENSES.txt')))
       ok('Third-party license attribution file present');
-    else fail(`Missing THIRD-PARTY-LICENSES.txt — run 'npm run licenses:file' and include it in the build`);
+    else
+      fail(
+        `Missing THIRD-PARTY-LICENSES.txt — run 'npm run licenses:file' and include it in the build`,
+      );
   }
 
   // Manual checklist acknowledgment (recorded per version)
@@ -749,9 +1015,13 @@ function verifyRelease(dir, proj, flags) {
     saveState(dir, state);
     ok(`Manual release checklist acknowledged for ${proj.pkg.version}`);
   } else if (ackVersion === proj.pkg.version) {
-    ok(`Manual release checklist previously acknowledged for ${proj.pkg.version} (${state.releaseAck.time})`);
+    ok(
+      `Manual release checklist previously acknowledged for ${proj.pkg.version} (${state.releaseAck.time})`,
+    );
   } else {
-    fail('Manual release checklist not acknowledged for this version. Perform these, then re-run with --ack-manual:');
+    fail(
+      'Manual release checklist not acknowledged for this version. Perform these, then re-run with --ack-manual:',
+    );
     for (const item of RELEASE_MANUAL_CHECKLIST) console.log(`      ${DIM}•${RESET} ${item}`);
   }
 }
@@ -774,11 +1044,28 @@ function cmdHealth(dir, flags) {
     }
     const n = Object.keys(list).length;
     if (n === 0) ok('No outdated dependencies');
-    else warn(`${n} outdated dependencies: ${Object.keys(list).slice(0, 8).join(', ')}${n > 8 ? ', ...' : ''}`);
+    else
+      warn(
+        `${n} outdated dependencies: ${Object.keys(list).slice(0, 8).join(', ')}${n > 8 ? ', ...' : ''}`,
+      );
 
-    const audit = sh('npm audit --audit-level=high', dir);
-    if (audit.ok) ok('npm audit clean at high level');
-    else fail(`npm audit found high/critical issues:\n${audit.out.split('\n').slice(-15).join('\n')}`);
+    // Production deps: blocking (this is what ships). Full tree incl dev:
+    // visibility only — dev-only advisories are maintenance work, not ship
+    // blockers (the gate's --omit=dev scope relies on this check existing).
+    const audit = sh('npm audit --audit-level=high --omit=dev', dir);
+    if (audit.ok) ok('npm audit clean at high level (production deps)');
+    else
+      fail(
+        `npm audit found high/critical issues in production deps:\n${audit.out.split('\n').slice(-15).join('\n')}`,
+      );
+    const fullAudit = sh('npm audit --audit-level=high', dir);
+    if (!fullAudit.ok && audit.ok) {
+      warn(
+        `dev-chain advisories at high (not shipped — fix when upstream allows, do NOT weaken the gate):\n${fullAudit.out.split('\n').slice(-10).join('\n')}`,
+      );
+    } else if (fullAudit.ok && audit.ok) {
+      ok('npm audit clean at high level (full tree incl dev)');
+    }
 
     if (flags.includes('--socket')) {
       const org = safeToken(loadRegistry().socketOrg || 'your-org', 'socket org');
@@ -806,8 +1093,17 @@ const STANDARD_SCRIPTS = {
   'lint:fix': 'eslint . --fix',
   format: 'prettier --write .',
   'format:check': 'prettier --check .',
-  security: 'npm audit --audit-level=high',
-  sast: 'semgrep scan --config auto --error --quiet',
+  // Gate audits SHIPPED (production) deps at high — dev deps don't ship, and
+  // their real threat (malicious packages) is covered by Socket + allowlist +
+  // cooldown, which npm audit can't see anyway. `policy health` audits the
+  // FULL tree incl dev and warns on dev-only advisories. Decided 2026-07-25
+  // after sessions improvised (omit=dev in some projects, a silently weakened
+  // audit-level in another) when a dev-chain advisory blocked commits.
+  security: 'npm audit --audit-level=high --omit=dev',
+  // The four sanctioned global exclusions (triaged FPs, documented in
+  // project-standards § Semgrep rule exclusions). Anything else is per-line
+  // `// nosemgrep` — enforced below in cmdCheck.
+  sast: 'semgrep scan --config auto --error --quiet --exclude-rule javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-res-sendfile.express-res-sendfile --exclude-rule javascript.express.security.audit.remote-property-injection.remote-property-injection',
   secrets: 'betterleaks git . -v',
   licenses: "license-checker --production --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary",
   'licenses:file': 'license-checker --production > THIRD-PARTY-LICENSES.txt',
@@ -864,7 +1160,13 @@ function cmdScaffold(dir) {
     if (proj.isTS) add['type-check'] = 'tsc --noEmit';
     if (proj.hasHTML) add['lint:html'] = 'html-validate *.html';
     if (proj.hasCSS) add['lint:css'] = 'stylelint "styles/*.css"';
-    const fastParts = ['lint', proj.hasHTML && 'lint:html', proj.hasCSS && 'lint:css', 'format:check', proj.isTS && 'type-check']
+    const fastParts = [
+      'lint',
+      proj.hasHTML && 'lint:html',
+      proj.hasCSS && 'lint:css',
+      'format:check',
+      proj.isTS && 'type-check',
+    ]
       .filter(Boolean)
       .map((s) => `npm run ${s}`);
     add.validate = fastParts.join(' && ');
@@ -894,7 +1196,9 @@ function cmdScaffold(dir) {
 
   for (const c of created) console.log(`  ${GREEN}created${RESET} ${c}`);
   for (const s of skipped) console.log(`  ${DIM}exists  ${s}${RESET}`);
-  console.log(`\nRe-run 'policy check' to see remaining gaps (devDependencies must be installed manually).\n`);
+  console.log(
+    `\nRe-run 'policy check' to see remaining gaps (devDependencies must be installed manually).\n`,
+  );
 }
 
 // ------------------------------------------------------------------ mirror
@@ -906,13 +1210,20 @@ function cmdMirror() {
     return finish();
   }
 
+  // Self-consistency first: two copies agreeing on a stale header is not
+  // "in sync", so each side must match its own version history before the
+  // private-vs-public comparison means anything.
+  auditPolicyDocVersions(POLICY_ROOT, 'private');
+  auditPolicyDocVersions(PUBLIC_ROOT, 'public mirror');
+
   // Drift: private docs newer or version-different vs public
   for (const doc of ['BUILD-POLICY.md', 'project-standards.md']) {
     const priv = readFile(path.join(POLICY_ROOT, doc));
     const pub = readFile(path.join(PUBLIC_ROOT, doc));
     const ver = (s) => (s.match(/\*\*Version:\*\*\s*([\d.]+)/) || [])[1];
     if (!pub) fail(`${doc} missing from public mirror`);
-    else if (ver(priv) !== ver(pub)) fail(`${doc} version drift: private ${ver(priv)} vs public ${ver(pub)}`);
+    else if (ver(priv) !== ver(pub))
+      fail(`${doc} version drift: private ${ver(priv)} vs public ${ver(pub)}`);
     else ok(`${doc} versions match (${ver(priv)})`);
   }
 
@@ -923,7 +1234,9 @@ function cmdMirror() {
     const pubDir = path.join(PUBLIC_ROOT, sub);
     const list = (d) => (exists(d) ? fs.readdirSync(d).filter((f) => !f.startsWith('.')) : []);
     const names = [...new Set([...list(privDir), ...list(pubDir)])].sort();
-    const stale = names.filter((f) => readFile(path.join(privDir, f)) !== readFile(path.join(pubDir, f)));
+    const stale = names.filter(
+      (f) => readFile(path.join(privDir, f)) !== readFile(path.join(pubDir, f)),
+    );
     if (stale.length > 0) {
       fail(
         `${sub}/ drift vs public mirror: ${stale.join(', ')} — sync: cp ${stale.map((f) => `${sub}/${f}`).join(' ')} ../build-policy-public/${sub}/`,
@@ -938,7 +1251,9 @@ function cmdMirror() {
     .split('\n')
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith('#'))
-    .map((l) => (l.startsWith('!') ? { term: l.slice(1), everywhere: true } : { term: l, everywhere: false }));
+    .map((l) =>
+      l.startsWith('!') ? { term: l.slice(1), everywhere: true } : { term: l, everywhere: false },
+    );
   // Third generic pattern: Apple app-specific password shape (xxxx-xxxx-xxxx-xxxx,
   // lowercase letters) — covered here so the literal never lives in the blocklist.
   const genericPatterns = [
@@ -966,9 +1281,14 @@ function cmdMirror() {
           for (const re of genericPatterns) {
             // Check every match, not just the first — a doc placeholder must
             // not mask a real secret later in the same file.
-            const all = content.match(new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g')) || [];
+            const all =
+              content.match(
+                new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g'),
+              ) || [];
             const hit = all.find(
-              (s) => !/^(your|you|user|name|example|placeholder|someone)@/i.test(s) && s !== 'xxxx-xxxx-xxxx-xxxx',
+              (s) =>
+                !/^(your|you|user|name|example|placeholder|someone)@/i.test(s) &&
+                s !== 'xxxx-xxxx-xxxx-xxxx',
             );
             if (hit) {
               fail(`Leak in public mirror ${rel}: matches ${re} ("${hit}")`);
@@ -1005,7 +1325,8 @@ function cmdDoctor() {
   }
 
   const npmrc = readFile(path.join(os.homedir(), '.npmrc'));
-  if (/^min-release-age\s*=\s*1/m.test(npmrc)) ok('~/.npmrc min-release-age=1 (24h package quarantine)');
+  if (/^min-release-age\s*=\s*1/m.test(npmrc))
+    ok('~/.npmrc min-release-age=1 (24h package quarantine)');
   else fail('~/.npmrc missing min-release-age=1');
 
   const settings = readJSON(path.join(os.homedir(), '.claude', 'settings.json')) || {};
@@ -1015,7 +1336,9 @@ function cmdDoctor() {
   else warn('Claude Code hooks not wired — run: policy setup-machine');
 
   const agentsDir = path.join(os.homedir(), '.claude', 'agents');
-  const agents = exists(agentsDir) ? fs.readdirSync(agentsDir).filter((f) => f.endsWith('.md')) : [];
+  const agents = exists(agentsDir)
+    ? fs.readdirSync(agentsDir).filter((f) => f.endsWith('.md'))
+    : [];
   if (agents.length > 0) ok(`Claude agents present: ${agents.join(', ')}`);
   else warn('No ~/.claude/agents definitions — run: policy setup-machine');
 
@@ -1156,7 +1479,9 @@ function cmdHookStop() {
   if (!marker || marker.diffHash !== diffHash(dir)) {
     reasons.push(
       `Full quality gates have NOT passed on the current tree` +
-        (marker ? ` (last pass: ${marker.timestamp}, tree has changed since)` : ' (no gates marker)') +
+        (marker
+          ? ` (last pass: ${marker.timestamp}, tree has changed since)`
+          : ' (no gates marker)') +
         `. If you are presenting this work as ready or asking the developer to commit, run them now: ` +
         `node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} gates — the pre-commit hook will reject the commit without this. ` +
         `If you are mid-iteration and not presenting yet, state that explicitly and continue.`,
@@ -1190,7 +1515,7 @@ function cmdHookPretool() {
           hookEventName: 'PreToolUse',
           permissionDecision: 'deny',
           permissionDecisionReason:
-            'BUILD-POLICY: --ack-manual is the DEVELOPER\'s signature that the manual release checks were personally performed — the AI must never run it. ' +
+            "BUILD-POLICY: --ack-manual is the DEVELOPER's signature that the manual release checks were personally performed — the AI must never run it. " +
             'Show the developer the checklist and ask them to run: node ../build-policy/scripts/policy.js verify-ready --release --ack-manual ' +
             '(they can type it with a ! prefix to run it in this session).',
         },
@@ -1253,6 +1578,166 @@ function cmdHookPretool() {
   process.exit(0);
 }
 
+// ------------------------------------------------------------------ upgrade
+
+// Ground a major dependency upgrade in registry facts, not model memory.
+// Pulls the target's real peer-dependency constraints, the installed version,
+// and the upstream migration source from npm, prints them, and scaffolds a
+// decision record the session must complete before `check`/`verify-ready` pass.
+// The whole point: the fabrication-prone facts (peer constraints, breaking
+// changes) come from `npm view`, and the record carries them forward so the
+// next session reads the finding instead of re-deriving it differently.
+function cmdUpgrade(dir, rest) {
+  const args = rest.filter((a) => !a.startsWith('--'));
+  const pkgName = args[0];
+  if (!pkgName) {
+    console.error('Usage: node policy.js upgrade <package> [targetVersion] [projectDir]');
+    process.exit(1);
+  }
+  safeToken(pkgName, 'package name');
+  // Remaining positional args: an explicit target version (starts with a digit)
+  // and/or a project dir. Everything defaults sensibly.
+  // NOTE: `dir` from main() is the first non-flag positional, which for this
+  // command is the package name — never a directory. Resolve the project dir
+  // from the args after the package name only, else default to cwd.
+  const explicit = args.slice(1).find((a) => /^\d/.test(a)) || null;
+  const projDir =
+    args.slice(1).find((a) => a !== explicit && exists(path.join(a, 'package.json'))) || '.';
+  if (explicit) safeToken(explicit, 'target version');
+  guardLocalPath(projDir);
+  const proj = detectProject(projDir);
+  section(`Upgrade research: ${pkgName}`);
+  if (!proj.hasPkg) {
+    fail(`No package.json in ${path.resolve(projDir)}`);
+    return finish();
+  }
+
+  const deps = { ...(proj.pkg.dependencies || {}), ...(proj.pkg.devDependencies || {}) };
+  const currentRange = deps[pkgName] || null;
+  if (!currentRange) warn(`${pkgName} is not a direct dependency — recording anyway`);
+
+  // FACTS FROM NPM (authoritative — never from memory)
+  const latest = sh(`npm view ${pkgName} version`, projDir);
+  const targetVersion = explicit || (latest.ok ? latest.out.trim() : null);
+  if (!targetVersion) {
+    fail(
+      `Could not resolve a target version via 'npm view ${pkgName} version' — is the name correct / registry reachable?`,
+    );
+    return finish();
+  }
+  const targetMajor = semverMajor(targetVersion);
+  const installedJson = readJSON(path.join(projDir, 'node_modules', pkgName, 'package.json'));
+  const installedVersion = installedJson ? installedJson.version : '(not installed)';
+
+  const peerRaw = sh(`npm view ${pkgName}@${targetVersion} peerDependencies --json`, projDir);
+  let peers = {};
+  try {
+    peers = JSON.parse(peerRaw.out || '{}') || {};
+  } catch {
+    /* no peers or non-JSON */
+  }
+  const repoRaw = sh(
+    `npm view ${pkgName}@${targetVersion} repository.url homepage --json`,
+    projDir,
+  );
+  let repoUrl = '';
+  try {
+    const r = JSON.parse(repoRaw.out || '{}');
+    repoUrl = ((r && (r['repository.url'] || r.homepage)) || repoRaw.out || '')
+      .toString()
+      .replace(/^git\+/, '')
+      .replace(/\.git$/, '')
+      .trim();
+  } catch {
+    repoUrl = repoRaw.out.trim();
+  }
+
+  // Peer-constraint analysis — the exact class of fact that gets fabricated.
+  const peerLines = Object.entries(peers).map(([p, need]) => {
+    const have = deps[p];
+    const flag =
+      have &&
+      semverMajor(have) != null &&
+      semverMajor(need) != null &&
+      semverMajor(have) < semverMajor(need)
+        ? '  ⚠ project below required major'
+        : '';
+    return `  - ${p} requires ${need}${have ? ` (project has ${have})` : ' (not in project)'}${flag}`;
+  });
+
+  ok(`Target: ${pkgName} ${installedVersion} → ${targetVersion} (major v${targetMajor})`);
+  console.log(`  Current range in package.json: ${currentRange || '(none)'}`);
+  console.log(`  Peer dependencies of ${targetVersion}:`);
+  console.log(peerLines.length ? peerLines.join('\n') : '    (none declared)');
+  console.log(
+    `  Upstream source: ${repoUrl || '(none found — check npmjs.com/package/' + pkgName + ')'}`,
+  );
+
+  // Scaffold the decision record (never overwrite an existing one)
+  const recDir = path.join(projDir, '.claude', 'specs', 'deps');
+  const recPath = path.join(recDir, `${depRecordSlug(pkgName, targetMajor)}.md`);
+  if (exists(recPath)) {
+    warn(
+      `Decision record already exists: ${path.relative(projDir, recPath)} — update it, don't duplicate`,
+    );
+    return finish();
+  }
+  fs.mkdirSync(recDir, { recursive: true });
+  const peerBlock = Object.entries(peers).length
+    ? Object.entries(peers)
+        .map(
+          ([p, need]) =>
+            `- \`${p}\`: requires \`${need}\`${deps[p] ? ` — project has \`${deps[p]}\`` : ' — not in project'}`,
+        )
+        .join('\n')
+    : '- (none declared)';
+  const record = `# Major upgrade: ${pkgName} → v${targetMajor}
+
+**Package:** ${pkgName}
+**From:** ${installedVersion} (range \`${currentRange || 'n/a'}\`)  **To:** ${targetVersion}
+**Researched:** ${new Date().toISOString().slice(0, 10)}
+**Status:** DRAFT — do not merge until completed and gates pass
+
+---
+
+## Verified facts (from \`npm view\` — DO NOT edit, DO NOT supplement from memory)
+
+**Peer dependencies of ${pkgName}@${targetVersion}:**
+${peerBlock}
+
+**Upstream migration source:** ${repoUrl || '(look up on npmjs.com)'}
+> Read the CHANGELOG / release notes for the v${targetMajor}.0.0 boundary before writing the plan below.
+
+---
+
+## To complete (cite the facts above — never recalled knowledge)
+
+### Peer-constraint resolution
+For each ⚠ peer above where the project is below the required major: what has to move first? (A peer bump is itself a major upgrade needing its own record.)
+
+### Breaking changes (from the upstream migration guide, with the section link)
+-
+
+### Migration steps
+1.
+
+### Risk & blast radius
+- Files/features touched:
+- Rollback plan:
+
+### Verification
+- [ ] \`npm install\` clean, no unmet peer warnings
+- [ ] \`policy gates\` pass on the upgraded tree
+- [ ] Decision: PROCEED / DEFER / REJECT —
+`;
+  fs.writeFileSync(recPath, record);
+  ok(`Scaffolded decision record: ${path.relative(projDir, recPath)}`);
+  console.log(
+    `\n${DIM}Complete the "To complete" sections from the upstream guide, then 'policy check' will pass.${RESET}`,
+  );
+  return finish();
+}
+
 // -------------------------------------------------------------------- main
 
 function main() {
@@ -1276,6 +1761,8 @@ function main() {
       return cmdVerifyReady(dir, flags);
     case 'health':
       return cmdHealth(dir, flags);
+    case 'upgrade':
+      return cmdUpgrade(dir, rest);
     case 'scaffold':
       return cmdScaffold(dir);
     case 'mirror':

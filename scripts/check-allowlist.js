@@ -34,10 +34,7 @@ if (!fs.existsSync(allowlistPath)) {
 const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
 const allowlist = JSON.parse(fs.readFileSync(allowlistPath, 'utf8'));
 
-const allDeps = [
-  ...Object.keys(pkg.dependencies || {}),
-  ...Object.keys(pkg.devDependencies || {}),
-];
+const allDeps = [...Object.keys(pkg.dependencies || {}), ...Object.keys(pkg.devDependencies || {})];
 
 const allowedNames = new Set(Object.keys(allowlist));
 const unapproved = allDeps.filter((dep) => !allowedNames.has(dep));

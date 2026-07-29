@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.3
-**Last updated:** 2026-07-22
+**Version:** 2.5
+**Last updated:** 2026-07-28
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -314,7 +314,7 @@ npm run lint        # ESLint (--max-warnings 0)
 npm run format      # Prettier
 npm run type-check  # tsc --noEmit (strict: true)
 npm run build       # Full build
-npm run security    # npm audit --audit-level=high
+npm run security    # npm audit --audit-level=high --omit=dev (gate = shipped deps; health audits full tree)
 npm run sast        # semgrep scan --config auto --error (with exclusions)
 ```
 
@@ -374,7 +374,7 @@ These four are the ONLY sanctioned global exclusions. Anything else is suppresse
   "format": "prettier --write .",
   "format:check": "prettier --check .",
   "type-check": "tsc --noEmit",
-  "security": "npm audit --audit-level=high",
+  "security": "npm audit --audit-level=high --omit=dev",
   "sast": "semgrep scan --config auto --error --quiet --exclude-rule javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-res-sendfile.express-res-sendfile --exclude-rule javascript.express.security.audit.remote-property-injection.remote-property-injection",
   "secrets": "betterleaks git . -v",
   "licenses": "license-checker --production --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary",
@@ -393,6 +393,30 @@ These four are the ONLY sanctioned global exclusions. Anything else is suppresse
 ```
 
 `validate` is the canonical fast-check name (husky and BUILD-POLICY reference it). Projects that historically used `check` should keep it as an alias: `"check": "npm run validate"`.
+
+### Testing tiers
+
+| Tier | Script | What it covers | Required |
+|---|---|---|---|
+| Unit | `test:unit` | Logic that needs no server — converters, parsers, formatters, pure functions | Optional; add it when such logic exists rather than bending smoke to fit |
+| Smoke | `test:smoke` → `tests/smoke.js` | Every API route returns non-5xx | **Yes**, any project with a server |
+| Integration | `test:integration` → `tests/harness.js integration` | Full lifecycles against an isolated server (own port, temp data dir, torn down after) | **Yes**, any project with a server |
+
+`test` runs whichever tiers exist, in order.
+
+**The tiers must be real — `check` FAILs otherwise.** A `test:smoke` that is an `echo`, a bare `exit 0`, or just `npm run build` passes a gate while testing nothing, which is worse than an honest red; and `tests/smoke.js` + `tests/harness.js` must both exist, because an inline `node -e "fetch(...)"` only passes when a server happens to be running on the dev port — that is not a test, and it puts production data in reach of one.
+
+E2E (Playwright) remains a future tier — adopt per-app for commercial apps with complex UI flows, not as a default.
+
+### Prettier baseline
+
+Projects may differ on `trailingComma`, `arrowParens`, `plugins` (e.g. `prettier-plugin-tailwindcss`), `endOfLine`, and anything else. These four keys are **not** negotiable, and `check` FAILs without them:
+
+```json
+{ "semi": true, "singleQuote": true, "tabWidth": 2, "printWidth": 100 }
+```
+
+They govern line shape, so a project that deviates cannot be formatted with any other project's config — a stray `prettier --write` borrowing a neighbouring config reflows the entire file and buries the real diff. `templates/prettierrc` (what `scaffold` installs) satisfies the baseline; bringing a drifted project into line means one mechanical `npx prettier --write .` reformat, best done as its own commit.
 
 ### Python
 ```bash
@@ -686,7 +710,19 @@ updates:
     open-pull-requests-limit: 10
 ```
 
-Major version bumps are ignored — they often include breaking changes that require manual migration and testing. Handle major upgrades deliberately as planned work, not via automated PRs.
+Major version bumps are ignored by Dependabot — they often include breaking changes that require manual migration and testing. Handle them via the enforced flow below, not from memory.
+
+**Major upgrade flow (enforced — `check` and `verify-ready` FAIL on an un-recorded major):**
+
+Because majors are manual, different sessions used to reason about the migration from model memory and reach conflicting — sometimes fabricated — conclusions (e.g. inventing a peer-dependency constraint instead of reading it). The fix is to ground the upgrade in registry facts and record the decision:
+
+1. `node ../build-policy/scripts/policy.js upgrade <pkg> [targetVersion]` — pulls the target's **real** `peerDependencies`, the installed version, and the upstream migration source from `npm view`, prints them, and scaffolds `.claude/specs/deps/<pkg>-v<major>.md`.
+2. Complete the record's "To complete" sections **citing the tool output and the upstream migration guide only — never recalled knowledge.** Peer constraints below the required major are flagged `⚠`; each such peer is itself a major upgrade needing its own record.
+3. Apply the change, run `policy gates`, record the PROCEED/DEFER/REJECT decision in the record.
+
+The enforcement: `auditMajorUpgrades` compares the working `package.json` against the committed one; any dependency whose **major** increased must have a matching decision record or `check`/`verify-ready` fail (pre-commit, same window as the CHANGELOG check). The record lives in `.claude/specs/deps/` — gitignored like all specs, carried between machines and sessions by file sync — and the check reads it from disk, so the next session inherits the grounded finding instead of re-deriving it.
+
+> **Anti-fabrication rule (applies to any session, any agent):** claims about a dependency's breaking changes or peer requirements must cite `npm view` output or the fetched upstream migration guide. A subagent that "researches" a migration from memory will hallucinate constraints — the same failure the verified-dates registry prevents for model IDs.
 
 **Dependabot PR Flow (minor and patch only, with Socket):**
 1. Review the Dependabot PR on GitHub — confirm it is a minor or patch bump
