@@ -241,7 +241,13 @@ function detectProject(dir) {
 }
 
 function changedFiles(dir) {
-  const r = sh('git status --porcelain', dir);
+  // `-uall` is load-bearing: plain --porcelain collapses an untracked directory
+  // to one `?? dir/` entry but lists its files individually once staged, so the
+  // file list — and diffHash with it — changed on `git add`, breaking the
+  // staging-invariance diffHash promises. Worse, readFile() on a directory path
+  // returns '' (EISDIR), so a new directory's contents were hashed as nothing
+  // and edits inside it never invalidated a gates marker.
+  const r = sh('git status --porcelain -uall', dir);
   if (!r.ok) return [];
   // sh() trims the whole output, which can strip the first line's leading
   // status column — parse by stripping the status token, not by offset.
