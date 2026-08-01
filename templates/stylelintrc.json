@@ -1,6 +1,7 @@
 {
   "extends": "stylelint-config-standard",
   "rules": {
+    "import-notation": null,
     "selector-class-pattern": null,
     "custom-property-pattern": null,
     "keyframes-name-pattern": null,

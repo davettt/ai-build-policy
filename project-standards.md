@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.5.1
-**Last updated:** 2026-07-29
+**Version:** 2.6.1
+**Last updated:** 2026-08-01
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -440,7 +440,14 @@ Before modifying or removing any code that enforces a constraint, cap, guard, or
 
 - All PRs reviewed by **CodeRabbit** before merge
 - Address all critical and high-severity findings
-- **The enforced path is the CLI, not the plugin:** `policy gates` runs `npm run review` (`coderabbit review --agent`) as a blocking gate, and the pre-commit verify-marker refuses commits without it. Never substitute a plugin/skill invocation for that gate — a skill runs only if the agent chooses to invoke it; the gate blocks.
+- **The enforced path is the CLI, not the plugin:** `policy gates` runs `npm run review` (`coderabbit review --agent --include-untracked`) as a blocking gate, and the pre-commit verify-marker refuses commits without it. Never substitute a plugin/skill invocation for that gate — a skill runs only if the agent chooses to invoke it; the gate blocks.
+- **`--include-untracked` is mandatory** (`check` FAILs without it). The CLI default reviews *tracked* changes only, and gates run before staging — so without the flag every brand-new file passed the review gate unreviewed, which is precisely the code most worth reviewing.
+- **A skipped review is a failed gate.** On a clean tree with the branch equal to its base — the normal state straight after a commit — CodeRabbit reports `"status":"review_skipped","message":"No changes detected"` and **exits 0**. `policy gates` reads the `--agent` output, not just the exit code, and FAILs: recording a pass there would claim a review of code the reviewer never opened. To review work that is already committed, diff against what preceded it (`--base-commit <sha>`); for a root commit, review it as a PR on the remote, or in a scratch repo (copy files out, `git init`, empty root commit, leave the files untracked, `--include-untracked`).
+- **New repos need two one-time steps before the review gate can run**, both surfaced by `policy gates` with the exact command:
+  1. **A commit must exist.** CodeRabbit resolves the current branch (`git rev-parse --abbrev-ref HEAD`) before reviewing anything, so it cannot run in a repo with no commits. The pre-commit hook allows the root commit for this reason — `verify-marker` waives itself when there is no HEAD, because gating a check that cannot run only teaches people to reach for `--no-verify`. Every commit after the root one is gated normally.
+  2. **A base branch, when there is no remote yet:** `git config coderabbit.baseBranch <branch>`. Without a remote CodeRabbit cannot infer one, and reviews on a remote-less repo draw the free CLI allowance rather than the org's.
+
+  Run full gates immediately after the root commit — with a branch present and `--include-untracked` set, the review covers the whole scaffold.
 - Plugin skills are for the two things the CLI cannot do (it reviews the local working diff only):
   - `coderabbit:autofix` — apply CodeRabbit feedback from **GitHub PR review threads**, per-change approval (use for Dependabot/PR follow-ups)
   - `coderabbit:code-review` — ad-hoc mid-development review between gate runs

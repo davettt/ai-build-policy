@@ -454,6 +454,14 @@ function cmdCheck(dir) {
     );
   }
 
+  // Review gate scope — the CLI default reviews tracked changes only, so a gate
+  // run before staging (the normal order) never saw new files at all.
+  if (scripts.review && !scripts.review.includes('--include-untracked')) {
+    fail(
+      `review script is "${scripts.review}" — missing --include-untracked, so brand-new files pass the review gate unreviewed (the CLI default covers TRACKED changes only, and gates run before staging). Standard: "${STANDARD_SCRIPTS.review}"`,
+    );
+  }
+
   // Prettier config — without one, prettier runs on defaults (double quotes)
   // and the project's format style silently drifts from the portfolio
   const prcPath = ['.prettierrc', '.prettierrc.json'].map((f) => path.join(dir, f)).find(exists);
@@ -765,15 +773,59 @@ function cmdGates(dir, flags) {
   const gates = GATE_ORDER.filter((g) => (fast ? g.fast : true)).filter((g) => scripts[g.script]);
 
   section(`Quality gates (${fast ? 'fast/pre-commit' : 'full'}): ${path.resolve(dir)}`);
+
+  // CodeRabbit preflight — both failures below surface as raw JSON from the CLI
+  // mid-run, which reads as "the tool is broken" rather than "your repo is not
+  // ready yet". Check them before burning the earlier gates.
+  if (!fast && gates.some((g) => g.script === 'review') && proj.isGit) {
+    if (!sh('git rev-parse --verify HEAD', dir).ok) {
+      fail(
+        'CodeRabbit needs a branch to exist (it resolves HEAD), and this repo has no commits. ' +
+          'Make the root commit first — the pre-commit hook allows it — then re-run gates: ' +
+          'git add -A && git commit -m "initial scaffold"',
+      );
+      return finish();
+    }
+    const hasRemote = sh('git remote', dir).out.length > 0;
+    const hasBase = sh('git config coderabbit.baseBranch', dir).ok;
+    if (!hasRemote && !hasBase) {
+      const branch = sh('git rev-parse --abbrev-ref HEAD', dir).out || 'main';
+      fail(
+        `CodeRabbit cannot determine a base branch (no git remote configured yet). Set it once: ` +
+          `git config coderabbit.baseBranch ${branch}`,
+      );
+      return finish();
+    }
+  }
+
   const report = [];
   for (const g of gates) {
     const t0 = Date.now();
     process.stdout.write(`  ${DIM}running${RESET} ${g.name} (npm run ${g.script}) ... `);
     const r = sh(`npm run ${safeToken(g.script, 'script name')}`, dir);
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
-    if (r.ok) {
+    // A gate that ran but examined nothing is not a pass. CodeRabbit exits 0
+    // with `"status":"review_skipped","message":"No changes detected"` whenever
+    // the tree is clean and the branch equals its base — the normal state right
+    // after a commit. Trusting the exit code alone recorded "CodeRabbit review:
+    // pass" into the marker for code the reviewer never opened, which is how a
+    // whole committed scaffold can end up shipped unreviewed.
+    const reviewSkipped = g.script === 'review' && /"status"\s*:\s*"review_skipped"/.test(r.out);
+    if (r.ok && !reviewSkipped) {
       console.log(`${GREEN}pass${RESET} ${DIM}${secs}s${RESET}`);
       report.push({ gate: g.name, pass: true });
+    } else if (reviewSkipped) {
+      console.log(`${RED}FAIL${RESET} ${DIM}${secs}s${RESET}\n`);
+      console.log(
+        `${RED}${BOLD}Gate failed: ${g.name} reviewed nothing.${RESET} CodeRabbit reported "No changes detected" — ` +
+          `the working tree is clean, so it had no diff to read, and a pass here would claim a review that never happened.\n\n` +
+          `If this code is already committed and was never reviewed, review it against the commit before it:\n` +
+          `  coderabbit review --agent --base-commit <sha-before-the-work>\n` +
+          `For a root commit (nothing precedes it), review it as a PR on the remote, or in a scratch repo:\n` +
+          `  copy the files out, git init, git commit --allow-empty -m base, leave the files untracked,\n` +
+          `  git config coderabbit.baseBranch <branch>, then: coderabbit review --agent --include-untracked\n`,
+      );
+      process.exit(1);
     } else {
       console.log(`${RED}FAIL${RESET} ${DIM}${secs}s${RESET}\n`);
       const tail = r.out.split('\n').slice(-40).join('\n');
@@ -818,6 +870,21 @@ function cmdVerifyMarker(dir) {
   guardLocalPath(dir);
   const proj = detectProject(dir);
   if (!proj.hasPkg || !proj.isGit) return;
+
+  // Root commit: CodeRabbit cannot run before a branch exists (it resolves the
+  // current branch via `git rev-parse --abbrev-ref HEAD`), so full gates cannot
+  // pass, so the marker cannot be written — and blocking here would deadlock a
+  // new repo into needing --no-verify. Gating a check that is impossible to run
+  // teaches people to bypass the hook, which costs more than this commit.
+  // Allowed once; every commit after this one has a HEAD and is gated normally.
+  if (!sh('git rev-parse --verify HEAD', dir).ok) {
+    console.log(
+      `${YELLOW}!${RESET} Root commit (no HEAD yet) — full gates cannot run before a branch exists; allowing.\n` +
+        `  ${DIM}Immediately after this commit: policy gates — the review gate then sees the whole tree.${RESET}`,
+    );
+    return;
+  }
+
   const sourceChanged = changedFiles(dir).filter(isSourceFile);
   if (sourceChanged.length === 0) return;
   const marker = readJSON(path.join(dir, '.policy', 'gates.json'));
@@ -1115,7 +1182,12 @@ const STANDARD_SCRIPTS = {
   'licenses:file': 'license-checker --production > THIRD-PARTY-LICENSES.txt',
   'deps:check': 'node ../build-policy/scripts/check-allowlist.js .',
   'deps:verify': 'node ../build-policy/scripts/verify-package.js',
-  review: 'coderabbit review --agent',
+  // --include-untracked is load-bearing: the CLI's default reviews TRACKED
+  // changes only, and gates run before staging, so every brand-new file went
+  // through the review gate unseen — the files most in need of review were the
+  // ones it skipped. Verified: an untracked file is reviewed with this flag
+  // (reviewType "all", reviewedFiles ["app.js"]) and ignored without it.
+  review: 'coderabbit review --agent --include-untracked',
   prepare: 'husky',
 };
 
