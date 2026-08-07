@@ -66,6 +66,12 @@
       "verified": "2026-07-13",
       "reviewEveryDays": 90,
       "notes": "Session model is the developer's choice. Mechanical subagents are pinned to haiku via ~/.claude/agents/ definitions."
+    },
+    "socket-cli": {
+      "value": "1.1.102",
+      "verified": "2026-08-07",
+      "reviewEveryDays": 90,
+      "notes": "Version pinned in templates/ci.yml Socket step. When updating, bump the pin in the template and re-sync every project ci.yml."
     }
   }
 }

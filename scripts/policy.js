@@ -333,6 +333,7 @@ const BASE_SCRIPTS = [
   'licenses',
   'deps:check',
   'review',
+  'socket:scan',
 ];
 
 // The policy docs state their version in a header line, and BUILD-POLICY.md
@@ -754,6 +755,11 @@ const GATE_ORDER = [
   { name: 'Dependency allowlist', script: 'deps:check', fast: true },
   { name: 'SAST (Semgrep)', script: 'sast' },
   { name: 'Dependency audit', script: 'security' },
+  // Quota-bounded: the free tier is 1,000 scans/month across all projects, and
+  // the dependency tree can only have moved if the lockfile did. CI scans every
+  // push regardless — this gate exists to catch a hostile package before it is
+  // committed, not to re-scan an unchanged tree several times a day.
+  { name: 'Socket supply-chain scan', script: 'socket:scan', whenDepsChange: true },
   { name: 'License compliance', script: 'licenses' },
   { name: 'CodeRabbit review', script: 'review' },
   { name: 'Build', script: 'build' },
@@ -798,8 +804,18 @@ function cmdGates(dir, flags) {
     }
   }
 
+  // The dependency tree cannot have moved unless the lockfile did, so a scan of
+  // an unchanged tree spends quota to re-learn what the last one already knew.
+  const depsChanged = changedFiles(dir).some((f) => /(^|\/)package(-lock)?\.json$/.test(f));
+
   const report = [];
   for (const g of gates) {
+    if (g.whenDepsChange && !depsChanged) {
+      console.log(
+        `  ${DIM}skipped${RESET} ${g.name} ${DIM}(no dependency change — CI scans every push)${RESET}`,
+      );
+      continue;
+    }
     const t0 = Date.now();
     process.stdout.write(`  ${DIM}running${RESET} ${g.name} (npm run ${g.script}) ... `);
     const r = sh(`npm run ${safeToken(g.script, 'script name')}`, dir);
@@ -1188,6 +1204,12 @@ const STANDARD_SCRIPTS = {
   // ones it skipped. Verified: an untracked file is reviewed with this flag
   // (reviewType "all", reviewedFiles ["app.js"]) and ignored without it.
   review: 'coderabbit review --agent --include-untracked',
+  // `socket ci` = `socket scan create --report`, exits non-zero when the scan
+  // fails the org's security policy. Uses the API token's default org, so no
+  // org argument to drift. This is the only gate that covers a malicious
+  // maintainer or typosquat — npm audit sees published CVEs, the allowlist sees
+  // names, neither sees a package that turned hostile in its latest release.
+  'socket:scan': 'socket ci',
   prepare: 'husky',
 };
 

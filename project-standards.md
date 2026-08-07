@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.6.2
-**Last updated:** 2026-08-01
+**Version:** 2.7
+**Last updated:** 2026-08-07
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -404,19 +404,19 @@ These four are the ONLY sanctioned global exclusions. Anything else is suppresse
 
 `test` runs whichever tiers exist, in order.
 
-**The tiers must be real — `check` FAILs otherwise.** A `test:smoke` that is an `echo`, a bare `exit 0`, or just `npm run build` passes a gate while testing nothing, which is worse than an honest red; and `tests/smoke.js` + `tests/harness.js` must both exist, because an inline `node -e "fetch(...)"` only passes when a server happens to be running on the dev port — that is not a test, and it puts production data in reach of one.
+`check` FAILs on a stub tier. A `test:smoke` of `echo`, `exit 0`, or `npm run build` passes the gate without testing anything. `tests/smoke.js` and `tests/harness.js` must both exist: an inline `node -e "fetch(...)"` passes only when a server is already running on the dev port, and runs against production data.
 
-E2E (Playwright) remains a future tier — adopt per-app for commercial apps with complex UI flows, not as a default.
+E2E (Playwright): per-app for commercial apps with complex UI flows. Not a default.
 
 ### Prettier baseline
 
-Projects may differ on `trailingComma`, `arrowParens`, `plugins` (e.g. `prettier-plugin-tailwindcss`), `endOfLine`, and anything else. These four keys are **not** negotiable, and `check` FAILs without them:
+`check` FAILs unless these four keys match. Everything else — `trailingComma`, `arrowParens`, `plugins`, `endOfLine` — is per-project:
 
 ```json
 { "semi": true, "singleQuote": true, "tabWidth": 2, "printWidth": 100 }
 ```
 
-They govern line shape, so a project that deviates cannot be formatted with any other project's config — a stray `prettier --write` borrowing a neighbouring config reflows the entire file and buries the real diff. `templates/prettierrc` (what `scaffold` installs) satisfies the baseline; bringing a drifted project into line means one mechanical `npx prettier --write .` reformat, best done as its own commit.
+These keys govern line shape: a project that deviates cannot be formatted with another project's config without reflowing every file. `templates/prettierrc` (installed by `scaffold`) satisfies the baseline. Correcting a drifted project requires one `npx prettier --write .` reformat — commit it separately.
 
 ### Python
 ```bash
@@ -440,14 +440,14 @@ Before modifying or removing any code that enforces a constraint, cap, guard, or
 
 - All PRs reviewed by **CodeRabbit** before merge
 - Address all critical and high-severity findings
-- **The enforced path is the CLI, not the plugin:** `policy gates` runs `npm run review` (`coderabbit review --agent --include-untracked`) as a blocking gate, and the pre-commit verify-marker refuses commits without it. Never substitute a plugin/skill invocation for that gate — a skill runs only if the agent chooses to invoke it; the gate blocks.
-- **`--include-untracked` is mandatory** (`check` FAILs without it). The CLI default reviews *tracked* changes only, and gates run before staging — so without the flag every brand-new file passed the review gate unreviewed, which is precisely the code most worth reviewing.
-- **A skipped review is a failed gate.** On a clean tree with the branch equal to its base — the normal state straight after a commit — CodeRabbit reports `"status":"review_skipped","message":"No changes detected"` and **exits 0**. `policy gates` reads the `--agent` output, not just the exit code, and FAILs: recording a pass there would claim a review of code the reviewer never opened. To review work that is already committed, diff against what preceded it (`--base-commit <sha>`); for a root commit, review it as a PR on the remote, or in a scratch repo (copy files out, `git init`, empty root commit, leave the files untracked, `--include-untracked`).
+- **The enforced path is the CLI, not the plugin:** `policy gates` runs `npm run review` (`coderabbit review --agent --include-untracked`) as a blocking gate, and the pre-commit verify-marker refuses commits without it. Do not substitute a plugin or skill invocation for that gate: a skill runs only when invoked, the gate blocks.
+- **`--include-untracked` is mandatory** (`check` FAILs without it). The CLI default reviews tracked changes only, and gates run before staging, so new files would pass the gate unreviewed.
+- **A skipped review is a failed gate.** On a clean tree with the branch equal to its base, CodeRabbit reports `"status":"review_skipped"` and exits 0. `policy gates` reads the `--agent` output rather than the exit code and FAILs, since no code was examined. To review committed work, diff against the preceding commit (`--base-commit <sha>`). For a root commit, review it as a PR on the remote, or in a scratch repo: copy the files out, `git init`, empty root commit, leave the files untracked, `--include-untracked`.
 - **New repos need two one-time steps before the review gate can run**, both surfaced by `policy gates` with the exact command:
-  1. **A commit must exist.** CodeRabbit resolves the current branch (`git rev-parse --abbrev-ref HEAD`) before reviewing anything, so it cannot run in a repo with no commits. The pre-commit hook allows the root commit for this reason — `verify-marker` waives itself when there is no HEAD, because gating a check that cannot run only teaches people to reach for `--no-verify`. Every commit after the root one is gated normally.
-  2. **A base branch, when there is no remote yet:** `git config coderabbit.baseBranch <branch>`. Without a remote CodeRabbit cannot infer one, and reviews on a remote-less repo draw the free CLI allowance rather than the org's.
+  1. **A commit must exist.** CodeRabbit resolves the current branch (`git rev-parse --abbrev-ref HEAD`), so it cannot run in a repo with no commits. `verify-marker` waives itself when there is no HEAD, allowing the root commit; every commit after it is gated normally. Do not use `--no-verify`.
+  2. **A base branch, when there is no remote yet:** `git config coderabbit.baseBranch <branch>`. Reviews on a repo with no remote draw the free CLI allowance rather than the org's.
 
-  Run full gates immediately after the root commit — with a branch present and `--include-untracked` set, the review covers the whole scaffold.
+  Run full gates immediately after the root commit; the review then covers the whole scaffold.
 - Plugin skills are for the two things the CLI cannot do (it reviews the local working diff only):
   - `coderabbit:autofix` — apply CodeRabbit feedback from **GitHub PR review threads**, per-change approval (use for Dependabot/PR follow-ups)
   - `coderabbit:code-review` — ad-hoc mid-development review between gate runs
@@ -684,6 +684,26 @@ Once a DMG is on a user's machine you are blind — unless the app logs.
 ### Supply Chain Security (Socket)
 
 Socket CLI (`@socketsecurity/cli`) is installed globally with the npm wrapper enabled. Every `npm install` is automatically scanned for malicious packages, typosquatting, and supply chain risks.
+
+**Socket is also an enforced gate.** The wrapper is a per-machine, per-shell alias, so a different shell, a new machine, or a CI runner has no scanning:
+
+- `socket:scan` (`socket ci`) is a required npm script. In local full gates it runs **only when `package-lock.json` or `package.json` changed** — the dependency tree cannot have moved otherwise, and the free tier is 1,000 scans/month across all projects.
+- CI runs it on **every push/PR**, and **hard-fails when `SOCKET_SECURITY_API_KEY` is unset**. A step that is skipped while the pipeline still reports success provides no scanning and no signal that scanning was absent. Set the secret at repo Settings → Secrets and variables → Actions.
+
+This is the only gate covering a compromised maintainer or a typosquat. `npm audit` reports published CVEs and the allowlist checks package names; neither detects a package whose latest release has become malicious.
+
+**Required API token scopes.** `socket ci` and `socket scan create --report` fetch the org security policy, so a token without `security-policy:read` produces a partial failure: the scan succeeds and the report request returns 403. Minimum set: `security-policy:read`, `alert-resolution list/create/read`, `alerts list`, `alerts trend`, `threat-campaigns list`.
+
+**When the wrapper rate-limits (HTTP 429).** The wrapper's install path can return `429 Too Many Requests` while Socket's read API remains available. A 429 indicates the package has not been scanned. It is not a security verdict and must not be treated as a pass.
+
+`socket raw-npm <cmd>` is the supported bypass. It is permitted only when all four conditions hold:
+
+1. **The change is known and bounded** — a specific advisory, an identified package, a target version. Never a blanket install of arbitrary new dependencies.
+2. **The target version is scored clean first**, via the read API that stays up during a 429: `socket package score npm <pkg>@<version> --markdown`. Check `supplyChain` and `vulnerability`. Anything below ~0.9 on supply chain, or any new `malware` / `installScripts` / `obfuscatedFile` alert, stops the bypass.
+3. **A full scan runs immediately afterwards**: `socket scan create --report --no-interactive` — confirming the resulting tree still passes policy.
+4. **The lockfile diff is inspected** — `git diff package-lock.json` shows only the expected bump and its transitive closure, nothing unrelated.
+
+**Not permitted as a 429 workaround:** `socket wrapper --disable`, invoking the nvm binary directly (`~/.nvm/.../bin/npm`), or unsetting the alias. Each disables scanning without recording that it was skipped, and the first two persist beyond the current command.
 
 **Package verification — before every install:**
 Before installing any npm package, verify it is the genuine upstream package:
