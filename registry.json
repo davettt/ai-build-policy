@@ -71,7 +71,7 @@
       "value": "1.1.102",
       "verified": "2026-08-07",
       "reviewEveryDays": 90,
-      "notes": "Version pinned in templates/ci.yml Socket step. When updating, bump the pin in the template and re-sync every project ci.yml."
+      "notes": "Socket CLI version in use locally (wrapper + socket:scan). Not pinned in CI — the template carries no Socket step by design; see project-standards § Supply Chain Security."
     }
   }
 }

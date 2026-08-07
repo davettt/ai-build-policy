@@ -685,10 +685,11 @@ Once a DMG is on a user's machine you are blind — unless the app logs.
 
 Socket CLI (`@socketsecurity/cli`) is installed globally with the npm wrapper enabled. Every `npm install` is automatically scanned for malicious packages, typosquatting, and supply chain risks.
 
-**Socket is also an enforced gate.** The wrapper is a per-machine, per-shell alias, so a different shell, a new machine, or a CI runner has no scanning:
+**Socket is also an enforced gate — locally, not in CI.**
 
 - `socket:scan` (`socket ci`) is a required npm script. In local full gates it runs **only when `package-lock.json` or `package.json` changed** — the dependency tree cannot have moved otherwise, and the free tier is 1,000 scans/month across all projects.
-- CI runs it on **every push/PR**, and **hard-fails when `SOCKET_SECURITY_API_KEY` is unset**. A step that is skipped while the pipeline still reports success provides no scanning and no signal that scanning was absent. Set the secret at repo Settings → Secrets and variables → Actions.
+- Dependabot branches are scanned locally before merge (the `dependabot-reviewer` agent runs `socket:scan` per branch).
+- **CI does not run Socket.** Those two controls already cover every path a package takes into the lockfile: the wrapper at install time, and the pre-merge scan for Dependabot. A CI step would re-scan a lockfile cleared before the commit existed, costing an API quota unit per run and requiring `SOCKET_SECURITY_API_KEY` in every repo. Add a CI step only for a project with contributors who do not install through the wrapper, or where Dependabot branches merge without local review.
 
 This is the only gate covering a compromised maintainer or a typosquat. `npm audit` reports published CVEs and the allowlist checks package names; neither detects a package whose latest release has become malicious.
 
