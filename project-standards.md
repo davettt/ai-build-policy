@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.7
-**Last updated:** 2026-08-07
+**Version:** 2.8
+**Last updated:** 2026-08-13
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -378,7 +378,7 @@ These four are the ONLY sanctioned global exclusions. Anything else is suppresse
   "sast": "semgrep scan --config auto --error --quiet --exclude-rule javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-res-sendfile.express-res-sendfile --exclude-rule javascript.express.security.audit.remote-property-injection.remote-property-injection",
   "secrets": "betterleaks git . -v",
   "licenses": "license-checker --production --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary",
-  "licenses:file": "license-checker --production > THIRD-PARTY-LICENSES.txt",
+  "licenses:file": "license-checker --production --relativeLicensePath | sed -e \"s|$PWD/||g\" -e \"s|$PWD|.|g\" > THIRD-PARTY-LICENSES.txt",
   "deps:check": "node ../build-policy/scripts/check-allowlist.js .",
   "deps:verify": "node ../build-policy/scripts/verify-package.js",
   "review": "coderabbit review --agent",
@@ -405,6 +405,12 @@ These four are the ONLY sanctioned global exclusions. Anything else is suppresse
 `test` runs whichever tiers exist, in order.
 
 `check` FAILs on a stub tier. A `test:smoke` of `echo`, `exit 0`, or `npm run build` passes the gate without testing anything. `tests/smoke.js` and `tests/harness.js` must both exist: an inline `node -e "fetch(...)"` passes only when a server is already running on the dev port, and runs against production data.
+
+**Smoke spawns its own server too, not just integration.** `test:smoke` MUST be `node tests/harness.js smoke`, with `tests/smoke.js` exporting `run(baseUrl)`. A `tests/smoke.js` that fetches a hardcoded dev port only passes when the local app happens to be running, and it probes real user data while doing it. That works on the developer's machine and fails on every CI runner, where nothing is listening. Keep direct invocation available for probing a running instance, but the gate must not depend on it.
+
+**Dynamic port (mandatory), same rule as the Electron main process.** `tests/harness.js` MUST ask the OS for a free port via `findFreePort()`: bind to port 0, read the assigned port, close it, then pass it to the spawned server. A hardcoded test port is not "its own port". Any stale server left behind by other local work can already hold it, the test server's own `listen` loses, and every test then runs against the squatter. Seen in practice: a static file server abandoned on the hardcoded test port answered every API call with its `index.html`, and 9 of 10 integration tests failed as if the app's routing were broken.
+
+Pair it with an identity check in `waitForServer`. A 200 does not prove the server is yours, since any static server returns 200. Assert on a field only your API returns, then fail loudly when another server holds the port rather than timing out or, worse, proceeding.
 
 E2E (Playwright): per-app for commercial apps with complex UI flows. Not a default.
 
@@ -678,7 +684,12 @@ Once a DMG is on a user's machine you are blind — unless the app logs.
 ### Third-Party License Attribution (shipped apps)
 
 `npm run licenses` validates license compatibility; attribution is the other half of the obligation:
-- `npm run licenses:file` generates `THIRD-PARTY-LICENSES.txt`; regenerate when dependencies change and include it in the app bundle (add to electron-builder `files`).
+- `npm run licenses:file` generates `THIRD-PARTY-LICENSES.txt`; regenerate when dependencies change and include it in the app bundle. The script strips the build root: license-checker prints absolute paths in `path:` and `licenseFile:`, and this file ships to customers and is committed to public repos, so it must not carry the build machine's home directory. `verify-ready --release` FAILs on any `/Users/<name>/...` left in it (add to electron-builder `files`).
+
+**Private content in tracked files.** `check` FAILs on an absolute home path (`/Users/<name>/...`, `/home/<name>/...`) in any tracked file. The `.gitignore` and tracked-file checks above cover private *files*; this covers identifying content inside files that are legitimately committed, which is how generated artifacts such as `THIRD-PARTY-LICENSES.txt` published a username and directory layout. Placeholder usernames (`/Users/you/`, `/home/yourname/`) are permitted, so documentation and UI hints are unaffected.
+
+**Security checks block, they do not report.** `check` runs at session start, which is a report a session can proceed past. The commit-time control is `policy leak-scan` in `.husky/pre-commit`: private files tracked in git, and absolute home paths in tracked files. Two git commands, ~30ms, no network. The public policy mirror additionally carries a `pre-push` guard running `policy mirror`, installed by `setup-machine`, because anything pushed there is world-readable and redaction after the fact is not a fix.
+
 - `verify-ready --release` fails for Electron apps without it.
 
 ### Supply Chain Security (Socket)

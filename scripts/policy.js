@@ -322,6 +322,11 @@ function diffHash(dir) {
 // whole of templates/prettierrc: projects legitimately differ on plugins and
 // comma/paren taste, but these four govern line shape, and a project that
 // deviates cannot be formatted with any other project's config.
+// Placeholder identities used in documentation and UI hints — never leaks.
+// Shared by the tracked-file scan in `check` and the leak scan in `mirror`.
+const PLACEHOLDER_ID =
+  /^(you|your|your[-_]?name|user|username|name|example|placeholder|someone|me|dev|developer)$/i;
+
 const PRETTIER_BASELINE = { semi: true, singleQuote: true, tabWidth: 2, printWidth: 100 };
 
 const BASE_SCRIPTS = [
@@ -396,6 +401,51 @@ function cmpSemver(a, b) {
   const [x, y] = [key(a), key(b)];
   for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] - y[i];
   return 0;
+}
+
+/**
+ * Private data that would publish with the repo. Two layers: private FILES that
+ * must never be tracked, and private CONTENT inside files that are legitimately
+ * tracked. Shared by `check` (session-start report) and `leak-scan` (pre-commit
+ * block) so the two can never diverge.
+ */
+function auditTrackedPrivacy(dir) {
+  // Ignoring is meaningless if the file is already tracked. Committed
+  // placeholders (.env.example/.env.template/.gitkeep) are fine by design.
+  const trackedRaw = sh(
+    `git ls-files -- .env '.env.*' .claude CLAUDE.md CLAUDE.local.md AGENTS.md local_data .policy`,
+    dir,
+  );
+  const tracked = trackedRaw.out
+    .split('\n')
+    .filter((f) => f && !/\.env\.(example|sample|template)$/.test(f) && !f.endsWith('.gitkeep'));
+  if (trackedRaw.ok && tracked.length > 0) {
+    fail(
+      `Private files are TRACKED in git (would publish with the repo): ${tracked.join(', ')} — git rm --cached them (developer runs this) before any push`,
+    );
+  } else ok('No private files tracked in git');
+
+  // The check above covers private FILES. This covers private CONTENT inside
+  // files that are legitimately tracked: an absolute home path publishes the
+  // developer's username and directory layout, and is never correct in a
+  // committed file. It reached a generated artifact (THIRD-PARTY-LICENSES.txt)
+  // because every other gate verified that the file existed, not what was in
+  // it. Placeholder usernames (`/Users/you/...`) are documentation, not leaks.
+  const hits = sh(`git grep -I -n -E "/(Users|home)/[A-Za-z0-9._-]+/" -- .`, dir);
+  const leaking = new Set();
+  if (hits.ok && hits.out) {
+    for (const line of hits.out.split('\n')) {
+      const file = line.split(':')[0];
+      for (const m of line.matchAll(/\/(?:Users|home)\/([A-Za-z0-9._-]+)\//g)) {
+        if (!PLACEHOLDER_ID.test(m[1])) leaking.add(file);
+      }
+    }
+  }
+  if (leaking.size > 0) {
+    fail(
+      `Absolute home paths in tracked file(s): ${[...leaking].join(', ')} — these publish the build machine's username and directory layout. Regenerate or make relative (placeholders like /Users/you/... are fine)`,
+    );
+  } else ok('No absolute home paths in tracked files');
 }
 
 function cmdCheck(dir) {
@@ -537,24 +587,7 @@ function cmdCheck(dir) {
       );
     } else ok('.gitignore covers all private paths (verified via git check-ignore)');
 
-    // Ignoring is meaningless if the file is already tracked. Committed
-    // placeholders (.env.example/.env.template/.gitkeep) are fine by design.
-    const trackedRaw = sh(
-      `git ls-files -- .env '.env.*' .claude CLAUDE.md CLAUDE.local.md AGENTS.md local_data .policy`,
-      dir,
-    );
-    const tracked = {
-      ok: trackedRaw.ok,
-      out: trackedRaw.out
-        .split('\n')
-        .filter((f) => f && !/\.env\.(example|sample|template)$/.test(f) && !f.endsWith('.gitkeep'))
-        .join('\n'),
-    };
-    if (tracked.ok && tracked.out) {
-      fail(
-        `Private files are TRACKED in git (would publish with the repo): ${tracked.out.split('\n').join(', ')} — git rm --cached them (developer runs this) before any push`,
-      );
-    } else ok('No private files tracked in git');
+    auditTrackedPrivacy(dir);
   } else {
     const gi = readFile(path.join(dir, '.gitignore'));
     for (const entry of [
@@ -1088,12 +1121,21 @@ function verifyRelease(dir, proj, flags) {
 
   // Third-party attribution shipped
   if (proj.isElectron) {
-    if (exists(path.join(dir, 'THIRD-PARTY-LICENSES.txt')))
-      ok('Third-party license attribution file present');
-    else
+    const attribPath = path.join(dir, 'THIRD-PARTY-LICENSES.txt');
+    if (exists(attribPath)) {
+      // The file ships to customers and is committed to public repos, so it
+      // must not carry the build machine's home directory.
+      const homePaths = (readFile(attribPath).match(/\/Users\/[^/\s]+/g) || []).length;
+      if (homePaths > 0) {
+        fail(
+          `THIRD-PARTY-LICENSES.txt contains ${homePaths} absolute home paths (e.g. /Users/<name>/...) — regenerate with 'npm run licenses:file' (the standard script strips the build root)`,
+        );
+      } else ok('Third-party license attribution file present');
+    } else {
       fail(
         `Missing THIRD-PARTY-LICENSES.txt — run 'npm run licenses:file' and include it in the build`,
       );
+    }
   }
 
   // Manual checklist acknowledgment (recorded per version)
@@ -1195,7 +1237,13 @@ const STANDARD_SCRIPTS = {
   sast: 'semgrep scan --config auto --error --quiet --exclude-rule javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-res-sendfile.express-res-sendfile --exclude-rule javascript.express.security.audit.remote-property-injection.remote-property-injection',
   secrets: 'betterleaks git . -v',
   licenses: "license-checker --production --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary",
-  'licenses:file': 'license-checker --production > THIRD-PARTY-LICENSES.txt',
+  // The attribution file ships to customers and is committed to public repos,
+  // so it must not carry the build machine's home directory. license-checker
+  // prints absolute paths in both `path:` and `licenseFile:`; --relativeLicensePath
+  // fixes only the latter and --customPath cannot drop a field, so the build
+  // root is stripped directly. `.` is the project's own entry.
+  'licenses:file':
+    'license-checker --production --relativeLicensePath | sed -e "s|$PWD/||g" -e "s|$PWD|.|g" > THIRD-PARTY-LICENSES.txt',
   'deps:check': 'node ../build-policy/scripts/check-allowlist.js .',
   'deps:verify': 'node ../build-policy/scripts/verify-package.js',
   // --include-untracked is load-bearing: the CLI's default reviews TRACKED
@@ -1303,6 +1351,25 @@ function cmdScaffold(dir) {
 
 // ------------------------------------------------------------------ mirror
 
+/**
+ * Commit-time privacy guard. `check` reports these at session start, which is
+ * a report, not a control — a session can proceed past it, and the finding that
+ * prompted this ran for days before anyone acted. Security checks belong in the
+ * hook that blocks, so this runs from pre-commit in every project and exits
+ * non-zero on any finding. Fast by construction: two git commands, no network.
+ */
+function cmdLeakScan(dir) {
+  guardLocalPath(dir);
+  const proj = detectProject(dir);
+  if (!proj.isGit) {
+    ok('Not a git repository — nothing to scan');
+    return finish();
+  }
+  section(`Privacy scan: ${path.resolve(dir)}`);
+  auditTrackedPrivacy(dir);
+  return finish();
+}
+
 function cmdMirror() {
   section('Public mirror check');
   if (!exists(PUBLIC_ROOT)) {
@@ -1354,6 +1421,26 @@ function cmdMirror() {
     .map((l) =>
       l.startsWith('!') ? { term: l.slice(1), everywhere: true } : { term: l, everywhere: false },
     );
+  // Portfolio detail is not a "leak" by term or pattern — it names nothing
+  // private — but it describes the private estate (how many projects exist,
+  // which were non-compliant, what remediation is outstanding) and means
+  // nothing to a public reader. It reached the public changelog because the
+  // scans below look for identifiers, not for internal operational prose.
+  // Version history entries belong in both copies; the remediation actions
+  // belong only in the private one.
+  const internalProse = [/\b\d+\s+projects?\b/i, /\bAction:/];
+  for (const doc of ['BUILD-POLICY.md', 'project-standards.md']) {
+    const content = readFile(path.join(PUBLIC_ROOT, doc));
+    for (const re of internalProse) {
+      const m = content.match(re);
+      if (m) {
+        fail(
+          `Internal portfolio detail in public mirror ${doc}: "${m[0]}" — remediation counts and per-project actions stay in the private copy; the public entry states the rule and its enforcement only`,
+        );
+      }
+    }
+  }
+
   // Third generic pattern: Apple app-specific password shape (xxxx-xxxx-xxxx-xxxx,
   // lowercase letters) — covered here so the literal never lives in the blocklist.
   const genericPatterns = [
@@ -1385,9 +1472,12 @@ function cmdMirror() {
               content.match(
                 new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g'),
               ) || [];
+            // Placeholders are documentation, not leaks. Same exemption list as
+            // the tracked-file scan in `check`, applied to paths as well as
+            // emails — the docs demonstrate the rule using `/Users/you/...`.
             const hit = all.find(
               (s) =>
-                !/^(your|you|user|name|example|placeholder|someone)@/i.test(s) &&
+                !PLACEHOLDER_ID.test(s.replace(/^\/(?:Users|home)\//, '').replace(/@.*$/, '')) &&
                 s !== 'xxxx-xxxx-xxxx-xxxx',
             );
             if (hit) {
@@ -1499,7 +1589,20 @@ function cmdSetupMachine() {
   }
   ok(`Installed agents to ${agentsDest}`);
 
-  // 3. Hooks — merge into settings.json, never clobber existing config
+  // 3. Public-mirror pre-push guard. Lives in .git/hooks (not versioned), so
+  // it is machine wiring like the rest of this command — a fresh clone of the
+  // mirror can otherwise push unchecked.
+  const mirrorHooks = path.join(PUBLIC_ROOT, '.git', 'hooks');
+  if (exists(mirrorHooks)) {
+    const dest = path.join(mirrorHooks, 'pre-push');
+    fs.copyFileSync(path.join(MACHINE, 'mirror-pre-push.sh'), dest);
+    fs.chmodSync(dest, 0o755);
+    ok(`Installed public-mirror pre-push guard at ${dest}`);
+  } else {
+    warn(`Public mirror not found at ${PUBLIC_ROOT} — pre-push guard not installed`);
+  }
+
+  // 4. Hooks — merge into settings.json, never clobber existing config
   const settingsPath = path.join(claudeDir, 'settings.json');
   const settings = readJSON(settingsPath) || {};
   const canonical = readJSON(path.join(MACHINE, 'hooks.json')) || {};
@@ -1867,6 +1970,8 @@ function main() {
       return cmdScaffold(dir);
     case 'mirror':
       return cmdMirror();
+    case 'leak-scan':
+      return cmdLeakScan(dir);
     case 'hook-stop':
       return cmdHookStop();
     case 'hook-pretool':
