@@ -1190,9 +1190,22 @@ function verifyRelease(dir, proj, flags) {
     ok(
       `Manual release checklist previously acknowledged for ${proj.pkg.version} (${state.releaseAck.time})`,
     );
+  } else if (!builtDmgVersions(dir).has(proj.pkg.version)) {
+    // Pre-build stage. Every item on the checklist needs the DMG that does not
+    // exist yet (install it, see the banner, upload it), so failing here states
+    // an impossibility: the build order is gates -> commit -> build, and the
+    // checklist comes after all three. Reported as pending, not as a blocker —
+    // a FAIL here sent sessions hunting for a way to satisfy it before the
+    // build, which is the one order the policy forbids.
+    ok(`Pre-build checks passed for ${proj.pkg.version} — build the DMG next`);
+    console.log(
+      `      ${DIM}The manual checklist below is performed AFTER the build, then signed off with:${RESET}\n` +
+        `      ${DIM}  policy verify-ready --release --ack-manual   (developer runs this personally)${RESET}`,
+    );
+    for (const item of RELEASE_MANUAL_CHECKLIST) console.log(`      ${DIM}•${RESET} ${item}`);
   } else {
     fail(
-      'Manual release checklist not acknowledged for this version. Perform these, then re-run with --ack-manual:',
+      `A DMG exists for ${proj.pkg.version} but the manual release checklist is not acknowledged. Perform these, then re-run with --ack-manual:`,
     );
     for (const item of RELEASE_MANUAL_CHECKLIST) console.log(`      ${DIM}•${RESET} ${item}`);
   }
@@ -1752,6 +1765,12 @@ function cmdHookPretool() {
   // --ack-manual is the developer's signature that manual release checks
   // (dogfood install, banner, Gumroad upload) were personally performed. The
   // AI cannot know that — it must never record the ack itself.
+  //
+  // Deliberately matched anywhere in the command, which also denies harmless
+  // mentions (writing documentation about the flag through a shell heredoc).
+  // That false positive is the cheap side of the trade: narrowing the pattern
+  // to an invocation shape risks missing a real one. Write docs with the file
+  // tools instead of the shell.
   if (input.tool_name === 'Bash' && /--ack-manual/.test(cmd)) {
     console.log(
       JSON.stringify({
