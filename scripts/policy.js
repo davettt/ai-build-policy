@@ -316,6 +316,40 @@ function diffHash(dir) {
   return h.digest('hex');
 }
 
+// Hash of file CONTENT only, with no dependence on those files' status against
+// HEAD. Unlike diffHash this is unchanged by committing them.
+function contentHash(dir, files) {
+  const h = crypto.createHash('sha256');
+  for (const f of files) h.update('\0' + readFile(path.join(dir, f)));
+  return h.digest('hex');
+}
+
+/**
+ * Does a gates marker still describe the code in front of us?
+ *
+ * diffHash alone said no as soon as you committed: it hashes the changed-file
+ * list *relative to HEAD*, and `git commit` empties that list without altering
+ * a byte of what was verified. So the sequence gates → commit → anything left
+ * the marker invalid and demanded a full re-run (CodeRabbit included) of gates
+ * that had just passed on identical code.
+ *
+ * A marker holds when the verified content is still present and nothing new has
+ * changed alongside it — whether that content is now committed or not.
+ */
+function markerMatches(dir, marker) {
+  if (!marker) return false;
+  if (marker.diffHash === diffHash(dir)) return true;
+  if (!Array.isArray(marker.files) || typeof marker.contentHash !== 'string') return false;
+
+  // Anything changed now that gates never saw invalidates the marker.
+  const current = changedFiles(dir).filter((f) => !f.startsWith('.policy/'));
+  const verified = new Set(marker.files);
+  if (current.some((f) => !verified.has(f))) return false;
+
+  // The verified files must still hold exactly the content that passed.
+  return contentHash(dir, marker.files) === marker.contentHash;
+}
+
 // ------------------------------------------------------------------- check
 
 // Prettier keys every project must share. Deliberately a baseline, not the
@@ -890,8 +924,15 @@ function cmdGates(dir, flags) {
   }
 
   if (!fast) {
+    const verifiedFiles = changedFiles(dir)
+      .filter((f) => !f.startsWith('.policy/'))
+      .sort();
     const marker = {
       diffHash: diffHash(dir),
+      // Recorded so the marker survives the commit, which empties the
+      // changed-file list without altering any verified content.
+      files: verifiedFiles,
+      contentHash: contentHash(dir, verifiedFiles),
       timestamp: new Date().toISOString(),
       gates: report.map((r) => r.gate),
     };
@@ -937,7 +978,7 @@ function cmdVerifyMarker(dir) {
   const sourceChanged = changedFiles(dir).filter(isSourceFile);
   if (sourceChanged.length === 0) return;
   const marker = readJSON(path.join(dir, '.policy', 'gates.json'));
-  if (marker && marker.diffHash === diffHash(dir)) {
+  if (markerMatches(dir, marker)) {
     console.log(`${GREEN}✓${RESET} Full gates passed on this exact tree (${marker.timestamp})`);
     return;
   }
@@ -999,7 +1040,7 @@ function cmdVerifyReady(dir, flags) {
   // 1. Gates marker matches the current diff
   const marker = readJSON(path.join(dir, '.policy', 'gates.json'));
   if (!marker) fail(`No gates marker — run 'policy gates' first`);
-  else if (marker.diffHash !== diffHash(dir))
+  else if (!markerMatches(dir, marker))
     fail(
       `Working tree changed since gates last passed (${marker.timestamp}) — re-run 'policy gates'`,
     );
@@ -1679,7 +1720,7 @@ function cmdHookStop() {
     );
   }
   const marker = readJSON(path.join(dir, '.policy', 'gates.json'));
-  if (!marker || marker.diffHash !== diffHash(dir)) {
+  if (!markerMatches(dir, marker)) {
     reasons.push(
       `Full quality gates have NOT passed on the current tree` +
         (marker

@@ -1,7 +1,7 @@
 # Build & Development Policy
 
-**Version:** 2.8
-**Last updated:** 2026-08-13
+**Version:** 2.9
+**Last updated:** 2026-08-16
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
 
@@ -181,6 +181,7 @@ The sanitised public copy lives in `build-policy-public/` → pushed to `THIS-RE
 
 | Version | Date | Changes |
 |---|---|---|
+| 2.9 | 2026-08-16 | The gates marker no longer expires at the moment of commit. `diffHash` hashes the changed-file list *relative to HEAD*, so `git commit` emptied that list and invalidated a marker without a byte of verified code changing: gates → commit → any further work demanded a full re-run, CodeRabbit included, of gates that had just passed on identical content. The marker now also records the verified file list and a `contentHash` over their contents, and `markerMatches` accepts it when the verified content is unchanged and nothing outside that set has changed — whether the content is committed or not. Verified across the sequence: valid before commit, valid after commit, invalid on an edit, valid again when that edit is reverted, invalid when a new file appears; `verify-marker` still blocks a commit carrying unverified changes, and markers written before this version behave exactly as they did. |
 | 2.8 | 2026-08-13 | Privacy checks moved from report to control. The tracked-file scans ran only in `check` at session start, so a finding could be seen and passed over; internal portfolio detail (project counts, outstanding remediation, which controls were absent and when) had also reached the public changelog, which no scan covered because it names nothing private. Now: `policy leak-scan` runs in `.husky/pre-commit` for every project and exits non-zero on any finding, sharing one implementation with `check` via `auditTrackedPrivacy`; `mirror` FAILs on internal portfolio prose in the public copy; and `setup-machine` installs a `pre-push` guard on the public mirror that runs `mirror` before anything reaches the remote. |
 | 2.7.2 | 2026-08-10 | Content-level leak scanning extended from the policy mirror to every project. `mirror` scanned file contents for private details; project `check` verified only that private *files* were gitignored and untracked, so identifying content inside a legitimately tracked file passed every gate — the case being an absolute home path in generated attribution. `check` now FAILs on `/Users/<name>/...` or `/home/<name>/...` in any tracked file, ignoring placeholder usernames (`you`, `yourname`, `example`) so docs and UI hints are unaffected. |
 | 2.7.1 | 2026-08-10 | `licenses:file` no longer writes the build machine's home directory into shipped attribution. `license-checker --production` prints absolute paths in both `path:` and `licenseFile:` (`--relativeLicensePath` fixes only the second, and `--customPath` cannot drop a field), so the standard script strips the build root. `verify-ready --release` now FAILs when `THIRD-PARTY-LICENSES.txt` contains `/Users/<name>/...`. |
