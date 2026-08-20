@@ -4,7 +4,9 @@
   "notaryKeychainProfile": "yourcompany",
   "staleness": {
     "healthRunDays": 30,
-    "registryReviewDays": 90
+    "registryReviewDays": 90,
+    "depsDriftPackages": 10,
+    "depsRefreshDays": 30
   },
   "entries": {
     "anthropic-model-fast": {

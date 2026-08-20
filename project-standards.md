@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.9.1
-**Last updated:** 2026-08-16
+**Version:** 2.14
+**Last updated:** 2026-08-21
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -762,6 +762,20 @@ Because majors are manual, different sessions used to reason about the migration
 The enforcement: `auditMajorUpgrades` compares the working `package.json` against the committed one; any dependency whose **major** increased must have a matching decision record or `check`/`verify-ready` fail (pre-commit, same window as the CHANGELOG check). The record lives in `.claude/specs/deps/` — gitignored like all specs, carried between machines and sessions by file sync — and the check reads it from disk, so the next session inherits the grounded finding instead of re-deriving it.
 
 > **Anti-fabrication rule (applies to any session, any agent):** claims about a dependency's breaking changes or peer requirements must cite `npm view` output or the fetched upstream migration guide. A subagent that "researches" a migration from memory will hallucinate constraints — the same failure the verified-dates registry prevents for model IDs.
+
+### Keeping dependencies current
+
+Two lanes, both minor/patch only. Majors always go through `policy upgrade <pkg>` and its decision record.
+
+**Local refresh (`policy deps-update`)** is the primary lane. It runs `npm update`, which moves each package to the newest version its declared range allows and does not rewrite the ranges in `package.json` (npm's documented behaviour). With `save-prefix = ^` that means minor and patch. One command brings the whole tree current, verified by one full gates run rather than one review cycle per package.
+
+Guardrails, all automatic: the lockfile changing makes `gates` run the Socket supply-chain scan; `min-release-age=1` quarantines anything published in the last 24 hours; full gates and tests must pass before the commit is possible; the change needs a CHANGELOG entry like any other.
+
+Run it when `check` reports drift, and before starting feature work rather than in the middle of it.
+
+**Dependabot** remains the safety net for anything the local lane misses, and the notification channel for advisories. It raises one PR per package, which is why it cannot be the primary lane: the PRs accumulate faster than the review-scan-merge cycle clears them. Once a local refresh lands on main, superseded PRs close themselves.
+
+`check` warns at session start when more than 10 packages sit behind their allowed range and the last refresh is over 30 days old. It warns rather than fails, since a routine refresh should not block unrelated work. The count is cached and re-measured at most once a day, because `npm outdated` is a network call and the session-start hook has a 10 second budget.
 
 **Dependabot PR Flow (minor and patch only, with Socket):**
 1. Review the Dependabot PR on GitHub — confirm it is a minor or patch bump

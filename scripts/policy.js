@@ -597,6 +597,35 @@ function cmdCheck(dir) {
     else fail(`Missing ${label}: ${f} (run: policy scaffold)`);
   }
 
+  // CLAUDE.md — required, and required to say something. The rule existed only
+  // as prose in Phase 1 marked "human judgment", so nothing verified it and a
+  // third of projects had none. It is gitignored (local context, never
+  // published), which is why it was omitted from the committed-file list above,
+  // but existence is checkable regardless of git.
+  //
+  // The floor is deliberately low: of the files that already existed, every one
+  // cleared 25 lines, while heading-based rules would have failed up to ten of
+  // them. A scaffolded copy still carrying its placeholder marker counts as
+  // absent — a file that exists but says nothing is the failure this is meant
+  // to catch, not a box to tick.
+  const claudeMd = path.join(dir, 'CLAUDE.md');
+  if (!exists(claudeMd)) {
+    fail(
+      'Missing CLAUDE.md — project context for every AI session (run: policy scaffold, then fill it in)',
+    );
+  } else {
+    const content = readFile(claudeMd);
+    if (content.includes('SCAFFOLD:')) {
+      fail(
+        'CLAUDE.md is still the unfilled scaffold — replace the placeholders and delete the SCAFFOLD line',
+      );
+    } else if (content.split('\n').length < 25) {
+      fail(
+        `CLAUDE.md is a stub (${content.split('\n').length} lines) — it must describe what the project is, its architecture, and the patterns a session must not undo`,
+      );
+    } else ok('CLAUDE.md present');
+  }
+
   // .gitignore effectiveness — some repos are public, so private context and
   // data must be unpublishable. Test what git would actually ignore (pattern
   // semantics), not what .gitignore happens to mention as a substring.
@@ -776,6 +805,39 @@ function checkStaleness(dir, reg) {
     else ok(`Maintenance current (last health run ${d} days ago)`);
   } else {
     warn(`No maintenance record — run 'policy health' to establish one`);
+  }
+
+  // Dependency drift inside the declared ranges. Warns rather than fails: a
+  // routine refresh should not block unrelated work. Visible every session so
+  // it cannot accumulate quietly — Dependabot raises one PR per package, and
+  // those queue faster than they get merged.
+  // `npm outdated` is a network call taking seconds, and this runs inside the
+  // SessionStart hook's 10s budget — so the result is cached and re-measured at
+  // most once a day. Offline, the probe simply fails and reports nothing rather
+  // than stalling the session.
+  if (exists(path.join(dir, 'package.json'))) {
+    const driftLimit = (reg.staleness && reg.staleness.depsDriftPackages) || 10;
+    const refreshDays = (reg.staleness && reg.staleness.depsRefreshDays) || 30;
+    const daysStale = state.lastDepsUpdate ? daysSince(state.lastDepsUpdate) : null;
+    if (daysStale === null || daysStale > refreshDays) {
+      const probeAgeHours = state.lastDriftProbe
+        ? (Date.now() - Date.parse(state.lastDriftProbe)) / 3600000
+        : Infinity;
+      let drift = state.driftCount;
+      if (probeAgeHours > 24) {
+        drift = outdatedSplit(dir).inRange.length;
+        state.lastDriftProbe = new Date().toISOString();
+        state.driftCount = drift;
+        saveState(dir, state);
+      }
+      if (drift > driftLimit) {
+        warn(
+          `${drift} dependencies behind their allowed range` +
+            (daysStale === null ? '' : ` (last refresh ${daysStale} days ago)`) +
+            ` — run: policy deps-update`,
+        );
+      }
+    }
   }
 
   const stale = Object.entries(reg.entries || {}).filter(
@@ -1120,13 +1182,41 @@ function cmdVerifyReady(dir, flags) {
 // site version.json => banner): installing the new DMG while the site still
 // lists the old version proves the banner machinery fires; updating the site
 // then proves the match clears it. Same code path a real user's old app hits.
-const RELEASE_MANUAL_CHECKLIST = [
-  'Installed new DMG over previous (dogfood): data migrated, settings intact, first-run + one core flow work',
-  'Update banner VISIBLE in the new build (site version.json still lists the previous version)',
-  'Uploaded new DMG to Gumroad, then updated site version.json + changelog + listing',
-  'Update banner CLEARED after site update (versions match; relaunch app to re-fetch)',
-  'Release marketing drafts prepped in app-marketing',
-];
+// Not every project ships the same way, and a checklist listing steps the
+// project cannot perform gets signed anyway — which destroys the meaning of the
+// signature. `gumroad` is the paid-app flow. `none` is an app that builds a DMG
+// but is not distributed yet, so there is nothing to upload and no site version
+// to compare a banner against. `internal` covers everything with no DMG at all:
+// PM2 web apps, CLIs, libraries.
+const RELEASE_CHECKLISTS = {
+  gumroad: [
+    'Installed new DMG over previous (dogfood): data migrated, settings intact, first-run + one core flow work',
+    'Update banner VISIBLE in the new build (site version.json still lists the previous version)',
+    'Uploaded new DMG to Gumroad, then updated site version.json + changelog + listing',
+    'Update banner CLEARED after site update (versions match; relaunch app to re-fetch)',
+    'Release marketing drafts prepped in app-marketing',
+  ],
+  none: [
+    'Installed new DMG over previous (dogfood): data migrated, settings intact, first-run + one core flow work',
+    'Not distributed yet: no upload or site listing for this version. Set "policy": {"distribution": "gumroad"} in package.json when it ships',
+  ],
+  internal: [
+    'Rebuilt and restarted (npm run build && pm2 restart <app>); one core flow verified in the running app',
+    'If the project is published (site, npm, GitHub release): listing and changelog updated',
+  ],
+};
+
+/**
+ * How this project reaches its users, which decides the release checklist.
+ * Declared per project via package.json `policy.distribution`; inferred
+ * otherwise, since most Electron apps here are sold through Gumroad and
+ * everything else is deployed locally.
+ */
+function releaseProfile(proj) {
+  const declared = proj.pkg && proj.pkg.policy && proj.pkg.policy.distribution;
+  if (declared && RELEASE_CHECKLISTS[declared]) return declared;
+  return proj.isElectron ? 'gumroad' : 'internal';
+}
 
 function verifyRelease(dir, proj, flags) {
   section('Release checks');
@@ -1179,10 +1269,39 @@ function verifyRelease(dir, proj, flags) {
     }
   }
 
+  // Release tag. The version-bump check above reads `git describe --tags`, but
+  // nothing in this tool ever created a tag and the workflow never named the
+  // step, so 21 of 24 projects had none and the check silently degraded to a
+  // warning. A tag is the durable record of what shipped: `release/` gets
+  // cleaned and DMGs get rebuilt, and then nothing else marks the commit a
+  // version was cut from. Enforced at sign-off rather than earlier, because the
+  // developer creates the tag, and only once the release is real.
+  const profile = releaseProfile(proj);
+  const checklist = RELEASE_CHECKLISTS[profile];
+  // Only the DMG-producing profiles have an artifact to stage the checklist on.
+  const buildsArtifact = profile === 'gumroad' || profile === 'none';
+
+  const tagName = `v${proj.pkg.version}`;
+  const tagExists =
+    sh(`git tag --list ${safeToken(tagName, 'git tag')}`, dir).out.trim() === tagName;
+  const tagAtHead = sh('git tag --points-at HEAD', dir)
+    .out.split('\n')
+    .map((t) => t.trim())
+    .includes(tagName);
+
   // Manual checklist acknowledgment (recorded per version)
   const state = loadState(dir);
   const ackVersion = state.releaseAck && state.releaseAck.version;
-  if (flags.includes('--ack-manual')) {
+  if (flags.includes('--ack-manual') && !tagExists) {
+    // Refuse the signature rather than record a release with no durable marker.
+    fail(
+      `Release ${proj.pkg.version} is not tagged — the ack was not recorded. Tag the release commit, then re-run:\n` +
+        `      git tag ${tagName} && git push origin ${tagName}`,
+    );
+  } else if (flags.includes('--ack-manual')) {
+    if (!tagAtHead) {
+      warn(`${tagName} exists but does not point at HEAD — confirm it marks the release commit`);
+    } else ok(`Release tagged at HEAD (${tagName})`);
     state.releaseAck = { version: proj.pkg.version, time: new Date().toISOString() };
     saveState(dir, state);
     ok(`Manual release checklist acknowledged for ${proj.pkg.version}`);
@@ -1190,28 +1309,152 @@ function verifyRelease(dir, proj, flags) {
     ok(
       `Manual release checklist previously acknowledged for ${proj.pkg.version} (${state.releaseAck.time})`,
     );
-  } else if (!builtDmgVersions(dir).has(proj.pkg.version)) {
-    // Pre-build stage. Every item on the checklist needs the DMG that does not
-    // exist yet (install it, see the banner, upload it), so failing here states
-    // an impossibility: the build order is gates -> commit -> build, and the
-    // checklist comes after all three. Reported as pending, not as a blocker —
-    // a FAIL here sent sessions hunting for a way to satisfy it before the
-    // build, which is the one order the policy forbids.
+  } else if (buildsArtifact && !builtDmgVersions(dir).has(proj.pkg.version)) {
+    // Pre-build stage, for profiles that produce a DMG. Every item on the
+    // checklist needs the artifact that does not exist yet (install it, see the
+    // banner, upload it), so failing here states an impossibility: the build
+    // order is gates -> commit -> build, and the checklist comes after all
+    // three. Reported as pending, not as a blocker — a FAIL here sent sessions
+    // hunting for a way to satisfy it before the build, which is the one order
+    // the policy forbids.
     ok(`Pre-build checks passed for ${proj.pkg.version} — build the DMG next`);
     console.log(
       `      ${DIM}The manual checklist below is performed AFTER the build, then signed off with:${RESET}\n` +
         `      ${DIM}  policy verify-ready --release --ack-manual   (developer runs this personally)${RESET}`,
     );
-    for (const item of RELEASE_MANUAL_CHECKLIST) console.log(`      ${DIM}•${RESET} ${item}`);
+    for (const item of checklist) console.log(`      ${DIM}•${RESET} ${item}`);
+    if (!tagExists) {
+      // Suggested after the build rather than before it: a tag pushed ahead of
+      // a build that then fails notarization, or a release later abandoned,
+      // marks a version that never shipped.
+      console.log(
+        `      ${DIM}•${RESET} Once the DMG builds and verifies, tag the release commit (the sign-off refuses an untagged release):\n` +
+          `        ${DIM}git tag ${tagName} && git push origin ${tagName}${RESET}`,
+      );
+    }
   } else {
     fail(
-      `A DMG exists for ${proj.pkg.version} but the manual release checklist is not acknowledged. Perform these, then re-run with --ack-manual:`,
+      buildsArtifact
+        ? `A DMG exists for ${proj.pkg.version} but the manual release checklist is not acknowledged. Perform these, then re-run with --ack-manual:`
+        : `Release checklist for ${proj.pkg.version} not acknowledged (${profile} release). Perform these, then re-run with --ack-manual:`,
     );
-    for (const item of RELEASE_MANUAL_CHECKLIST) console.log(`      ${DIM}•${RESET} ${item}`);
+    for (const item of checklist) console.log(`      ${DIM}•${RESET} ${item}`);
   }
 }
 
 // ------------------------------------------------------------------ health
+
+/**
+ * Split outdated packages into what the declared ranges already allow and what
+ * needs a range change. `current !== wanted` is reachable by `npm update`;
+ * anything else is a major and goes through `policy upgrade <pkg>`.
+ */
+function outdatedSplit(dir) {
+  const raw = sh('npm outdated --json', dir);
+  let list = {};
+  try {
+    list = JSON.parse(raw.out || '{}');
+  } catch {
+    /* non-JSON output, treat as none */
+  }
+  const entries = Object.entries(list);
+  return {
+    // Installed, and a newer version already permitted by the declared range.
+    inRange: entries.filter(([, v]) => v.current && v.wanted && v.current !== v.wanted),
+    // Installed and at the top of its range, but a newer major exists.
+    majorOnly: entries.filter(
+      ([, v]) => v.current && v.current === v.wanted && v.latest !== v.wanted,
+    ),
+    // Not installed at all: `npm outdated` reports these with no `current`.
+    // They are an install problem, not a drift problem.
+    missing: entries.filter(([, v]) => !v.current),
+  };
+}
+
+/**
+ * Refresh dependencies inside their declared ranges.
+ *
+ * Dependabot covers the same ground, but one PR per package: a weekly trickle
+ * that needs a review-scan-merge cycle each. They queue faster than they clear
+ * (12 open PRs and 24 days of drift on one app when this was written), so the
+ * lockfile ages while local work continues against it. This does the same
+ * updates in one pass, to be verified once by a full gates run.
+ *
+ * Safe by construction rather than by care: `npm update` does not rewrite the
+ * semver ranges in package.json (npm's own docs), and with save-prefix `^` that
+ * confines it to minor and patch. Majors still require `policy upgrade <pkg>`
+ * and its decision record. The lockfile changing makes `gates` run the Socket
+ * supply-chain scan, and `min-release-age=1` quarantines anything published in
+ * the last 24 hours.
+ */
+function cmdDepsUpdate(dir) {
+  guardLocalPath(dir);
+  const proj = detectProject(dir);
+  section(`Dependency refresh: ${path.resolve(dir)}`);
+  if (!proj.hasPkg) {
+    ok('No package.json — nothing to update');
+    return finish();
+  }
+
+  const { inRange, majorOnly, missing } = outdatedSplit(dir);
+  if (missing.length > 0) {
+    warn(
+      `${missing.length} declared dependency/ies not installed (${missing
+        .map(([n]) => n)
+        .slice(0, 5)
+        .join(', ')}) — run npm install first`,
+    );
+  }
+  if (inRange.length === 0) {
+    ok('All dependencies current within their declared ranges');
+  } else {
+    console.log(`  ${inRange.length} package(s) behind their allowed range:`);
+    for (const [name, v] of inRange.slice(0, 15)) {
+      console.log(`    ${DIM}${name} ${v.current} → ${v.wanted}${RESET}`);
+    }
+    if (inRange.length > 15) console.log(`    ${DIM}...and ${inRange.length - 15} more${RESET}`);
+  }
+  if (majorOnly.length > 0) {
+    console.log(
+      `  ${DIM}${majorOnly.length} package(s) need a major bump — not touched here; use: policy upgrade <pkg>${RESET}`,
+    );
+  }
+
+  if (inRange.length > 0) {
+    process.stdout.write(`  ${DIM}running${RESET} npm update ... `);
+    const r = sh('npm update', dir);
+    if (!r.ok) {
+      console.log(`${RED}FAILED${RESET}\n`);
+      console.log(r.out.split('\n').slice(-20).join('\n'));
+      fail('npm update failed — dependencies unchanged');
+      return finish();
+    }
+    console.log(`${GREEN}done${RESET}`);
+    const after = outdatedSplit(dir);
+    ok(`${inRange.length - after.inRange.length} package(s) updated within range`);
+    if (after.inRange.length > 0) {
+      warn(
+        `${after.inRange.length} still behind: ${after.inRange
+          .map(([n]) => n)
+          .slice(0, 6)
+          .join(', ')} — usually a transitive pin held by another dependency`,
+      );
+    }
+  }
+
+  const state = loadState(dir);
+  state.lastDepsUpdate = new Date().toISOString();
+  saveState(dir, state);
+
+  if (inRange.length > 0) {
+    console.log(
+      `\n  ${BOLD}Lockfile changed. Next:${RESET}\n` +
+        `    node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} gates   ${DIM}(the Socket scan runs because dependencies moved)${RESET}\n` +
+        `    CHANGELOG entry, then the developer commits\n`,
+    );
+  }
+  return finish();
+}
 
 function cmdHealth(dir, flags) {
   guardLocalPath(dir);
@@ -1288,7 +1531,7 @@ const STANDARD_SCRIPTS = {
   // The four sanctioned global exclusions (triaged FPs, documented in
   // project-standards § Semgrep rule exclusions). Anything else is per-line
   // `// nosemgrep` — enforced below in cmdCheck.
-  sast: 'semgrep scan --config auto --error --quiet --exclude-rule javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-res-sendfile.express-res-sendfile --exclude-rule javascript.express.security.audit.remote-property-injection.remote-property-injection',
+  sast: 'semgrep scan --config auto --error --quiet --exclude-rule javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-res-sendfile.express-res-sendfile --exclude-rule javascript.express.security.audit.remote-property-injection.remote-property-injection --exclude-rule html.security.audit.missing-integrity.missing-integrity',
   secrets: 'betterleaks git . -v',
   licenses: "license-checker --production --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary",
   // The attribution file ships to customers and is committed to public repos,
@@ -1339,6 +1582,9 @@ function cmdScaffold(dir) {
   copy('ci.yml', '.github/workflows/ci.yml');
   copy('pre-commit', '.husky/pre-commit');
   copy('prettierrc', '.prettierrc');
+  // Scaffolded with placeholders intact; `check` keeps failing until they are
+  // replaced, so this hands over a skeleton rather than closing the gap.
+  copy('CLAUDE.md', 'CLAUDE.md');
   if (proj.hasHTML) copy('htmlvalidate.json', '.htmlvalidate.json');
   if (proj.hasCSS) copy('stylelintrc.json', '.stylelintrc.json');
   if (proj.isElectron) copy('entitlements.mac.plist', 'build/entitlements.mac.plist');
@@ -2024,6 +2270,8 @@ function main() {
       return cmdVerifyReady(dir, flags);
     case 'health':
       return cmdHealth(dir, flags);
+    case 'deps-update':
+      return cmdDepsUpdate(dir);
     case 'upgrade':
       return cmdUpgrade(dir, rest);
     case 'scaffold':
