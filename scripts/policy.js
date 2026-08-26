@@ -430,23 +430,42 @@ function auditPolicyDocVersions(root, label) {
 function auditPolicyRepo(root) {
   auditPolicyDocVersions(root, 'policy docs');
 
-  for (const f of [
+  const hasPublicMirrorSibling =
+    path.basename(root) !== 'build-policy-public' &&
+    exists(path.join(path.dirname(root), 'build-policy-public'));
+
+  const requiredFiles = [
     'scripts/policy.js',
     'scripts/check-allowlist.js',
     'scripts/bootstrap-allowlist.js',
     'scripts/verify-package.js',
     'machine/hooks.json',
     'machine/session-start.sh',
-    'machine/mirror-pre-push.sh',
     'templates/ci.yml',
     'templates/pre-commit',
     'templates/AGENTS.md',
     'templates/CLAUDE.md',
     'registry.json',
+  ];
+  const privateOnlyFiles = [
+    'machine/build-policy-pre-commit.sh',
+    'machine/mirror-pre-push.sh',
     'mirror-blocklist.txt',
-  ]) {
+  ];
+
+  for (const f of hasPublicMirrorSibling
+    ? requiredFiles.concat(privateOnlyFiles)
+    : requiredFiles) {
     if (exists(path.join(root, f))) ok(`Policy repo file present: ${f}`);
     else fail(`Policy repo file missing: ${f}`);
+  }
+
+  if (!hasPublicMirrorSibling) {
+    for (const f of privateOnlyFiles) {
+      if (!exists(path.join(root, f))) {
+        ok(`Policy repo private-only file skipped in public mirror: ${f}`);
+      }
+    }
   }
 
   for (const f of ['registry.json', 'machine/hooks.json', '.prettierrc']) {
@@ -1156,7 +1175,10 @@ function cmdGates(dir, flags) {
   guardLocalPath(dir);
   const proj = detectProject(dir);
   if (!proj.hasPkg) {
-    console.log('No package.json — nothing to gate.');
+    console.log(
+      'Gates skipped: no package.json, so there is nothing to run.\n' +
+        'This is not a pass. Documentation-only repos are covered by `check`.',
+    );
     return;
   }
   const fast = flags.includes('--fast');
@@ -2171,7 +2193,19 @@ function cmdSetupMachine() {
   }
   ok(`Installed agents to ${agentsDest}`);
 
-  // 3. Public-mirror pre-push guard. Lives in .git/hooks (not versioned), so
+  // 3. build-policy pre-commit guard. This repo has no package.json/Husky gate,
+  // so the native hook runs the policy repo checks that matter before commit.
+  const policyHooks = path.join(POLICY_ROOT, '.git', 'hooks');
+  if (exists(policyHooks)) {
+    const dest = path.join(policyHooks, 'pre-commit');
+    fs.copyFileSync(path.join(MACHINE, 'build-policy-pre-commit.sh'), dest);
+    fs.chmodSync(dest, 0o755);
+    ok(`Installed build-policy pre-commit guard at ${dest}`);
+  } else {
+    warn(`Policy repo git hooks not found at ${policyHooks} — pre-commit guard not installed`);
+  }
+
+  // 4. Public-mirror pre-push guard. Lives in .git/hooks (not versioned), so
   // it is machine wiring like the rest of this command — a fresh clone of the
   // mirror can otherwise push unchecked.
   const mirrorHooks = path.join(PUBLIC_ROOT, '.git', 'hooks');
@@ -2184,7 +2218,7 @@ function cmdSetupMachine() {
     warn(`Public mirror not found at ${PUBLIC_ROOT} — pre-push guard not installed`);
   }
 
-  // 4. Hooks — merge into settings.json, never clobber existing config
+  // 5. Hooks — merge into settings.json, never clobber existing config
   const settingsPath = path.join(claudeDir, 'settings.json');
   const settings = readJSON(settingsPath) || {};
   const canonical = readJSON(path.join(MACHINE, 'hooks.json')) || {};
