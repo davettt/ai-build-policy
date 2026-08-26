@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.14
-**Last updated:** 2026-08-21
+**Version:** 2.20
+**Last updated:** 2026-08-25
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -181,8 +181,19 @@ Checklist of what "done" looks like.
 - `contextIsolation: true`, `nodeIntegration: false`
 - **PDF export:** use **pdfmake** (pure JS, no Chromium dependency). Do NOT use Puppeteer — it bundles a ~150MB Chromium binary unnecessarily since Electron already IS Chromium.
 - **Secret storage:** AES-256-CBC with a machine-derived key (`SHA256(appname:hostname:username)`). Do NOT use Electron `safeStorage` — its encrypted values go stale across app re-signs/updates (see a-reference-app `server/ai.js` `isStaleSafeStorageKey` for the migration that moved off it).
+- **Secret storage — what it defends against, and what it does not.** The property being bought is that a config file copied to another machine does not decrypt, because the key is derived from that machine. It is not protection against code running as the user on the same machine: `hostname` and `username` are readable, so the key is derivable, and the value at risk is the user's own BYOK API key rather than user data or payment details. Stated because the scheme reads like strong encryption and is not; it is machine-binding.
+
+  Reviewed and kept deliberately (2026-08-23) after an automated review proposed a keychain-held root key, a KDF, and AES-GCM:
+  - **Keychain root key: rejected.** macOS keychain ACLs bind to the code signature, so a re-signed build loses access. That is the exact failure that forced the migration off `safeStorage`, and it surfaces at app startup as a prompt or a key that no longer decrypts.
+  - **AES-GCM: rejected as not worth the migration.** Authenticated encryption matters when an attacker can write but not read. Here anyone who can write the config can also read it and derive the key, so it closes no open gap, while costing a format change and a migration across every shipping app.
+
+  Revisit if the stored value ever becomes something other than a user's own API key.
+
 - **Native modules** (e.g. better-sqlite3): add `"postinstall": "npx @electron/rebuild -f -w <module>"` and `"asarUnpack": ["**/*.node"]` in electron-builder config.
-- **No in-app license gate** — Gumroad download is the gate (matches all shipping apps).
+- **No in-app license gate** — the store download is the gate (matches all shipping apps). An activation check puts a network dependency in the startup path, burns an activation on every validation, and needs somewhere to store the key.
+- **These four are enforced, not advisory.** `check` FAILs an Electron project that carries a puppeteer dependency, calls the store licence API, uses `safeStorage`, or has no `findFreePort()`. Matching is on imports and calls, so discussing `safeStorage` in a comment (to record that a project moved off it) does not flag.
+- **Electron itself is audited, despite being a devDependency.** The `security` script is `--omit=dev` because the gate models shipped risk and dev dependencies do not ship. Electron is the exception: electron-builder bundles it into the DMG, so Chromium is in the shipped artifact while sitting in `devDependencies`. `gates` therefore audits the full tree for Electron projects and FAILs on an Electron high or critical advisory only, leaving dev-chain advisories out of the gate. It runs in `gates` rather than `check` because it is a network call and the session-start hook has a 10 second budget. When it fires, check whether the fix is inside the declared range: if so `policy deps-update` resolves it, otherwise it needs a major upgrade decision (`policy upgrade electron`).
+- **Scaffolding a new app: never copy an existing project wholesale.** `policy scaffold` writes `electron/main.js` (with `findFreePort()`, `contextIsolation`, no `titleBarStyle`) and `server/secret-storage.js` (AES-256-CBC, machine-derived key, `enc:` prefix, plaintext migration). A freshly scaffolded app passes the Electron checks with no edits, so there is nothing to copy from another project. Where a worked example helps beyond that, the reference is named here for the specific pattern — copying a project chosen for being nearby is how a one-off divergence becomes a convention.
 - **Version check:** fetch `yourdomain.com/<app>/version.json` on launch with a cache-busting param (`?t=${Date.now()}`) so CDN caching can't hide a release; show the update banner on a **simple version mismatch** (`site.version !== APP_VERSION`), not a semver "newer than" comparison. The mismatch check is deliberate (decided 2026-07-15): it needs no comparison function, and it makes banner verification self-testing at every release — install the new DMG while the site still lists the old version and the banner MUST appear (same code path a user's old app hits); update the site and it MUST clear. Cosmetic trade-off accepted: during the upload window the developer's own new build shows a banner naming the older site version — nobody else ever sees that state. The live banner is verified twice per release via the release checklist (`verify-ready --release`). Apps still on a semver comparison (e.g. a-reference-app): migrate to the mismatch check when next touched.
 - **Data safety:** schema version + migration-on-load + pre-migration backups + downgrade guard are mandatory — see § Data Migration, Backups & Downgrade Guard.
 - **Diagnostics:** structured local logging + "Export diagnostics" — see § Diagnostics Logging.
@@ -315,6 +326,7 @@ npm run format      # Prettier
 npm run type-check  # tsc --noEmit (strict: true)
 npm run build       # Full build
 npm run security    # npm audit --audit-level=high --omit=dev (gate = shipped deps; health audits full tree)
+                    # Electron projects: `gates` additionally audits Electron itself — see below
 npm run sast        # semgrep scan --config auto --error (with exclusions)
 ```
 
@@ -706,11 +718,25 @@ This is the only gate covering a compromised maintainer or a typosquat. `npm aud
 
 **Required API token scopes.** `socket ci` and `socket scan create --report` fetch the org security policy, so a token without `security-policy:read` produces a partial failure: the scan succeeds and the report request returns 403. Minimum set: `security-policy:read`, `alert-resolution list/create/read`, `alerts list`, `alerts trend`, `threat-campaigns list`.
 
+**Starting a new project: scan the tree, not each package.** The wrapper scans package by package as they install, so a first install of a normal stack costs several hundred scans against a 1,000/month allowance and fails partway when the allowance runs low. Scanning the finished tree instead costs one scan and covers the same packages. This is the sanctioned path for a first install, and it is an explicit exception to precondition 1 below, which would otherwise forbid the only remedy available:
+
+```bash
+socket raw-npm install --ignore-scripts   # tree lands; no package runs any code
+socket scan create --report               # one scan, whole resolved tree
+npm rebuild                               # only after the scan is clean
+```
+
+`--ignore-scripts` is what makes this equivalent rather than weaker. The wrapper's value is stopping a malicious package before its install scripts execute; here nothing executes until the tree has been scanned and passed. `npm rebuild` then runs the lifecycle scripts of packages that declare them, which is what native modules such as better-sqlite3 need. If the scan flags something, remove it before running `npm rebuild`.
+
+Electron 42 and later declare no `postinstall`: `index.js` checks for the binary and fetches it on first use, so `npm rebuild` correctly does nothing for it and an absent `dist/` after install is expected. Electron 41 and earlier do declare one, and `npm rebuild` runs it.
+
+**A 429 may be quota, not rate.** Check with `socket organization quota` before retrying. A rate limit clears by waiting; a depleted quota does not, and each retry consumes what is left rather than waiting it out.
+
 **When the wrapper rate-limits (HTTP 429).** The wrapper's install path can return `429 Too Many Requests` while Socket's read API remains available. A 429 indicates the package has not been scanned. It is not a security verdict and must not be treated as a pass.
 
 `socket raw-npm <cmd>` is the supported bypass. It is permitted only when all four conditions hold:
 
-1. **The change is known and bounded** — a specific advisory, an identified package, a target version. Never a blanket install of arbitrary new dependencies.
+1. **The change is known and bounded** — a specific advisory, an identified package, a target version. Never a blanket install of arbitrary new dependencies, with one exception: a new project's first install, which is blanket by nature and follows the tree-scan procedure above.
 2. **The target version is scored clean first**, via the read API that stays up during a 429: `socket package score npm <pkg>@<version> --markdown`. Check `supplyChain` and `vulnerability`. Anything below ~0.9 on supply chain, or any new `malware` / `installScripts` / `obfuscatedFile` alert, stops the bypass.
 3. **A full scan runs immediately afterwards**: `socket scan create --report --no-interactive` — confirming the resulting tree still passes policy.
 4. **The lockfile diff is inspected** — `git diff package-lock.json` shows only the expected bump and its transitive closure, nothing unrelated.
@@ -762,6 +788,14 @@ Because majors are manual, different sessions used to reason about the migration
 The enforcement: `auditMajorUpgrades` compares the working `package.json` against the committed one; any dependency whose **major** increased must have a matching decision record or `check`/`verify-ready` fail (pre-commit, same window as the CHANGELOG check). The record lives in `.claude/specs/deps/` — gitignored like all specs, carried between machines and sessions by file sync — and the check reads it from disk, so the next session inherits the grounded finding instead of re-deriving it.
 
 > **Anti-fabrication rule (applies to any session, any agent):** claims about a dependency's breaking changes or peer requirements must cite `npm view` output or the fetched upstream migration guide. A subagent that "researches" a migration from memory will hallucinate constraints — the same failure the verified-dates registry prevents for model IDs.
+
+### Never hand-edit package-lock.json
+
+The lockfile is generated, not authored. Change it only by running npm (`npm install`, `npm update`, `policy deps-update`), and revert an unwanted change with `git checkout package-lock.json`.
+
+Packages that ship native binaries (rolldown, lightningcss, `@tailwindcss/oxide`, esbuild, swc) declare every platform variant as an optional dependency, and npm records a resolution for all of them whatever machine generates the file. Removing the ones the current machine does not need leaves the declarations pointing at entries that no longer exist. That installs cleanly locally and fails on Linux, so the first symptom is a broken CI build with no apparent cause, often days later.
+
+`check` and `gates` FAIL when a lockfile declares platform binaries it has no resolutions for. The rule looks only at families of two or more platform-named siblings, so genuinely optional native modules such as `canvas` are unaffected.
 
 ### Keeping dependencies current
 

@@ -18,9 +18,14 @@ jobs:
         with:
           fetch-depth: 0 # full history for secret scanning
 
+      # Must match the local development version. A skew means CI resolves and
+      # installs with a different npm major than the one that wrote the
+      # lockfile, which is a difference that only shows up as a CI-only failure.
+      # Node 24 is LTS (Krypton) and ships npm 11, as local does.
+      # When bumping local, bump this and re-sync every project's ci.yml.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - run: npm ci

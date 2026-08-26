@@ -34,10 +34,10 @@
       "notes": "BYOK smart tier in shipping apps. AEO also uses gpt-5.5-2026-04-23 top tier."
     },
     "node-lts": {
-      "value": "22",
-      "verified": "2026-07-13",
+      "value": "24",
+      "verified": "2026-08-23",
       "reviewEveryDays": 180,
-      "notes": "CI setup-node version and local nvm target."
+      "notes": "CI node-version in templates/ci.yml. Must match the local development major so CI resolves with the same npm. Node 24 is LTS (Krypton), ships npm 11. Verified against nodejs.org/dist/index.json."
     },
     "gh-action-checkout": {
       "value": "actions/checkout@v4",

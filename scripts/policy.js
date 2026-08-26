@@ -438,6 +438,177 @@ function cmpSemver(a, b) {
 }
 
 /**
+ * Electron itself is audited, despite living in devDependencies.
+ *
+ * The `security` gate is `npm audit --audit-level=high --omit=dev`, on the
+ * reasoning that the gate models SHIPPED risk and dev dependencies do not ship
+ * (2.4.1). That premise is false for exactly one package: electron-builder
+ * bundles Electron into the DMG, so the largest attack surface in the shipped
+ * app — Chromium — was the one thing the audit never looked at. Found shipping
+ * an Electron with a high-severity sandbox escape and a fix already available.
+ *
+ * Audits the full tree but fails only on Electron, so dev-chain advisories stay
+ * out of the gate as 2.4.1 intended.
+ */
+function auditShippedElectron(dir) {
+  const raw = sh('npm audit --audit-level=high --json', dir);
+  let report;
+  try {
+    report = JSON.parse(raw.out);
+  } catch {
+    warn('Could not parse npm audit output — Electron not audited');
+    return;
+  }
+  const vuln = (report.vulnerabilities || {}).electron;
+  if (!vuln) {
+    ok('Electron has no known advisories (audited despite being a devDependency)');
+    return;
+  }
+  if (['high', 'critical'].includes(vuln.severity)) {
+    const titles = (vuln.via || [])
+      .filter((v) => typeof v === 'object')
+      .map((v) => `${v.title} [${v.severity}]`)
+      .slice(0, 2);
+    fail(
+      `Electron ${vuln.severity} advisory affects the SHIPPED app (${vuln.range}): ${titles.join('; ')} — ` +
+        `${vuln.fixAvailable ? 'a fix is available; upgrade electron' : 'no fix published yet; assess before shipping'}. ` +
+        `The 'security' gate omits dev deps, but electron-builder bundles Electron into the DMG`,
+    );
+  } else {
+    warn(
+      `Electron has a ${vuln.severity} advisory (${vuln.range}) — below the high gate threshold`,
+    );
+  }
+}
+
+/**
+ * Electron decisions that project-standards states as prohibitions.
+ *
+ * These were prose only, so a new app scaffolded by copying an existing project
+ * inherited whatever that project happened to do — and a divergence read as
+ * "how we build Electron apps here" rather than as a defect. Checking the
+ * outcome is possible where checking "read the standards first" is not.
+ *
+ * Comment lines are skipped: one project discusses `safeStorage` only to record
+ * that it moved off it, and flagging that would train people to ignore the
+ * check. Matching is on imports and calls, not on the word appearing.
+ */
+function auditElectronStandards(dir, proj) {
+  const deps = { ...(proj.pkg.dependencies || {}), ...(proj.pkg.devDependencies || {}) };
+  const findings = [];
+
+  const puppeteer = Object.keys(deps).filter((d) => /puppeteer/.test(d));
+  if (puppeteer.length > 0) {
+    findings.push(
+      `${puppeteer.join(', ')} in dependencies — Electron already is Chromium; use pdfmake for PDF export (project-standards § Electron)`,
+    );
+  }
+
+  let licence = null;
+  let safeStorage = null;
+  let hasFindFreePort = false;
+  const walk = (d) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (['node_modules', 'dist', 'release', 'build', 'coverage'].includes(e.name)) continue;
+      if (e.name.startsWith('.')) continue;
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!/\.(ts|tsx|js|jsx|mjs)$/.test(e.name)) continue;
+      const src = readFile(full);
+      if (/findFreePort/.test(src)) hasFindFreePort = true;
+      const rel = path.relative(dir, full);
+      for (const line of src.split('\n')) {
+        const t = line.trim();
+        if (t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')) continue;
+        if (!licence && /api\.gumroad\.com\/v2\/licenses/.test(t)) licence = rel;
+        if (!safeStorage && /safeStorage\s*\.\s*\w+|[{,]\s*safeStorage\s*[},]/.test(t))
+          safeStorage = rel;
+      }
+    }
+  };
+  walk(dir);
+
+  if (licence) {
+    findings.push(
+      `in-app licence gate in ${licence} — the Gumroad download is the gate; an activation check puts a network dependency in the startup path (project-standards § Electron)`,
+    );
+  }
+  if (safeStorage) {
+    findings.push(
+      `Electron safeStorage used in ${safeStorage} — its values go stale across re-signs; use AES-256-CBC with a machine-derived key (project-standards § Electron)`,
+    );
+  }
+  if (!hasFindFreePort) {
+    findings.push(
+      `no findFreePort() found — a hardcoded port collides with the PM2 dev instance and can connect the app to the wrong process (project-standards § Electron)`,
+    );
+  }
+
+  if (findings.length > 0) {
+    for (const f of findings) fail(`Electron standard: ${f}`);
+  } else ok('Electron standards followed (no licence gate, puppeteer, or safeStorage)');
+}
+
+// Cross-platform native binaries: @rolldown/binding-linux-x64-gnu and friends.
+// A package that ships these declares them all as optionalDependencies, and npm
+// records a resolution for every one regardless of the machine generating the
+// lockfile — verified against npm 11 with `--package-lock-only`, `npm update`,
+// a from-scratch regeneration, and a real `--omit=optional` install.
+const PLATFORM_BINARY =
+  /(linux|darwin|win32|freebsd|android)[-_.]?(x64|arm64|ia32|arm|s390x|ppc64)|(x64|arm64)[-_.]?(linux|darwin|win32)|msvc|gnu$|musl$/i;
+
+/**
+ * A lockfile that declares platform binaries it has no resolutions for.
+ *
+ * npm never writes this state. It appears when something filters the lockfile
+ * to "just what this machine needs" — leaving the optionalDependencies list
+ * intact while deleting the entries it points at. The result installs fine on
+ * the machine that made it and fails on every other platform, so the first
+ * symptom is a CI build breaking with no obvious cause. A real instance removed
+ * 50 entries across rolldown, lightningcss and @tailwindcss/oxide.
+ *
+ * Genuinely optional native modules (canvas, which often cannot build) are not
+ * platform variants and are skipped: only families of two or more
+ * platform-named siblings are checked.
+ */
+function auditLockfileIntegrity(dir) {
+  const lockPath = path.join(dir, 'package-lock.json');
+  if (!exists(lockPath)) return;
+  const lock = readJSON(lockPath);
+  if (!lock || !lock.packages) return;
+
+  const broken = [];
+  for (const [name, entry] of Object.entries(lock.packages)) {
+    if (!entry || !entry.optionalDependencies) continue;
+    const platform = Object.keys(entry.optionalDependencies).filter((n) => PLATFORM_BINARY.test(n));
+    if (platform.length < 2) continue;
+    const present = platform.filter((n) => lock.packages['node_modules/' + n]).length;
+    if (present < platform.length) {
+      broken.push(
+        `${(name || '(root)').replace('node_modules/', '')} ${present}/${platform.length}`,
+      );
+    }
+  }
+
+  if (broken.length > 0) {
+    fail(
+      `package-lock.json is missing platform binaries it declares: ${broken.join(', ')} — ` +
+        `npm never writes this, so the lockfile has been edited or filtered. It will install here and fail CI on Linux. ` +
+        `Restore it (git checkout package-lock.json) or regenerate with npm install; never hand-edit a lockfile`,
+    );
+  } else ok('Lockfile declares a resolution for every platform binary');
+}
+
+/**
  * Private data that would publish with the repo. Two layers: private FILES that
  * must never be tracked, and private CONTENT inside files that are legitimately
  * tracked. Shared by `check` (session-start report) and `leak-scan` (pre-commit
@@ -493,6 +664,25 @@ function cmdCheck(dir) {
   if (path.resolve(dir) === POLICY_ROOT) auditPolicyDocVersions(POLICY_ROOT, 'policy docs');
 
   if (!proj.hasPkg) {
+    // A project carrying scaffolding but no package.json is mid-setup, not
+    // documentation-only. Reporting PASS here was a false green: every
+    // structural check is skipped, including all four template-drift checks, so
+    // the session is told the project is fine while nothing has been examined.
+    // With no signal to work from, a session invents its own theory of what is
+    // wrong — one concluded its freshly scaffolded files were stale and
+    // proposed deleting six of them, CHANGELOG.md included.
+    const scaffolded = ['AGENTS.md', '.husky', '.github/workflows/ci.yml'].filter((f) =>
+      exists(path.join(dir, f)),
+    );
+    if (scaffolded.length > 0) {
+      fail(
+        `Project is mid-setup: scaffolding present (${scaffolded.join(', ')}) but no package.json, ` +
+          `so every structural check is skipped and this report says nothing about compliance. ` +
+          `Create it (npm init), then re-run check and 'policy scaffold' for anything conditional on project type`,
+      );
+      checkStaleness(dir, reg);
+      return finish();
+    }
     ok('No package.json — documentation-only project, structural checks skipped');
     checkStaleness(dir, reg);
     return finish();
@@ -651,6 +841,7 @@ function cmdCheck(dir) {
     } else ok('.gitignore covers all private paths (verified via git check-ignore)');
 
     auditTrackedPrivacy(dir);
+    auditLockfileIntegrity(dir);
   } else {
     const gi = readFile(path.join(dir, '.gitignore'));
     for (const entry of [
@@ -681,6 +872,7 @@ function cmdCheck(dir) {
     if (mac && mac.notarize && mac.hardenedRuntime)
       ok('Signing config: notarize + hardenedRuntime set');
     else warn('electron-builder mac config missing notarize/hardenedRuntime');
+    auditElectronStandards(dir, proj);
   } else if (proj.hasServer) {
     if (exists(path.join(dir, 'public/manifest.json'))) ok('PWA manifest present');
     else warn('No public/manifest.json — web apps should ship PWA icons');
@@ -908,6 +1100,24 @@ function cmdGates(dir, flags) {
   const gates = GATE_ORDER.filter((g) => (fast ? g.fast : true)).filter((g) => scripts[g.script]);
 
   section(`Quality gates (${fast ? 'fast/pre-commit' : 'full'}): ${path.resolve(dir)}`);
+
+  // A filtered lockfile installs fine here and fails CI on Linux, so it must be
+  // caught before the work is presented rather than by a red pipeline later.
+  // Pure JSON read, no network.
+  if (!fast) {
+    const before = results.fail;
+    auditLockfileIntegrity(dir);
+    if (results.fail > before) return finish();
+  }
+
+  // Electron ships inside the DMG but sits in devDependencies, so the `security`
+  // gate's --omit=dev never sees it. Audited here rather than in `check` because
+  // it is a network call and the session-start hook has a 10s budget.
+  if (!fast && proj.isElectron) {
+    const before = results.fail;
+    auditShippedElectron(dir);
+    if (results.fail > before) return finish();
+  }
 
   // CodeRabbit preflight — both failures below surface as raw JSON from the CLI
   // mid-run, which reads as "the tool is broken" rather than "your repo is not
@@ -1587,7 +1797,15 @@ function cmdScaffold(dir) {
   copy('CLAUDE.md', 'CLAUDE.md');
   if (proj.hasHTML) copy('htmlvalidate.json', '.htmlvalidate.json');
   if (proj.hasCSS) copy('stylelintrc.json', '.stylelintrc.json');
-  if (proj.isElectron) copy('entitlements.mac.plist', 'build/entitlements.mac.plist');
+  if (proj.isElectron) {
+    copy('entitlements.mac.plist', 'build/entitlements.mac.plist');
+    // The mandatory patterns as working code. Without these, building a new
+    // Electron app meant copying whichever project was nearest, which is how a
+    // one-off divergence (an in-app licence gate, safeStorage, a hardcoded
+    // port) spreads as though it were house style.
+    copy('electron-main.js', 'electron/main.js');
+    copy('secret-storage.js', 'server/secret-storage.js');
+  }
 
   if (!exists(path.join(dir, 'CHANGELOG.md'))) {
     fs.writeFileSync(
