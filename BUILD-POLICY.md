@@ -7,7 +7,7 @@ Single source of truth for how we build, maintain, and ship software. Every AI a
 
 ## The enforcement principle
 
-**Every step in this policy is either enforced by a machine or evidenced by an artifact a machine checks. Prose is never the enforcement layer.** LLMs follow instructions probabilistically; programs execute the same way every time. So the process lives in `scripts/policy.js` and its hooks, and this document describes the control system for the humans working with it. An AI tool doesn't need to memorise this document — it needs to run the commands and respond to what they report.
+**Every automatable step in this policy is either enforced by a machine or evidenced by an artifact a machine checks. Steps that require human judgment are explicitly named as judgment steps; prose is never the enforcement layer for a rule that can be mechanically checked.** LLMs follow instructions probabilistically; programs execute the same way every time. So the process lives in `scripts/policy.js` and its hooks, and this document describes the control system for the humans working with it. An AI tool doesn't need to memorise this document — it needs to run the commands and respond to what they report.
 
 ### Which layer a check belongs in
 
@@ -20,6 +20,8 @@ There are two enforcement layers and they are not interchangeable.
 Duplicate a rule across both layers only when the consequence is permanent. The gates marker is the model: the Stop hook blocks the AI from ending its turn without one, and `verify-marker` in pre-commit is the net if that was somehow bypassed.
 
 Agents other than Claude Code get no hooks of the first kind, so for them the git layer is the only automatic enforcement and it arrives late. That is a reason for those agents to run the commands `AGENTS.md` lists, not a reason to move checks into the git layer: doing so delays feedback for every tool, including the ones that were catching problems early.
+
+Claude Code is the fully hooked environment: session-start, stop, and pre-tool controls fire while the agent is working. Other agents use the same policy commands and are held by the same pre-commit and CI backstops, but their early-session behavior depends on `AGENTS.md` compliance unless that tool has equivalent hooks configured.
 
 The single entrypoint (run from any project root; `build-policy/` is a sibling directory):
 
@@ -85,6 +87,8 @@ Each step names its enforcement. **Human judgment** steps are deliberately human
 | Gates match the *current* diff (no edit-after-gates) | `verify-ready` compares marker hash to working tree |
 | Full gates passed on the *exact tree being committed* — "ready to commit" cannot silently skip them | Husky pre-commit runs `policy verify-marker` — **commit is impossible if source changed without a matching full-gates marker** |
 
+Root commit exception: CodeRabbit cannot review before HEAD exists, so the initial baseline commit may pass without a full-gates marker; immediately after it, full gates must run and every later source commit is gated normally.
+
 ### Phase 5 — Review
 
 | Step | Enforced by |
@@ -97,7 +101,7 @@ Each step names its enforcement. **Human judgment** steps are deliberately human
 
 | Step | Enforced by |
 |---|---|
-| CHANGELOG.md entry for every code change | Stop hook blocks the AI's turn-end if source changed without it; `verify-ready` fails without it |
+| CHANGELOG.md entry for every code change, written as public-safe project history | Stop hook blocks the AI's turn-end if source changed without it; `verify-ready` fails without it |
 | Gates run before the AI presents work as ready — never left for the developer to remember to ask | Stop hook blocks turn-end if source changed without a full-gates marker for the current tree (mid-iteration turns may state so and continue); `verify-marker` in pre-commit is the hard backstop |
 | A shipped version is frozen — new source work bumps the version and opens a new CHANGELOG section, never amends a shipped entry | A built DMG in `release/` marks its version shipped: Stop hook blocks turn-end, `check` fails, `verify-ready` fails while source changes sit on a shipped version |
 | README updated when setup/features/config change | Human judgment (delegate to `readme-updater` agent) |
@@ -161,7 +165,7 @@ Never modified by AI without explicit developer review and sign-off, regardless 
 
 Atomic writes; field whitelisting; read-all-then-write-all for multi-file ops; cascade deletes; **schema-version + migration-on-load + pre-migration backups + downgrade guard** for all user data; supply-chain protection (Socket wrapper, `min-release-age=1`, dependency allowlist with dual review).
 
-**Socket 429.** The wrapper's install path can rate-limit while Socket's read API remains available. A 429 indicates the package has not been scanned; it is not a pass. Do not disable the wrapper — that removes scanning for all subsequent installs without recording that it was skipped. Use `socket raw-npm <cmd>` after scoring the target version (`socket package score npm <pkg>@<ver> --markdown`), then re-scan the resulting tree. Preconditions: project-standards § Supply Chain Security.
+**Socket install fallback.** Socket is the default supply-chain control. Do not disable or bypass scanning. If the wrapper cannot complete a first install because the dependency tree is too large or quota/rate-limited, bypass only the wrapper's package-by-package install path: `socket raw-npm install --ignore-scripts`, then `socket scan create --report` over the resolved tree, then `npm rebuild` only after the scan is clean. For bounded upgrades during a 429, follow project-standards § Supply Chain Security: score the target version first, run the raw npm command, scan the resulting tree, and inspect the lockfile diff.
 
 ## Model strategy
 
@@ -169,7 +173,7 @@ Session model is the developer's launch-time choice, never determined mid-sessio
 
 ## Evidence trail
 
-**The authoritative evidence is machine-generated:** GitHub Actions CI logs (every push/PR — timestamped, third-party-hosted), git history (conventional commits, tags), CHANGELOG.md, PR review threads, `.policy/` markers, and the policy repo's own history (the control system's evolution). Specs and plans live in `.claude/specs/` — gitignored, carried by your private file sync. They never reach GitHub, but keep them: they are the decision record for *why* changes were made. Local terminal output is working state, not evidence.
+**The authoritative evidence is machine-generated:** GitHub Actions CI logs (every push/PR — timestamped, third-party-hosted), git history (conventional commits, tags), CHANGELOG.md, PR review threads, `.policy/` markers, and the policy repo's own history (the control system's evolution). Changelog entries are required, but they must be public-safe: concise, factual, and free of customer names, private paths, internal counts, secrets, trade-secret details, or security-incident phrasing. Specs and plans live in `.claude/specs/` — gitignored, carried by your private file sync. They never reach GitHub, but keep them: they are the decision record for *why* changes were made. Local terminal output is working state, not evidence.
 
 ## Known limitations (stated, not hidden)
 

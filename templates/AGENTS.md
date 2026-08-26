@@ -1,7 +1,8 @@
 # Agent Instructions (all AI coding agents)
 
-This project is governed by a shared build policy. The machinery is agent-agnostic —
-run it from this project's root. Claude Code gets this via hooks; **if you are any
+This project is governed by a shared build policy. The policy commands and
+commit/CI backstops are agent-agnostic — run them from this project's root.
+Claude Code gets this via hooks; **if you are any
 other agent (Codex, Gemini, etc.), follow this file.**
 
 ## The single entrypoint
@@ -22,11 +23,12 @@ node ../build-policy/scripts/policy.js <command>
 
 1. **The developer commits, never the agent.** Present work; do not run `git commit`/`git push`.
 2. **`gates` before saying "ready to commit".** `gates --fast` (pre-commit subset) does NOT count — it writes no marker.
-3. **CHANGELOG.md entry for every code change** before ending your turn.
+3. **CHANGELOG.md entry for every code change** before ending your turn. Write entries as public-safe project history: no customer names, private paths, secrets, internal counts, trade-secret details, or security-incident phrasing.
 4. **Fix shared problems in `../build-policy/`** (templates, standards), not per-project — every project self-reports drift from the shared templates.
 5. **Never suppress a failing security check to get green** (e.g. semgrep rule exclusions, `nosemgrep`). Triage findings with the developer; agreed exclusions belong in the shared template with written justification.
 6. **Security-sensitive code follows the written standards** — do not redesign crypto, key storage, auth, or signing config, even to something "better", without the developer agreeing to a standards change first. Source of truth: `../build-policy/project-standards.md`.
 7. Secrets live in `.env` (gitignored); user data in `local_data/` (gitignored); never commit either.
+8. When presenting work for commit, include a suggested conventional commit message. Use one line for ordinary work; for extended work, include a short body line. The developer commits, never the agent.
 
 ## Read before substantial work
 

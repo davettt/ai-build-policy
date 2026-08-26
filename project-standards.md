@@ -20,9 +20,14 @@ cd my-new-app
 # Create .claude folder for specs
 mkdir -p .claude/specs
 
-# Optional: init git
+# Initialize Git before building
 git init
 ```
+
+For software projects governed by this policy, initialize Git before building:
+`git init`, scaffold the policy files, create the initial project shell, and have the
+developer make an initial baseline commit. CodeRabbit needs an existing `HEAD` to
+review later work; without one, the first real build is harder to gate cleanly.
 
 ### Step 2: Start Claude Code
 ```bash
@@ -718,7 +723,7 @@ This is the only gate covering a compromised maintainer or a typosquat. `npm aud
 
 **Required API token scopes.** `socket ci` and `socket scan create --report` fetch the org security policy, so a token without `security-policy:read` produces a partial failure: the scan succeeds and the report request returns 403. Minimum set: `security-policy:read`, `alert-resolution list/create/read`, `alerts list`, `alerts trend`, `threat-campaigns list`.
 
-**Starting a new project: scan the tree, not each package.** The wrapper scans package by package as they install, so a first install of a normal stack costs several hundred scans against a 1,000/month allowance and fails partway when the allowance runs low. Scanning the finished tree instead costs one scan and covers the same packages. This is the sanctioned path for a first install, and it is an explicit exception to precondition 1 below, which would otherwise forbid the only remedy available:
+**Starting a new project: bypass the wrapper, not Socket scanning.** The wrapper scans package by package as they install, so a first install of a normal stack costs several hundred scans against a 1,000/month allowance and fails partway when the allowance runs low. Scanning the finished tree instead costs one scan and covers the same packages. This is the sanctioned path for a first install, and it is an explicit exception to precondition 1 below, which would otherwise forbid the only remedy available:
 
 ```bash
 socket raw-npm install --ignore-scripts   # tree lands; no package runs any code
@@ -815,17 +820,18 @@ Run it when `check` reports drift, and before starting feature work rather than 
 1. Review the Dependabot PR on GitHub — confirm it is a minor or patch bump
 2. `git fetch origin` to pull the branch locally
 3. `git checkout <dependabot-branch-name>`
-4. `socket scan create your-org .` to scan for supply chain risks
+4. `npm run socket:scan` to scan for supply-chain risks using the same org/policy/quota as `policy gates`
 5. `npm install && npm run quality` to verify build, lint, types, SAST, and security all pass
 6. If clean, merge on GitHub
 7. `git checkout main && git pull` to return to main
 
 **Commands:**
 ```bash
-socket scan create your-org .  # Scan current project dependencies (org + path)
-socket npm install <pkg>    # Install with Socket scanning (automatic if wrapper is on)
-socket fix                  # Fix CVEs in dependencies
-socket wrapper on/off       # Enable/disable automatic npm wrapping
+npm run socket:scan                         # Canonical project supply-chain scan
+socket scan create --report --org your-org  # Direct whole-tree scan under the org
+socket npm install <pkg>                    # Install with Socket scanning (automatic if wrapper is on)
+socket fix                                  # Fix CVEs in dependencies
+socket wrapper on/off                       # Enable/disable automatic npm wrapping
 ```
 
 **Minimum Release Age:**
@@ -893,7 +899,11 @@ All projects with a GitHub repo have `.github/workflows/ci.yml`. The canonical t
 | Secret scanning | Yes (betterleaks CLI) | Yes (gitleaks-action, full history) |
 | Dependency allowlist | Yes | No (`build-policy/scripts` isn't in the repo — local-only by design) |
 | CodeRabbit review | Yes | Via PR integration |
-| Smoke/integration tests | Yes (needs running server) | No (needs server lifecycle) |
+| Smoke/integration tests | Yes (self-contained server lifecycle) | Yes (`--if-present`, self-contained server lifecycle) |
+
+Smoke and integration tiers must be safe in both places: they start their own server,
+use a temporary data directory, and tear down after themselves. A test that depends on
+the PM2/dev instance is not a gate test; it is a manual probe.
 
 GitHub Actions versions are tracked in `registry.json` with verified dates — pin them to commit SHAs at the next scheduled review.
 

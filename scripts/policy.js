@@ -427,6 +427,67 @@ function auditPolicyDocVersions(root, label) {
   }
 }
 
+function auditPolicyRepo(root) {
+  auditPolicyDocVersions(root, 'policy docs');
+
+  for (const f of [
+    'scripts/policy.js',
+    'scripts/check-allowlist.js',
+    'scripts/bootstrap-allowlist.js',
+    'scripts/verify-package.js',
+    'machine/hooks.json',
+    'machine/session-start.sh',
+    'machine/mirror-pre-push.sh',
+    'templates/ci.yml',
+    'templates/pre-commit',
+    'templates/AGENTS.md',
+    'templates/CLAUDE.md',
+    'registry.json',
+    'mirror-blocklist.txt',
+  ]) {
+    if (exists(path.join(root, f))) ok(`Policy repo file present: ${f}`);
+    else fail(`Policy repo file missing: ${f}`);
+  }
+
+  for (const f of ['registry.json', 'machine/hooks.json', '.prettierrc']) {
+    if (readJSON(path.join(root, f))) ok(`Policy repo JSON parses: ${f}`);
+    else fail(`Policy repo JSON invalid: ${f}`);
+  }
+
+  for (const f of [
+    'scripts/policy.js',
+    'scripts/check-allowlist.js',
+    'scripts/bootstrap-allowlist.js',
+    'scripts/verify-package.js',
+  ]) {
+    const r = sh(`node --check ${safeToken(f, 'policy repo script')}`, root);
+    if (r.ok) ok(`Policy repo script parses: ${f}`);
+    else fail(`Policy repo script syntax error: ${f}\n${r.out}`);
+  }
+
+  const hooks = readJSON(path.join(root, 'machine/hooks.json'));
+  if (hooks && hooks.SessionStart && hooks.Stop && hooks.PreToolUse) {
+    ok('Claude hook events present: SessionStart, Stop, PreToolUse');
+  } else fail('machine/hooks.json missing one of SessionStart, Stop, PreToolUse');
+
+  const preCommit = readFile(path.join(root, 'templates/pre-commit'));
+  for (const needle of ['leak-scan', 'verify-marker', 'gates --fast']) {
+    if (preCommit.includes(needle)) ok(`pre-commit template includes ${needle}`);
+    else fail(`pre-commit template missing ${needle}`);
+  }
+
+  const ci = readFile(path.join(root, 'templates/ci.yml'));
+  for (const needle of [
+    'npm run build --if-present',
+    'npm run test:unit --if-present',
+    'npm run test:smoke --if-present',
+    'npm run test:integration --if-present',
+  ]) {
+    if (ci.includes(needle)) ok(`CI template includes ${needle}`);
+    else fail(`CI template missing ${needle}`);
+  }
+}
+
 function cmpSemver(a, b) {
   const key = (v) => {
     const p = v.split('.').map(Number);
@@ -660,8 +721,11 @@ function cmdCheck(dir) {
 
   section(`Compliance check: ${path.resolve(dir)}`);
 
-  // Running inside the policy repo itself: the docs are the deliverable.
-  if (path.resolve(dir) === POLICY_ROOT) auditPolicyDocVersions(POLICY_ROOT, 'policy docs');
+  if (path.resolve(dir) === POLICY_ROOT) {
+    auditPolicyRepo(POLICY_ROOT);
+    checkStaleness(dir, reg);
+    return finish();
+  }
 
   if (!proj.hasPkg) {
     // A project carrying scaffolding but no package.json is mid-setup, not

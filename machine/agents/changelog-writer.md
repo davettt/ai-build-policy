@@ -20,6 +20,12 @@ Rules:
   block mismatched versions.
 - One concise line per change, written for a developer reader. No marketing tone.
 - Every code change gets an entry — features, fixes, refactors, dependency updates.
+- Write entries as if the repository may be public.
+- Do not include customer names, private paths, secrets, internal project counts,
+  unreleased strategy, trade-secret implementation details, or security-incident
+  phrasing.
+- For security-sensitive fixes, use neutral hardening language and leave exploit
+  mechanics in private notes/specs.
 - Never remove or rewrite existing entries.
 - If the top version in CHANGELOG.md doesn't match what you're told about package.json,
   note the mismatch in your reply rather than guessing.

@@ -13,7 +13,8 @@ Given a project directory and branch name:
 1. `git fetch origin` and `git checkout <branch>` in the project directory.
 2. Confirm the bump is minor or patch only (inspect the package.json diff vs main).
    A major bump is an automatic FAIL — report it and stop.
-3. Run `socket scan create your-org .` and capture the result.
+3. Run `npm run socket:scan` and capture the result. This must use the
+   authenticated Socket org/policy/quota.
 4. Run `npm install` then `npm run quality` (or `npm run validate` if quality is
    very slow) and capture pass/fail per gate.
 5. `git checkout main` when done — always leave the repo on main.
