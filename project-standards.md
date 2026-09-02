@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.23
-**Last updated:** 2026-08-27
+**Version:** 2.29
+**Last updated:** 2026-09-03
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -203,6 +203,7 @@ Checklist of what "done" looks like.
 - **Data safety:** schema version + migration-on-load + pre-migration backups + downgrade guard are mandatory — see § Data Migration, Backups & Downgrade Guard.
 - **Diagnostics:** structured local logging + "Export diagnostics" — see § Diagnostics Logging.
 - **Privacy disclosure:** BYOK apps send user content to the configured AI provider — state this consistently in the app's settings UI, README/listing, and the site's terms page. No commercial release without the disclosure in place.
+- **Both providers, not one.** A BYOK app must wire up Anthropic *and* OpenAI. Supporting one makes an account with that vendor a condition of using the app, which is a purchase barrier rather than a preference: a buyer who already pays OpenAI should not need a second vendor relationship to open something they bought. `check` FAILs an Electron project that calls one provider and not the other, matching on the SDK import or API host rather than the vendor's name, since settings copy, type unions and stale-key migrations mention providers an app never calls. Apps with no AI at all are not flagged. The reference shape is a `MODELS` map keyed by provider with per-provider stored keys and a per-provider validation path.
 
 **DMG Build, Code Signing & Notarization:**
 
@@ -241,6 +242,7 @@ Legacy projects using `APPLE_ID`/`APPLE_TEAM_ID`/`APPLE_APP_SPECIFIC_PASSWORD` i
       "entitlementsInherit": "build/entitlements.mac.plist",
       "notarize": true
     },
+    "afterAllArtifactBuild": "build/notarize-dmg.js",
     "files": ["electron/**/*", "server/**/*", "dist/**/*", "!local_data/**", "!**/*.map"],
     "directories": { "output": "release" },
     "asar": true,
@@ -248,6 +250,14 @@ Legacy projects using `APPLE_ID`/`APPLE_TEAM_ID`/`APPLE_APP_SPECIFIC_PASSWORD` i
   }
 }
 ```
+
+**`mac.notarize` covers the app, not the DMG. Both are required.** electron-builder submits and staples the `.app`, then packages that stapled app into a disk image afterwards, and never submits the container itself. Every DMG built this way is unsigned: `codesign` reports "code object is not signed at all" and `spctl` "no usable signature" on the DMG, while the app inside verifies as "Notarized Developer ID". Checked across four shipping apps here and identical in all of them, so it is a builder default rather than a per-project mistake.
+
+It is easy to miss because a stapled app is approved however it arrives. Dragging the app to Applications works, and installs succeed. The gap is at *download* time: Gatekeeper evaluates the quarantined disk image when it is opened, before the app inside is reachable, and an unsigned container is the case that produces "Apple cannot check it for malicious software".
+
+`afterAllArtifactBuild` runs `build/notarize-dmg.js` (installed by `policy scaffold`), which signs, notarizes and staples the container in that order. Notarization needs a signed artifact, and a ticket only staples to the exact bytes submitted, so signing after stapling invalidates both. Failures throw, rather than emitting an artifact that looks finished.
+
+Enforced at two points, because config being right is not evidence the credentials resolved. `check` FAILs when `afterAllArtifactBuild` is absent or points at a missing file. `verify-ready --release` assesses the built DMG itself with `spctl -a -t open --context context:primary-signature` plus `stapler validate`. Verify by hand with the same command. The `--context` flag is what makes it the disk-image evaluation rather than a different policy that can report a pass Gatekeeper would not give the customer.
 
 `build/entitlements.mac.plist` (standard for all apps):
 ```xml
@@ -284,6 +294,7 @@ Icon: `build/icon.png` (512x512 PNG). electron-builder converts to `.icns` autom
 - Implement caching to reduce API costs
 - Rate limiting on expensive endpoints
 - **Model IDs — the source of truth is `build-policy/registry.json`.** Never invent IDs; copy from the registry (which mirrors the shipping apps). Each registry entry carries a `verified` date; `policy health`/`check` flag entries past their review window — when flagged, web-search the current models, update the registry and every shipping app consistently. Don't ship stale IDs.
+- **Model entries review every 60 days, not the registry default of 90.** Model families now turn over faster than a quarter, and a stale entry costs more than an out-of-date name: Sonnet 5 superseded Sonnet 4.6 at a *lower* price ($2/$10 per MTok against $3/$15), so sitting on the old ID meant paying more for less. Each model entry records its price at verification, so a review can answer "is the newer one cheaper" without researching the model it replaced. Compare price as well as capability, and in both directions — a newer model is not automatically dearer.
 
 ---
 
@@ -465,6 +476,7 @@ Before modifying or removing any code that enforces a constraint, cap, guard, or
 - Address all critical and high-severity findings
 - **The enforced path is the CLI, not the plugin:** `policy gates` runs `npm run review` (`coderabbit review --agent --include-untracked`) as a blocking gate, and the pre-commit verify-marker refuses commits without it. Do not substitute a plugin or skill invocation for that gate: a skill runs only when invoked, the gate blocks.
 - **`--include-untracked` is mandatory** (`check` FAILs without it). The CLI default reviews tracked changes only, and gates run before staging, so new files would pass the gate unreviewed.
+- **The gate is conditional on source, and unconditional at release.** The CLI allowance is a few reviews per rolling window, so `policy gates` skips the review when the diff contains only config, docs, or changelog files — there is nothing in it for a code reviewer to read, and spending the review there leaves nothing for the next real change. Any source file in the diff brings it back, `gates --with-review` forces it, and `verify-ready --release` FAILs unless the marker records a CodeRabbit pass, so nothing ships unreviewed. A clean tree is not treated as source-free: the gate still runs, which is what keeps the review_skipped FAIL below catching already-committed work.
 - **A skipped review is a failed gate.** On a clean tree with the branch equal to its base, CodeRabbit reports `"status":"review_skipped"` and exits 0. `policy gates` reads the `--agent` output rather than the exit code and FAILs, since no code was examined. To review committed work, diff against the preceding commit (`--base-commit <sha>`). For a root commit, review it as a PR on the remote, or in a scratch repo: copy the files out, `git init`, empty root commit, leave the files untracked, `--include-untracked`.
 - **New repos need two one-time steps before the review gate can run**, both surfaced by `policy gates` with the exact command:
   1. **A commit must exist.** CodeRabbit resolves the current branch (`git rev-parse --abbrev-ref HEAD`), so it cannot run in a repo with no commits. `verify-marker` waives itself when there is no HEAD, allowing the root commit; every commit after it is gated normally. Do not use `--no-verify`.
@@ -474,6 +486,8 @@ Before modifying or removing any code that enforces a constraint, cap, guard, or
 - Plugin skills are for the two things the CLI cannot do (it reviews the local working diff only):
   - `coderabbit:autofix` — apply CodeRabbit feedback from **GitHub PR review threads**, per-change approval (use for Dependabot/PR follow-ups)
   - `coderabbit:code-review` — ad-hoc mid-development review between gate runs
+- **`verify-ready` gates the build, and an unfinished release blocks the next one.** A clean `verify-ready` run records a pass bound to the gates marker's content hash, and the DMG build guard denies the build without a matching record, so the artifact cannot come from a tree those checks never saw. The sign-off cannot be enforced at the moment it is skipped, because uploading and updating the site happen in a browser; instead `check` FAILs when a DMG exists for the current version with no matching git tag, so an unfinished release surfaces at the next session start. Tag the release commit and push the tag (`git tag v<version> && git push origin v<version>`) as part of finishing a release, not as an afterthought.
+- **Security review is enforced, not remembered.** `/security-review` in Claude Code covers auth, data, payment, CORS and secret changes and spends no CodeRabbit allowance, so it is the right second layer now that the review gate is conditional. `verify-ready` FAILs when a security-sensitive file changed without a recorded review. A file counts as sensitive by path name (`auth`, `session`, `login`, `token`, `password`, `credential`, `secret`, `crypto`, `encrypt`, `payment`, `billing`, `stripe`, `cors`, `permission`, `middleware`) or by what it calls (`createCipheriv`/`createDecipheriv`, `safeStorage`, JWT, bcrypt/argon2/scrypt, `cors(` or `Access-Control-Allow`, `fs.rm`/`unlink`/`rimraf`, SQL `DELETE FROM`/`DROP TABLE`). Record the review with `policy security-ack`, which hashes exactly those files: change one afterwards and the record stops applying, because a review of the previous version says nothing about the new one. The Stop hook checks the same condition at turn end, so the requirement does not depend on `verify-ready` being run. The review is still judgment — the machinery only checks that it happened, on this content.
 - **Socket** scans dependencies for supply chain risks (separate from code review — see Security section)
 
 ---
@@ -905,7 +919,9 @@ Smoke and integration tiers must be safe in both places: they start their own se
 use a temporary data directory, and tear down after themselves. A test that depends on
 the PM2/dev instance is not a gate test; it is a manual probe.
 
-GitHub Actions versions are tracked in `registry.json` with verified dates — pin them to commit SHAs at the next scheduled review.
+GitHub Actions versions are tracked in `registry.json` with verified dates, and pinned by commit SHA in `templates/ci.yml`. The two notations state the same fact, so `check` FAILs when a `gh-action-*` entry names a version the template does not pin, matched on the `# vX.Y.Z` comment beside each SHA. Bumping the registry without the template is the direction that matters: it reads as done while CI still runs the old action.
+
+**Action runtimes carry hard external deadlines, unlike a version bump.** GitHub removes Node 20 from hosted runners on 2026-09-23, and any action still declaring `node20` stops working that day — the `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION` opt-out, which has kept them running since the 2026-06-16 default flip, is removed with it. That is why these three entries review every 90 days rather than 180: a review window is a way of noticing drift, and it is the wrong instrument for a published cutoff, since the old 180-day window would have expired more than two months after the date. When a bump is forced by a runtime deprecation, read the intervening majors rather than jumping to latest blind — the ones here included a credential-handling change, a fork-PR checkout restriction, and a narrowing of automatic caching, none of which are runtime work.
 
 ### File Uploads (when applicable)
 - Per-file size limit (e.g. 5MB)
@@ -958,6 +974,14 @@ npm run restart:pm2
 pm2 logs {app-name}
 pm2 status
 ```
+
+**Register apps by script path, never `pm2 start npm`.** PM2 resolves `npm` to an absolute path when the app is registered, and pins the interpreter alongside it, so an app started that way is bound to whichever Node was active that day. It keeps working until that version is removed, and it does not follow the daemon onto a new runtime — after an `nvm install` + `pm2 update`, every other app moves and that one does not. Start the entry file the `start` script would run:
+
+```bash
+pm2 start server/index.js --name {app-name}   # not: pm2 start npm -- start
+```
+
+Found 2026-09-01: after a Node version bump, one app was left behind on the previous runtime while every other app moved. Check with `pm2 jlist` and look for a version path in `pm_exec_path` or `exec_interpreter`; re-register with `pm2 delete` then `pm2 start <entry> --name <app>`, and `pm2 save`.
 
 ### Stale Build Detection
 

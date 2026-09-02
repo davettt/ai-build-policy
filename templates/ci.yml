@@ -14,18 +14,33 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # full history for secret scanning
 
-      # Must match the local development version. A skew means CI resolves and
-      # installs with a different npm major than the one that wrote the
-      # lockfile, which is a difference that only shows up as a CI-only failure.
-      # Node 24 is LTS (Krypton) and ships npm 11, as local does.
-      # When bumping local, bump this and re-sync every project's ci.yml.
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      # Read from .nvmrc, so nvm locally and setup-node here resolve the same
+      # file and cannot disagree. This previously read `node-version: 24`, on
+      # the reasoning that matching the major was enough to get the same npm
+      # major. It is not: a floating major resolves to whatever the newest
+      # Node 24 is, so CI's npm kept drifting ahead of local. npm 11.14.1 omits
+      # optional peer dependencies from the lockfile and 11.19.0 records them,
+      # so `npm ci` failed on packages the lockfile never listed — a break
+      # caused by a Node release nobody here made.
+      #
+      # An exact version in this file would have fixed that, but the value
+      # would live somewhere no local tool reads, leaving drift possible and
+      # merely detected. One file both sides read makes it structural.
+      # Floating both sides does NOT work: they resolve at different moments
+      # and drift independently, which is exactly the failure above.
+      #
+      # .nvmrc is written by `policy scaffold` from `node-lts` in
+      # build-policy/registry.json, which is the version of record; `check`
+      # fails on a mismatch and `doctor` fails when local Node differs. Track
+      # the newest LTS patch, not the newest release: Node 25 ships an older
+      # npm than Node 24, so "newest" can reintroduce the same skew.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version-file: .nvmrc
           cache: npm
 
       - run: npm ci
@@ -95,6 +110,6 @@ jobs:
         run: npm run test:integration --if-present
 
       - name: Secret scanning
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -13,9 +13,14 @@
  *   doctor              Machine-level setup checks (tools, npmrc, hooks, agents)
  *   check [dir]         Project compliance check (structure, scripts, drift, staleness)
  *   gates [dir]         Run quality gates in order; writes .policy/gates.json marker
- *                         --fast   pre-commit subset (validate + secrets)
+ *                         --fast          pre-commit subset (validate + secrets)
+ *                         --with-review   force the CodeRabbit gate on a source-free diff
+ *                                         (it is skipped there to protect the CLI allowance)
  *   verify-marker [dir] Pre-commit: block commit if source changed without a full-gates
  *                         pass on this exact tree (called from .husky/pre-commit)
+ *   security-ack [dir]  Record that /security-review was run over the security-sensitive
+ *                         files in the current diff (auth, secrets, crypto, CORS, payment,
+ *                         data deletion). verify-ready FAILs without it when they change.
  *   verify-ready [dir]  Confirm gates marker matches current diff + changelog updated
  *                         --release      add release checks (version, attribution, checklist)
  *                         --ack-manual   record that manual release checks were performed
@@ -275,6 +280,40 @@ function isSourceFile(f) {
 }
 
 /**
+ * Security-sensitive change detection.
+ *
+ * BUILD-POLICY Phase 5 has always required a security review for auth, data,
+ * payment, CORS and secret changes, and named it a judgment step — which meant
+ * nothing checked whether it happened. The CodeRabbit gate is now conditional
+ * on source, so leaving this to memory would thin the review layer twice over.
+ * `/security-review` (Claude Code, no CodeRabbit allowance) is the review;
+ * `security-ack` records that it ran, bound to the content it examined.
+ *
+ * Deliberately two-signal — a path name OR a call that carries the risk —
+ * because neither alone is enough: `server/auth.js` is obvious from its name,
+ * while a CORS header or a recursive delete can land in a file called
+ * anything. Patterns are narrow on purpose: a check that fires on every diff
+ * gets acked reflexively and stops meaning anything.
+ */
+const SECURITY_PATH_PATTERNS =
+  /(^|\/)(auth|session|login|logout|signup|token|password|credential|secret|crypto|encrypt|payment|billing|stripe|cors|permission|middleware)/i;
+const SECURITY_CONTENT_PATTERNS = [
+  /createCipheriv|createDecipheriv|safeStorage/,
+  /jsonwebtoken|jwt\.(sign|verify)|bcrypt|argon2|scrypt/,
+  /\bcors\s*\(|Access-Control-Allow/,
+  /fs\.(rm|rmSync|unlink|unlinkSync|rmdir)\b|rimraf/,
+  /DELETE\s+FROM|DROP\s+TABLE/i,
+];
+function securitySensitiveFiles(dir, files) {
+  return files.filter((f) => {
+    if (!isSourceFile(f)) return false;
+    if (SECURITY_PATH_PATTERNS.test(f)) return true;
+    const body = readFile(path.join(dir, f));
+    return body ? SECURITY_CONTENT_PATTERNS.some((re) => re.test(body)) : false;
+  });
+}
+
+/**
  * Versions that already have a built DMG in the release output — treated as
  * shipped and frozen: new source work requires a version bump and a NEW
  * CHANGELOG section, never amendments to a built version's entry.
@@ -298,6 +337,20 @@ function builtDmgVersions(dir) {
     if (m) versions.add(m[1]);
   }
   return versions;
+}
+
+/** The DMG built for a given version, or null. Only `release/` itself is
+ *  searched: `release/archive/` holds superseded builds, and assessing one of
+ *  those would report on an artifact that is not being shipped. */
+function releaseDmgPath(dir, version) {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(path.join(dir, 'release'));
+  } catch {
+    return null;
+  }
+  const match = entries.find((f) => f.endsWith('.dmg') && f.includes(version));
+  return match ? path.join(dir, 'release', match) : null;
 }
 
 function diffHash(dir) {
@@ -505,6 +558,34 @@ function auditPolicyRepo(root) {
     if (ci.includes(needle)) ok(`CI template includes ${needle}`);
     else fail(`CI template missing ${needle}`);
   }
+
+  // The registry records which action version is current, but the template pins
+  // by SHA for supply-chain reasons, so the two state the same fact in different
+  // notations and nothing forced them to agree. A registry bumped without the
+  // template is the worse direction: it reads as done while CI still runs the old
+  // action. Matched on the `# vX.Y.Z` comment beside each pin, which is the only
+  // place the human-readable version survives the SHA.
+  const actionEntries = Object.entries(loadRegistry().entries || {}).filter(([k]) =>
+    k.startsWith('gh-action-'),
+  );
+  for (const [key, entry] of actionEntries) {
+    const m = String(entry.value).match(/^(.+?)@(v[\d.]+)$/);
+    if (!m) {
+      warn(`${key} value "${entry.value}" is not <action>@<version> — cannot check the CI pin`);
+      continue;
+    }
+    const [, action, version] = m;
+    // The pin line is `uses: <action>@<sha> # <version>`.
+    const pinned = new RegExp(
+      `${action.replace(/[/.]/g, '\\$&')}@[0-9a-f]{40}\\s*#\\s*${version.replace(/\./g, '\\.')}\\b`,
+    ).test(ci);
+    if (pinned) ok(`CI template pins ${action} ${version} (matches registry)`);
+    else
+      fail(
+        `registry says ${key} is ${entry.value}, but templates/ci.yml does not pin that version — ` +
+          `bump the SHA and its # ${version} comment, or the registry is claiming a version CI never runs`,
+      );
+  }
 }
 
 function cmpSemver(a, b) {
@@ -587,6 +668,13 @@ function auditElectronStandards(dir, proj) {
   let licence = null;
   let safeStorage = null;
   let hasFindFreePort = false;
+  // BYOK provider coverage. Matched on the call surface (SDK import or API
+  // host) rather than the word "openai"/"anthropic", which appears in settings
+  // copy, type unions and stale-key migrations in apps that only ever call one
+  // of them — counting those would report an app as dual-provider on the
+  // strength of a dropdown it never wired up.
+  let callsAnthropic = null;
+  let callsOpenAI = null;
   const walk = (d) => {
     let entries;
     try {
@@ -612,6 +700,10 @@ function auditElectronStandards(dir, proj) {
         if (!licence && /api\.gumroad\.com\/v2\/licenses/.test(t)) licence = rel;
         if (!safeStorage && /safeStorage\s*\.\s*\w+|[{,]\s*safeStorage\s*[},]/.test(t))
           safeStorage = rel;
+        if (!callsAnthropic && /api\.anthropic\.com|['"]@anthropic-ai\/sdk['"]/.test(t))
+          callsAnthropic = rel;
+        if (!callsOpenAI && /api\.openai\.com|from\s+['"]openai['"]|require\(['"]openai['"]\)/.test(t))
+          callsOpenAI = rel;
       }
     }
   };
@@ -630,6 +722,19 @@ function auditElectronStandards(dir, proj) {
   if (!hasFindFreePort) {
     findings.push(
       `no findFreePort() found — a hardcoded port collides with the PM2 dev instance and can connect the app to the wrong process (project-standards § Electron)`,
+    );
+  }
+  // A BYOK app that calls exactly one provider forces the customer to hold an
+  // account with that vendor to use the app at all, which is a purchase
+  // condition rather than a preference. Only flagged when the app already calls
+  // one: apps with no AI at all are not missing a provider.
+  if (callsAnthropic && !callsOpenAI) {
+    findings.push(
+      `only Anthropic is wired up (${callsAnthropic}) — BYOK apps must offer OpenAI as well, so a customer is not required to hold an account with one specific vendor (project-standards § AI Models)`,
+    );
+  } else if (callsOpenAI && !callsAnthropic) {
+    findings.push(
+      `only OpenAI is wired up (${callsOpenAI}) — BYOK apps must offer Anthropic as well (project-standards § AI Models)`,
     );
   }
 
@@ -955,6 +1060,22 @@ function cmdCheck(dir) {
     if (mac && mac.notarize && mac.hardenedRuntime)
       ok('Signing config: notarize + hardenedRuntime set');
     else warn('electron-builder mac config missing notarize/hardenedRuntime');
+    // `mac.notarize` covers the .app only; the DMG wrapping it is a separate
+    // artifact that Apple never sees. Both halves are required for a
+    // distributable build, and the config check is what makes the gap visible
+    // before a release rather than at the release check on a finished DMG.
+    const afterAll = proj.pkg.build && proj.pkg.build.afterAllArtifactBuild;
+    if (afterAll && exists(path.join(dir, afterAll))) {
+      ok('DMG container signing wired (afterAllArtifactBuild)');
+    } else {
+      fail(
+        afterAll
+          ? `build.afterAllArtifactBuild points at ${afterAll}, which does not exist — the DMG would ship unsigned`
+          : `No build.afterAllArtifactBuild — mac.notarize signs the .app but leaves the DMG container unsigned, ` +
+              `which Gatekeeper rejects on download. Run 'policy scaffold', then set ` +
+              `"afterAllArtifactBuild": "build/notarize-dmg.js" in package.json build config`,
+      );
+    }
     auditElectronStandards(dir, proj);
   } else if (proj.hasServer) {
     if (exists(path.join(dir, 'public/manifest.json'))) ok('PWA manifest present');
@@ -1000,6 +1121,30 @@ function cmdCheck(dir) {
     } else {
       ok(`Version ${proj.pkg.version} shipped (DMG built), no new source changes`);
     }
+
+    // An unfinished release blocks the next one. The steps that actually ship —
+    // uploading to Gumroad, updating the site — happen in a browser, where no
+    // hook can see them, so the sign-off cannot be enforced at the moment it is
+    // skipped. It can be noticed afterwards: a DMG exists for this version and
+    // nothing marks the commit it was cut from. Surfaced at session start,
+    // which is the next time the project is opened.
+    //
+    // Keyed on the git tag rather than the recorded ack because `.policy/` is
+    // gitignored, so the ack is per-machine and a fresh clone would report a
+    // finished release as unfinished. A tag is pushed and shared. Scoped to the
+    // current version so older DMGs left in release/ are not re-litigated.
+    if (proj.isGit) {
+      const relTag = `v${proj.pkg.version}`;
+      const tagged =
+        sh(`git tag --list ${safeToken(relTag, 'git tag')}`, dir).out.trim() === relTag;
+      if (tagged) ok(`Release ${relTag} tagged`);
+      else
+        fail(
+          `A DMG exists for ${proj.pkg.version} but ${relTag} is not tagged — the release was started and never signed off. ` +
+            `Finish it (dogfood, upload, site update), then: git tag ${relTag} && git push origin ${relTag}, ` +
+            `and the developer runs verify-ready --release --ack-manual`,
+        );
+    }
   }
 
   // CHANGELOG freshness vs package version
@@ -1012,6 +1157,53 @@ function cmdCheck(dir) {
   }
 
   // CI template drift
+  // Every third-party package in the lockfile must carry an integrity hash.
+  // Without one npm cannot checksum what it downloaded, so the lockfile pins a
+  // version but not its contents — the supply-chain guarantee the lockfile
+  // exists to provide. Observed 2026-09-01: a regenerated lockfile kept
+  // `integrity` on only the 50 packages it newly added and dropped it from the
+  // other 674, which no test catches because `npm ci` installs happily without
+  // it. The loss is invisible in a diff that also moves thousands of lines.
+  //
+  // Two exclusions, both structural rather than thresholds: bundled
+  // dependencies (`inBundle`) ship inside their parent's tarball and have none
+  // of their own, and workspace packages (paths outside node_modules/) are
+  // local source with nothing to verify against.
+  const lock = readJSON(path.join(dir, 'package-lock.json'));
+  if (lock && lock.packages) {
+    const unverified = Object.entries(lock.packages).filter(
+      ([name, meta]) =>
+        name.startsWith('node_modules/') && !meta.link && !meta.inBundle && !meta.integrity,
+    );
+    if (unverified.length === 0) ok('Lockfile: every third-party package carries an integrity hash');
+    else
+      fail(
+        `${unverified.length} package(s) in package-lock.json have no integrity hash, so npm cannot verify what it downloads ` +
+          `(e.g. ${unverified
+            .slice(0, 3)
+            .map(([n]) => n.replace('node_modules/', ''))
+            .join(', ')}). ` +
+          `Regenerate the lockfile from a clean tree: rm -rf node_modules package-lock.json && npm install`,
+      );
+  }
+
+  // .nvmrc is what CI resolves its Node from (node-version-file), so a project
+  // whose file disagrees with the registry builds on a different Node than the
+  // one the policy pins — and the lockfile it writes is the one CI must read.
+  const nvmrcPin = (loadRegistry().entries || {})['node-lts'];
+  if (nvmrcPin && nvmrcPin.value && exists(path.join(dir, '.github/workflows/ci.yml'))) {
+    const have = readFile(path.join(dir, '.nvmrc')).trim();
+    if (!have)
+      fail(
+        `Missing .nvmrc — CI resolves its Node from it, and without it local and CI drift apart (run: policy scaffold)`,
+      );
+    else if (have !== nvmrcPin.value)
+      fail(
+        `.nvmrc says Node ${have} but the policy pins ${nvmrcPin.value} — CI and this project would build on different Node versions, and npm ci needs the npm that wrote the lockfile`,
+      );
+    else ok(`.nvmrc matches the pinned Node (${have})`);
+  }
+
   const ciPath = path.join(dir, '.github/workflows/ci.yml');
   if (exists(ciPath)) {
     const norm = (s) => s.replace(/\s+/g, ' ').trim();
@@ -1165,7 +1357,16 @@ const GATE_ORDER = [
   // committed, not to re-scan an unchanged tree several times a day.
   { name: 'Socket supply-chain scan', script: 'socket:scan', whenDepsChange: true },
   { name: 'License compliance', script: 'licenses' },
-  { name: 'CodeRabbit review', script: 'review' },
+  // Quota-bounded, same argument as the Socket scan above: the CLI allowance is
+  // a few reviews per rolling window, and a diff with no source in it gives a
+  // code reviewer nothing to read. Spending a review on a packaging-config or
+  // docs-only change buys nothing and leaves the allowance empty for the next
+  // real change — which is how a two-line config edit ends up blocking for half
+  // an hour. Skipped only when there ARE changes and none of them are source: a
+  // clean tree still runs the gate, so the review_skipped FAIL below keeps
+  // catching already-committed work that was never reviewed. Force it back on
+  // with `gates --with-review`.
+  { name: 'CodeRabbit review', script: 'review', whenSourceChanges: true },
   { name: 'Build', script: 'build' },
   { name: 'Smoke tests', script: 'test:smoke' },
   { name: 'Integration tests', script: 'test:integration' },
@@ -1182,8 +1383,17 @@ function cmdGates(dir, flags) {
     return;
   }
   const fast = flags.includes('--fast');
+  const withReview = flags.includes('--with-review');
   const scripts = proj.pkg.scripts || {};
   const gates = GATE_ORDER.filter((g) => (fast ? g.fast : true)).filter((g) => scripts[g.script]);
+
+  // A diff that touches no source has nothing for a code reviewer to read. An
+  // empty diff is NOT that case — it means the work is already committed, and
+  // the review gate must still run so a never-reviewed tree cannot slip past.
+  const changedNow = changedFiles(dir);
+  const skipReview =
+    !withReview && changedNow.length > 0 && changedNow.filter(isSourceFile).length === 0;
+  const willRunReview = !fast && !skipReview && gates.some((g) => g.script === 'review');
 
   section(`Quality gates (${fast ? 'fast/pre-commit' : 'full'}): ${path.resolve(dir)}`);
 
@@ -1208,7 +1418,7 @@ function cmdGates(dir, flags) {
   // CodeRabbit preflight — both failures below surface as raw JSON from the CLI
   // mid-run, which reads as "the tool is broken" rather than "your repo is not
   // ready yet". Check them before burning the earlier gates.
-  if (!fast && gates.some((g) => g.script === 'review') && proj.isGit) {
+  if (willRunReview && proj.isGit) {
     if (!sh('git rev-parse --verify HEAD', dir).ok) {
       fail(
         'CodeRabbit needs a branch to exist (it resolves HEAD), and this repo has no commits. ' +
@@ -1238,6 +1448,12 @@ function cmdGates(dir, flags) {
     if (g.whenDepsChange && !depsChanged) {
       console.log(
         `  ${DIM}skipped${RESET} ${g.name} ${DIM}(no dependency change — CI scans every push)${RESET}`,
+      );
+      continue;
+    }
+    if (g.whenSourceChanges && skipReview) {
+      console.log(
+        `  ${DIM}skipped${RESET} ${g.name} ${DIM}(no source in this diff — review allowance saved for code changes; force: gates --with-review)${RESET}`,
       );
       continue;
     }
@@ -1304,6 +1520,39 @@ function cmdGates(dir, flags) {
   }
   console.log(
     `\n${GREEN}${BOLD}All ${report.length} gates passed.${RESET}${fast ? '' : ' Marker written (.policy/gates.json).'}\n`,
+  );
+}
+
+// ---------------------------------------------------------- security-ack
+
+/**
+ * Record that `/security-review` was run over the security-sensitive files in
+ * the current tree. Bound to a content hash of exactly those files, so the ack
+ * cannot carry forward: edit one of them and it stops matching, which is the
+ * whole point — a review of last week's auth code says nothing about today's.
+ */
+function cmdSecurityAck(dir) {
+  guardLocalPath(dir);
+  section(`Security review ack: ${path.resolve(dir)}`);
+  const sensitive = securitySensitiveFiles(dir, changedFiles(dir)).sort();
+  if (sensitive.length === 0) {
+    console.log(
+      `No security-sensitive files in the current diff — nothing to acknowledge.\n` +
+        `${DIM}The ack is only required when auth, secrets, crypto, CORS, payment or data-deletion code changes.${RESET}\n`,
+    );
+    return;
+  }
+  const state = loadState(dir);
+  state.securityReview = {
+    hash: contentHash(dir, sensitive),
+    files: sensitive,
+    time: new Date().toISOString(),
+  };
+  saveState(dir, state);
+  console.log(
+    `${GREEN}✓${RESET} Security review recorded for ${sensitive.length} file(s):\n` +
+      sensitive.map((f) => `    ${DIM}${f}${RESET}`).join('\n') +
+      `\n\n${DIM}Re-run /security-review and this command if any of them change again.${RESET}\n`,
   );
 }
 
@@ -1420,6 +1669,22 @@ function cmdVerifyReady(dir, flags) {
       `Version ${proj.pkg.version} already shipped as a DMG — bump the version and start a new CHANGELOG section before declaring ready`,
     );
   }
+  // 2b. Security review for auth/data/payment/CORS/secret changes. Phase 5 has
+  // always required this; until now nothing checked that it happened.
+  const sensitive = securitySensitiveFiles(dir, changed).sort();
+  if (sensitive.length > 0) {
+    const rec = loadState(dir).securityReview;
+    if (rec && rec.hash === contentHash(dir, sensitive))
+      ok(`Security review recorded for the ${sensitive.length} sensitive file(s) (${rec.time})`);
+    else
+      fail(
+        `${sensitive.length} security-sensitive file(s) changed without a recorded review: ${sensitive.join(', ')}.\n` +
+          `      Run /security-review over these changes, address what it finds, then record it:\n` +
+          `      node ../build-policy/scripts/policy.js security-ack` +
+          (rec ? `\n      ${DIM}(a review is recorded, but for different content — it no longer applies)${RESET}` : ''),
+      );
+  }
+
   if (sourceChanged.length > 0 && !changed.includes('CHANGELOG.md')) {
     fail(`${sourceChanged.length} source file(s) changed but CHANGELOG.md not updated`);
   } else if (sourceChanged.length > 0) {
@@ -1471,6 +1736,22 @@ function cmdVerifyReady(dir, flags) {
   auditMajorUpgrades(dir, proj);
 
   if (release) verifyRelease(dir, proj, flags);
+
+  // Record a clean pass so later steps can require it. Until now verify-ready
+  // reported and forgot, which is why nothing downstream could depend on it:
+  // the DMG build guard had to re-derive a couple of its checks ad hoc, and the
+  // rest went unenforced. Bound to the gates marker's content hash, so the
+  // record describes an exact tree and cannot survive an edit.
+  const vrMarker = readJSON(path.join(dir, '.policy', 'gates.json'));
+  if (results.fail === 0 && vrMarker && markerMatches(dir, vrMarker)) {
+    const state = loadState(dir);
+    state.verifyReady = {
+      contentHash: vrMarker.contentHash,
+      release,
+      time: new Date().toISOString(),
+    };
+    saveState(dir, state);
+  }
   return finish();
 }
 
@@ -1517,6 +1798,22 @@ function releaseProfile(proj) {
 function verifyRelease(dir, proj, flags) {
   section('Release checks');
 
+  // `gates` skips the review on a source-free diff to protect a small CLI
+  // allowance. That trade is only safe if the review is unconditional at the
+  // one point where unreviewed code would actually ship, so a release is
+  // refused unless the marker records a CodeRabbit pass. The recovery is the
+  // force flag, not a re-run — a plain re-run would skip it again.
+  const relMarker = readJSON(path.join(dir, '.policy', 'gates.json'));
+  if (relMarker && Array.isArray(relMarker.gates)) {
+    if (relMarker.gates.includes('CodeRabbit review'))
+      ok('CodeRabbit review passed on the tree being released');
+    else
+      fail(
+        `The gates marker records no CodeRabbit review — a release must not ship code the reviewer never opened. ` +
+          `Re-run with the review forced on: policy gates --with-review`,
+      );
+  }
+
   // Version bumped vs last tag. Tag-at-release flow: pkg == tag is CORRECT
   // when the tag sits at HEAD (this release, already tagged); it is a missed
   // bump only when commits landed after the tag.
@@ -1562,6 +1859,38 @@ function verifyRelease(dir, proj, flags) {
       fail(
         `Missing THIRD-PARTY-LICENSES.txt — run 'npm run licenses:file' and include it in the build`,
       );
+    }
+  }
+
+  // Gatekeeper acceptance of the DMG container. `mac.notarize: true` staples
+  // the .app and then wraps it, leaving the container unsigned — every DMG
+  // shipped before 2026-09-02 was rejected by this exact check while the app
+  // inside passed, so nothing in the old flow could have caught it. Verified on
+  // the artifact rather than trusted from config, because the config being
+  // right is not evidence the credentials resolved or that notarization
+  // actually succeeded: a signed-but-unstapled DMG is the failure that only
+  // shows up on a machine other than the one that built it.
+  if (proj.isElectron && proj.pkg) {
+    const dmgPath = releaseDmgPath(dir, proj.pkg.version);
+    if (!dmgPath) {
+      // No artifact yet: the pre-build stage below reports this correctly, and
+      // a FAIL here would demand a check on a file the build order says should
+      // not exist yet.
+    } else {
+      const assessed = sh(
+        `spctl -a -t open --context context:primary-signature -vv ${JSON.stringify(dmgPath)}`,
+        dir,
+      );
+      const stapled = sh(`xcrun stapler validate ${JSON.stringify(dmgPath)}`, dir);
+      if (/accepted/.test(assessed.out) && stapled.ok) {
+        ok(`DMG container signed, notarized and stapled (${path.basename(dmgPath)})`);
+      } else {
+        fail(
+          `DMG container is not distributable: ${/accepted/.test(assessed.out) ? 'stapled ticket missing' : 'Gatekeeper rejects it (' + (assessed.out.split('\n')[1] || 'no usable signature').trim() + ')'}. ` +
+            `The app inside may still be notarized — the container is a separate artifact and needs its own signature. ` +
+            `Wire build/notarize-dmg.js in as afterAllArtifactBuild (policy scaffold installs it) and rebuild.`,
+        );
+      }
     }
   }
 
@@ -1872,6 +2201,15 @@ function cmdScaffold(dir) {
     created.push(dest);
   };
 
+  // .nvmrc is generated from the registry rather than copied from a template,
+  // so the file and the version of record cannot disagree: there is one place
+  // to bump, and every project's file is derived from it.
+  const nodePin = (loadRegistry().entries || {})['node-lts'];
+  if (nodePin && nodePin.value && !exists(path.join(dir, '.nvmrc'))) {
+    fs.writeFileSync(path.join(dir, '.nvmrc'), `${nodePin.value}\n`);
+    created.push('.nvmrc');
+  } else if (nodePin && nodePin.value) skipped.push('.nvmrc');
+
   copy('gitignore', '.gitignore');
   copy('AGENTS.md', 'AGENTS.md');
   copy('dependabot.yml', '.github/dependabot.yml');
@@ -1891,6 +2229,11 @@ function cmdScaffold(dir) {
     // port) spreads as though it were house style.
     copy('electron-main.js', 'electron/main.js');
     copy('secret-storage.js', 'server/secret-storage.js');
+    // Copied into build/ rather than generated, because it is real signing code
+    // that must stay identical across apps: a per-project copy that drifts is
+    // how one app quietly stops stapling. build/ is committed (it holds source
+    // assets, not output), so the hook ships with the repo.
+    copy('notarize-dmg.js', 'build/notarize-dmg.js');
   }
 
   if (!exists(path.join(dir, 'CHANGELOG.md'))) {
@@ -2118,6 +2461,36 @@ function cmdDoctor() {
     else fail(`${bin} not found — ${hint}`);
   }
 
+  // Local Node must equal the version CI pins. `npm ci` demands byte-level
+  // agreement with the lockfile, so a local npm older than CI's writes a
+  // lockfile CI then rejects — and the developer sees it as a CI-only failure
+  // in a project they may not have touched. Checked here rather than in
+  // `check`, since it is a property of the machine, not of any one project.
+  const wantNode = (loadRegistry().entries || {})['node-lts'];
+  if (wantNode && wantNode.value) {
+    const haveNode = sh('node -v').out.trim().replace(/^v/, '');
+    // A mismatch has two very different causes and one wrong remedy. If nvm's
+    // default already IS the pinned version, the machine is correct and this
+    // shell simply predates the switch: nvm activates the default only for
+    // shells started after it, and a process launched earlier passes its old
+    // PATH to every child. Reporting that as "upgrade Node" sends people to
+    // re-run an install that changes nothing, and leaves them believing the
+    // machine is wrong. Observed 2026-09-01, twice, in two sessions.
+    const nvmDefault = readFile(path.join(os.homedir(), '.nvm/alias/default')).trim();
+    if (haveNode === wantNode.value) ok(`Node ${haveNode} matches the version CI pins`);
+    else if (nvmDefault === wantNode.value)
+      fail(
+        `This shell is on Node ${haveNode}, but the machine default is already ${nvmDefault} — nothing to install. ` +
+          `The session was started before the switch and inherited the old PATH; nvm applies the default only to shells started after it. ` +
+          `Open a NEW terminal (a new session in the same terminal inherits the same PATH), or run: nvm use default`,
+      );
+    else
+      fail(
+        `Node ${haveNode} locally but CI pins ${wantNode.value} — the npm that writes the lockfile ` +
+          `must be the one that reads it, or 'npm ci' fails in CI only. Upgrade: nvm install ${wantNode.value} --reinstall-packages-from=${haveNode} && nvm alias default ${wantNode.value}`,
+      );
+  }
+
   const npmrc = readFile(path.join(os.homedir(), '.npmrc'));
   if (/^min-release-age\s*=\s*1/m.test(npmrc))
     ok('~/.npmrc min-release-age=1 (24h package quarantine)');
@@ -2294,6 +2667,26 @@ function cmdHookStop() {
         `A new CHANGELOG section means bumping package.json to match, in the same turn.`,
     );
   }
+  // Duplicated from verify-ready on purpose, the same way the gates marker is
+  // checked in both the Stop hook and pre-commit: verify-ready is the one
+  // policy command no hook or CI workflow invokes, so on its own the security
+  // requirement rests on an agent choosing to run it — which is the enforcement
+  // gap this policy exists to close. Turn end is the moment unreviewed auth
+  // code would otherwise reach the developer, so it is checked here too.
+  const sensitive = securitySensitiveFiles(dir, changed).sort();
+  if (sensitive.length > 0) {
+    const rec = loadState(dir).securityReview;
+    if (!rec || rec.hash !== contentHash(dir, sensitive)) {
+      reasons.push(
+        `Security-sensitive files changed without a recorded review: ${sensitive.join(', ')}. ` +
+          `These touch auth, secrets, crypto, CORS, payment or data deletion, where a missed bug is not a bug report — it is an incident. ` +
+          `Run /security-review over these changes, fix what it finds, then record it: ` +
+          `node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} security-ack` +
+          (rec ? ` (a review is recorded, but for different content — it no longer applies).` : '.') +
+          ` If a review genuinely does not apply here, say so explicitly rather than skipping it silently.`,
+      );
+    }
+  }
   const marker = readJSON(path.join(dir, '.policy', 'gates.json'));
   if (!markerMatches(dir, marker)) {
     reasons.push(
@@ -2366,7 +2759,17 @@ function cmdHookPretool() {
     );
     process.exit(0);
   }
-  if (input.tool_name === 'Bash' && /electron:build|electron-builder/.test(cmd)) {
+  // Matched as a command word, not anywhere in the string. The bare-substring
+  // form denied `grep electron-builder package.json` and any heredoc mentioning
+  // the DMG flow, which is a different trade from the --ack-manual guard above:
+  // there, the false positives cost a doc edit and the pattern protects a
+  // signature that must never be forged. Here the guard protects an ordering
+  // (gates -> commit -> build), a real invocation always appears as a command
+  // word, and blocking inspection of a build config makes diagnosing a broken
+  // build harder than the guard is worth.
+  const BUILD_INVOCATION =
+    /(?:^|[;&|(]|&&|\|\||\bnpm\s+run\s+|\bnpx\s+|\byarn\s+|\bpnpm\s+(?:run\s+)?)\s*(?:electron:build\b|electron-builder\b)/;
+  if (input.tool_name === 'Bash' && BUILD_INVOCATION.test(cmd)) {
     const dir = process.cwd();
     const deny = (reason) => {
       console.log(
@@ -2397,6 +2800,29 @@ function cmdHookPretool() {
         `BUILD-POLICY: CHANGELOG top entry is ${topVer} but package.json is ${pkg.version} — ` +
           `this build would produce a ${pkg.version} DMG for ${topVer}'s changes. ` +
           `Bump package.json to ${topVer} (developer commits the bump), then build.`,
+      );
+    }
+    // verify-ready is a prerequisite for the artifact, not a report filed
+    // afterwards. Its checks (gates marker, CHANGELOG, smoke coverage, security
+    // review, major-upgrade records) all describe things that must hold before
+    // a DMG exists, and nothing forced it to run — so a build could skip every
+    // one. The tree is clean at this point, so the marker's content hash is the
+    // tree's identity and a stale record cannot pass for the current one.
+    const buildMarker = readJSON(path.join(dir, '.policy', 'gates.json'));
+    const vr = loadState(dir).verifyReady;
+    if (!buildMarker || !markerMatches(dir, buildMarker)) {
+      deny(
+        'BUILD-POLICY: no gates marker for this tree — a DMG must not be built from code the gates never passed. ' +
+          `Run: node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} gates`,
+      );
+    }
+    if (!vr || vr.contentHash !== buildMarker.contentHash) {
+      deny(
+        'BUILD-POLICY: verify-ready has not passed on this tree, and it is a prerequisite for the build, not a report filed afterwards. ' +
+          (vr
+            ? 'A pass is recorded, but for different content — it no longer applies. '
+            : 'No pass is recorded. ') +
+          `Run: node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} verify-ready --release`,
       );
     }
   }
@@ -2584,6 +3010,8 @@ function main() {
       return cmdVerifyMarker(dir);
     case 'verify-ready':
       return cmdVerifyReady(dir, flags);
+    case 'security-ack':
+      return cmdSecurityAck(dir);
     case 'health':
       return cmdHealth(dir, flags);
     case 'deps-update':

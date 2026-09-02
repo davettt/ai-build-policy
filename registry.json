@@ -10,28 +10,28 @@
   },
   "entries": {
     "anthropic-model-fast": {
-      "value": "claude-haiku-4-5-20251001",
-      "verified": "2026-06-28",
-      "reviewEveryDays": 90,
-      "notes": "BYOK fast tier in shipping apps. Copy exact ID from a-reference-app/server/ai.js."
+      "value": "claude-haiku-4-5",
+      "verified": "2026-09-03",
+      "reviewEveryDays": 60,
+      "notes": "BYOK fast tier in shipping apps. Haiku 4.5 is still the current and only Haiku. ID is complete as written: Anthropic model IDs take no date suffix, and the previous value carried one. Reviewed every 60 days rather than 90: model families here now turn over faster than that window, and a superseded ID is not the only cost \u2014 Sonnet 5 replaced Sonnet 4.6 at a LOWER price ($2/$10 per MTok against $3/$15), so a stale entry can mean paying more for less. On review, compare price as well as capability, in both directions. Price at verification: $1.00/$5.00 per MTok input/output."
     },
     "anthropic-model-smart": {
-      "value": "claude-sonnet-4-6",
-      "verified": "2026-06-28",
-      "reviewEveryDays": 90,
-      "notes": "BYOK smart tier in shipping apps."
+      "value": "claude-sonnet-5",
+      "verified": "2026-09-03",
+      "reviewEveryDays": 60,
+      "notes": "BYOK smart tier in shipping apps. Replaced claude-sonnet-4-6, which Sonnet 5 supersedes at a lower price ($2/$10 per MTok against $3/$15). Reviewed every 60 days rather than 90: model families here now turn over faster than that window, and a superseded ID is not the only cost \u2014 Sonnet 5 replaced Sonnet 4.6 at a LOWER price ($2/$10 per MTok against $3/$15), so a stale entry can mean paying more for less. On review, compare price as well as capability, in both directions. Price at verification: $2.00/$10.00 per MTok input/output."
     },
     "openai-model-fast": {
-      "value": "gpt-5.4-nano-2026-03-17",
-      "verified": "2026-06-28",
-      "reviewEveryDays": 90,
-      "notes": "BYOK fast tier in shipping apps."
+      "value": "gpt-5.6-luna",
+      "verified": "2026-09-03",
+      "reviewEveryDays": 60,
+      "notes": "BYOK fast tier in shipping apps. GPT-5.6 names durable capability tiers (Sol, Terra, Luna) rather than sizes; Luna is the high-volume efficiency tier. Replaced gpt-5.4-nano-2026-03-17. Reviewed every 60 days rather than 90: model families here now turn over faster than that window, and a superseded ID is not the only cost \u2014 Sonnet 5 replaced Sonnet 4.6 at a LOWER price ($2/$10 per MTok against $3/$15), so a stale entry can mean paying more for less. On review, compare price as well as capability, in both directions. Price at verification: $0.20/$1.20 per MTok input/output (after OpenAI's 2026-07-30 cut of 80% on Luna)."
     },
     "openai-model-smart": {
-      "value": "gpt-5.4-mini-2026-03-17",
-      "verified": "2026-06-28",
-      "reviewEveryDays": 90,
-      "notes": "BYOK smart tier in shipping apps. AEO also uses gpt-5.5-2026-04-23 top tier."
+      "value": "gpt-5.6-terra",
+      "verified": "2026-09-03",
+      "reviewEveryDays": 60,
+      "notes": "BYOK smart tier in shipping apps. Terra is the balanced everyday tier. Replaced gpt-5.4-mini-2026-03-17. The bare gpt-5.6 alias routes to Sol, so it is not used here. Reviewed every 60 days rather than 90: model families here now turn over faster than that window, and a superseded ID is not the only cost \u2014 Sonnet 5 replaced Sonnet 4.6 at a LOWER price ($2/$10 per MTok against $3/$15), so a stale entry can mean paying more for less. On review, compare price as well as capability, in both directions. Price at verification: $2.00/$12.00 per MTok input/output (after OpenAI's 2026-07-30 cut of 20% on Terra)."
     },
     "node-lts": {
       "value": "24",
@@ -40,22 +40,22 @@
       "notes": "CI node-version in templates/ci.yml. Must match the local development major so CI resolves with the same npm. Node 24 is LTS (Krypton), ships npm 11. Verified against nodejs.org/dist/index.json."
     },
     "gh-action-checkout": {
-      "value": "actions/checkout@v4",
-      "verified": "2026-07-13",
-      "reviewEveryDays": 180,
-      "notes": "On review: pin to commit SHA for supply-chain hardening."
+      "value": "actions/checkout@v7.0.1",
+      "verified": "2026-09-03",
+      "reviewEveryDays": 90,
+      "notes": "Pinned by SHA in templates/ci.yml (3d3c42e5aac5ba805825da76410c181273ba90b1). Bumped v4.3.1 -> v7.0.1 for the Node 20 runner removal on 2026-09-23: v4 runs on node20, which stops existing on GitHub-hosted runners that day. v5 was the Node 24 move (needs runner >= v2.327.1, which GitHub-hosted already exceed); v6 persists credentials to a separate file; v7 blocks checking out fork PRs for pull_request_target and workflow_run. The template triggers only on push and pull_request, so the v7 restriction does not apply here. Review every 90 days rather than 180 \u2014 a runtime deprecation has a hard external date, and the old window would have expired after it."
     },
     "gh-action-setup-node": {
-      "value": "actions/setup-node@v4",
-      "verified": "2026-07-13",
-      "reviewEveryDays": 180,
-      "notes": "On review: pin to commit SHA for supply-chain hardening."
+      "value": "actions/setup-node@v7.0.0",
+      "verified": "2026-09-03",
+      "reviewEveryDays": 90,
+      "notes": "Pinned by SHA in templates/ci.yml (820762786026740c76f36085b0efc47a31fe5020). Bumped v4.4.0 -> v7.0.0 for the Node 20 runner removal on 2026-09-23. v5 was the Node 24 move; v6 limits automatic caching to npm, which is exactly what the template uses (`cache: npm`), so that break does not reach us; v7 migrates to ESM and adds cache-key outputs. Reads the Node version from .nvmrc via node-version-file \u2014 see the node-lts entry. Review every 90 days rather than 180."
     },
     "gh-action-gitleaks": {
-      "value": "gitleaks/gitleaks-action@v2",
-      "verified": "2026-07-13",
+      "value": "gitleaks/gitleaks-action@v3.0.0",
+      "verified": "2026-09-03",
       "reviewEveryDays": 90,
-      "notes": "Replace with a Betterleaks action when one is published. Pin to SHA on review."
+      "notes": "Pinned by SHA in templates/ci.yml (e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e). Bumped v2.3.9 -> v3.0.0, which is a runtime-only change: node20 -> node24, no changes to inputs, outputs or behaviour. Required before 2026-09-23, when Node 20 leaves the runners and v2 stops working regardless of ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION. Still the gitleaks action rather than a Betterleaks one; replace when Betterleaks publishes an action."
     },
     "secret-scanner": {
       "value": "betterleaks",
@@ -73,7 +73,7 @@
       "value": "1.1.102",
       "verified": "2026-08-07",
       "reviewEveryDays": 90,
-      "notes": "Socket CLI version in use locally (wrapper + socket:scan). Not pinned in CI — the template carries no Socket step by design; see project-standards § Supply Chain Security."
+      "notes": "Socket CLI version in use locally (wrapper + socket:scan). Not pinned in CI \u2014 the template carries no Socket step by design; see project-standards \u00a7 Supply Chain Security."
     }
   }
 }
