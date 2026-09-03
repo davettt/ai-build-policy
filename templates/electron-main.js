@@ -7,7 +7,7 @@
 // Adapted from the reference implementation named in
 // project-standards § Stack Preferences → Electron Desktop Apps.
 
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, shell } from 'electron';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -67,6 +67,30 @@ async function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
     },
     // Native macOS title bar: do NOT set titleBarStyle.
+  });
+
+  // External links go to the user's real browser, never to an Electron window.
+  // MANDATORY. Without these two handlers Electron's default takes over and a
+  // target="_blank" link opens a new BrowserWindow: a Chromium window with no
+  // address bar, no back button, no bookmarks and no session shared with the
+  // browser the user actually uses. They cannot see where they are, and a
+  // shipped app has no business rendering the open web inside itself.
+  //
+  // Two handlers because they cover different events. setWindowOpenHandler
+  // catches target="_blank" and window.open; will-navigate catches a plain
+  // in-page link that would otherwise replace the app's own UI with a web page
+  // and strand the user with no way back.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    shell.openExternal(url);
+    return { action: 'deny' };
+  });
+
+  win.webContents.on('will-navigate', (event, url) => {
+    const serverOrigin = `http://127.0.0.1:${port}`;
+    if (!url.startsWith(serverOrigin)) {
+      event.preventDefault();
+      shell.openExternal(url);
+    }
   });
 
   win.loadURL(`http://127.0.0.1:${port}`);

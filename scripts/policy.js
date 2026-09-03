@@ -480,6 +480,78 @@ function auditPolicyDocVersions(root, label) {
   }
 }
 
+/**
+ * Marketing-site checks: the update path's far end.
+ *
+ * A shipped DMG carries its update URL baked in, so anything it points at must
+ * keep working for copies already installed. That makes two things site-side
+ * obligations rather than tidiness: every app that publishes a `version.json`
+ * needs the changelog page that `version.json` sends people to, and every
+ * changelog page needs a download link, because a customer arriving there was
+ * told an update exists and must be able to get it.
+ *
+ * Checked here rather than in the app repos because that is where the files
+ * are, and an app cannot verify a page in a different repository.
+ */
+function auditSite(dir) {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const appDirs = entries
+    .filter((e) => e.isDirectory() && !e.name.startsWith('.') && e.name !== 'dist')
+    .map((e) => e.name)
+    .filter((name) => exists(path.join(dir, name, 'version.json')));
+
+  if (appDirs.length === 0) {
+    ok('Site: no app version.json files found (nothing to check)');
+    return;
+  }
+
+  for (const app of appDirs) {
+    const changelogIndex = path.join(dir, app, 'changelog', 'index.html');
+    if (!exists(changelogIndex)) {
+      fail(
+        `Site: ${app}/version.json is published but ${app}/changelog/ does not exist — ` +
+          `installed copies of the app link here for release notes and would hit a 404`,
+      );
+      continue;
+    }
+    // The changelog page is where an update banner lands, so it has to carry
+    // the route to the actual download. Without it the page explains what
+    // changed and offers no way to get it.
+    const html = readFile(changelogIndex);
+    if (/gumroad\.com/.test(html)) {
+      ok(`Site: ${app}/changelog/ exists and links to the download`);
+    } else {
+      fail(
+        `Site: ${app}/changelog/ has no Gumroad link — a customer sent here by the update ` +
+          `banner can read what changed but cannot download it`,
+      );
+    }
+  }
+
+  // The URL each app is told to visit must be the changelog page. This is the
+  // one end of the link that stays editable after a DMG ships, so pointing it
+  // at a store means losing the update route if distribution ever moves.
+  for (const app of appDirs) {
+    const meta = readJSON(path.join(dir, app, 'version.json'));
+    if (!meta) {
+      fail(`Site: ${app}/version.json does not parse`);
+      continue;
+    }
+    const want = `/${app}/changelog/`;
+    if (meta.url && meta.url.includes(want)) ok(`Site: ${app}/version.json points at its changelog`);
+    else
+      fail(
+        `Site: ${app}/version.json url is ${JSON.stringify(meta.url || null)}, not the changelog page ` +
+          `(…${want}) — a store URL baked into shipped copies becomes a dead end if distribution moves`,
+      );
+  }
+}
+
 function auditPolicyRepo(root) {
   auditPolicyDocVersions(root, 'policy docs');
 
@@ -675,6 +747,13 @@ function auditElectronStandards(dir, proj) {
   // strength of a dropdown it never wired up.
   let callsAnthropic = null;
   let callsOpenAI = null;
+  // External-link routing and where the update banner points. Both are about
+  // the same moment: a shipped app sending the user somewhere. Tracked here
+  // rather than in their own walk because this traversal already reads every
+  // source file.
+  let opensExternal = false;
+  let versionCheck = null;
+  let changelogLink = false;
   const walk = (d) => {
     let entries;
     try {
@@ -704,6 +783,9 @@ function auditElectronStandards(dir, proj) {
           callsAnthropic = rel;
         if (!callsOpenAI && /api\.openai\.com|from\s+['"]openai['"]|require\(['"]openai['"]\)/.test(t))
           callsOpenAI = rel;
+        if (!opensExternal && /shell\s*\.\s*openExternal/.test(t)) opensExternal = true;
+        if (!versionCheck && /version\.json/.test(t)) versionCheck = rel;
+        if (!changelogLink && /\/changelog\/?['"`]|\/changelog\/?\$/.test(t)) changelogLink = true;
       }
     }
   };
@@ -728,6 +810,25 @@ function auditElectronStandards(dir, proj) {
   // account with that vendor to use the app at all, which is a purchase
   // condition rather than a preference. Only flagged when the app already calls
   // one: apps with no AI at all are not missing a provider.
+  // A shipped app must hand external links to the user's browser. Without
+  // setWindowOpenHandler, Electron's default opens target="_blank" in a new
+  // BrowserWindow: Chromium with no address bar, no back button and no session
+  // shared with the browser the user actually uses.
+  if (!opensExternal) {
+    findings.push(
+      `no shell.openExternal() found — without setWindowOpenHandler, links open inside the app in a chromeless Electron window instead of the user's browser (project-standards § Electron)`,
+    );
+  }
+  // Where the update banner points. A URL baked into a shipped DMG cannot be
+  // changed for anyone who already installed it, so it must point at a page we
+  // control and can re-target — the app's changelog page, which in turn carries
+  // the download link. Pointing straight at a store means that if distribution
+  // ever moves, every installed copy has a dead link and no route to the update.
+  if (versionCheck && !changelogLink) {
+    findings.push(
+      `${versionCheck} checks for updates but no /changelog/ URL appears in the source — the update link must point at the app's changelog page, the one URL that can be re-targeted after the DMG ships (project-standards § Electron)`,
+    );
+  }
   if (callsAnthropic && !callsOpenAI) {
     findings.push(
       `only Anthropic is wired up (${callsAnthropic}) — BYOK apps must offer OpenAI as well, so a customer is not required to hold an account with one specific vendor (project-standards § AI Models)`,
@@ -850,6 +951,11 @@ function cmdCheck(dir) {
     checkStaleness(dir, reg);
     return finish();
   }
+
+  // The marketing site is the other half of the update path: shipped apps point
+  // their update banner at a changelog page here, so a missing page is a dead
+  // link in software already on customers' machines and unfixable there.
+  if (path.basename(path.resolve(dir)) === 'tiongcreative-site') auditSite(dir);
 
   if (!proj.hasPkg) {
     // A project carrying scaffolding but no package.json is mid-setup, not
