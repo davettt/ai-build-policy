@@ -1073,7 +1073,7 @@ function cmdCheck(dir) {
           ? `build.afterAllArtifactBuild points at ${afterAll}, which does not exist — the DMG would ship unsigned`
           : `No build.afterAllArtifactBuild — mac.notarize signs the .app but leaves the DMG container unsigned, ` +
               `which Gatekeeper rejects on download. Run 'policy scaffold', then set ` +
-              `"afterAllArtifactBuild": "build/notarize-dmg.js" in package.json build config`,
+              `"afterAllArtifactBuild": "build/notarize-dmg.cjs" in package.json build config`,
       );
     }
     auditElectronStandards(dir, proj);
@@ -1870,6 +1870,10 @@ function verifyRelease(dir, proj, flags) {
   // right is not evidence the credentials resolved or that notarization
   // actually succeeded: a signed-but-unstapled DMG is the failure that only
   // shows up on a machine other than the one that built it.
+  // Gates the sign-off below: a release whose container Gatekeeper rejects must
+  // not be recordable as acknowledged. The check already ran, it simply did not
+  // bind, so the FAIL was advisory and depended on someone reading it.
+  let dmgRejected = false;
   if (proj.isElectron && proj.pkg) {
     const dmgPath = releaseDmgPath(dir, proj.pkg.version);
     if (!dmgPath) {
@@ -1878,17 +1882,25 @@ function verifyRelease(dir, proj, flags) {
       // not exist yet.
     } else {
       const assessed = sh(
-        `spctl -a -t open --context context:primary-signature -vv ${JSON.stringify(dmgPath)}`,
+        // 2>&1 is required, not defensive. spctl writes its verdict to stderr
+        // and exits 0 on success, and sh() returns stdout only on success (it
+        // merges both streams only on failure). Without the redirect this reads
+        // an empty string, /accepted/ never matches, and a correctly signed DMG
+        // is reported as having no usable signature — refusing to ship the one
+        // artifact that is actually fine. The bug hid because the obvious test
+        // is an unsigned DMG, which exits non-zero and takes the merged path.
+        `spctl -a -t open --context context:primary-signature -vv ${JSON.stringify(dmgPath)} 2>&1`,
         dir,
       );
       const stapled = sh(`xcrun stapler validate ${JSON.stringify(dmgPath)}`, dir);
       if (/accepted/.test(assessed.out) && stapled.ok) {
         ok(`DMG container signed, notarized and stapled (${path.basename(dmgPath)})`);
       } else {
+        dmgRejected = true;
         fail(
           `DMG container is not distributable: ${/accepted/.test(assessed.out) ? 'stapled ticket missing' : 'Gatekeeper rejects it (' + (assessed.out.split('\n')[1] || 'no usable signature').trim() + ')'}. ` +
             `The app inside may still be notarized — the container is a separate artifact and needs its own signature. ` +
-            `Wire build/notarize-dmg.js in as afterAllArtifactBuild (policy scaffold installs it) and rebuild.`,
+            `Wire build/notarize-dmg.cjs in as afterAllArtifactBuild (policy scaffold installs it) and rebuild.`,
         );
       }
     }
@@ -1917,7 +1929,17 @@ function verifyRelease(dir, proj, flags) {
   // Manual checklist acknowledgment (recorded per version)
   const state = loadState(dir);
   const ackVersion = state.releaseAck && state.releaseAck.version;
-  if (flags.includes('--ack-manual') && !tagExists) {
+  if (flags.includes('--ack-manual') && dmgRejected) {
+    // Same refusal as the untagged case, for the same reason: the ack is a
+    // durable record, and one saying "signed off" over an artifact Gatekeeper
+    // rejects is worse than none. The container check above already reported
+    // this, but reporting is not enforcing — every later run would otherwise
+    // read "previously acknowledged" with no memory of the failure.
+    fail(
+      `Gatekeeper rejects the ${proj.pkg.version} DMG (see above) — the ack was not recorded. ` +
+        `Fix the container signing and rebuild, then re-run the sign-off.`,
+    );
+  } else if (flags.includes('--ack-manual') && !tagExists) {
     // Refuse the signature rather than record a release with no durable marker.
     fail(
       `Release ${proj.pkg.version} is not tagged — the ack was not recorded. Tag the release commit, then re-run:\n` +
@@ -2233,7 +2255,7 @@ function cmdScaffold(dir) {
     // that must stay identical across apps: a per-project copy that drifts is
     // how one app quietly stops stapling. build/ is committed (it holds source
     // assets, not output), so the hook ships with the repo.
-    copy('notarize-dmg.js', 'build/notarize-dmg.js');
+    copy('notarize-dmg.cjs', 'build/notarize-dmg.cjs');
   }
 
   if (!exists(path.join(dir, 'CHANGELOG.md'))) {

@@ -1,6 +1,6 @@
 # Project Standards
 
-**Version:** 2.29
+**Version:** 2.30
 **Last updated:** 2026-09-03
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
@@ -242,7 +242,7 @@ Legacy projects using `APPLE_ID`/`APPLE_TEAM_ID`/`APPLE_APP_SPECIFIC_PASSWORD` i
       "entitlementsInherit": "build/entitlements.mac.plist",
       "notarize": true
     },
-    "afterAllArtifactBuild": "build/notarize-dmg.js",
+    "afterAllArtifactBuild": "build/notarize-dmg.cjs",
     "files": ["electron/**/*", "server/**/*", "dist/**/*", "!local_data/**", "!**/*.map"],
     "directories": { "output": "release" },
     "asar": true,
@@ -255,7 +255,7 @@ Legacy projects using `APPLE_ID`/`APPLE_TEAM_ID`/`APPLE_APP_SPECIFIC_PASSWORD` i
 
 It is easy to miss because a stapled app is approved however it arrives. Dragging the app to Applications works, and installs succeed. The gap is at *download* time: Gatekeeper evaluates the quarantined disk image when it is opened, before the app inside is reachable, and an unsigned container is the case that produces "Apple cannot check it for malicious software".
 
-`afterAllArtifactBuild` runs `build/notarize-dmg.js` (installed by `policy scaffold`), which signs, notarizes and staples the container in that order. Notarization needs a signed artifact, and a ticket only staples to the exact bytes submitted, so signing after stapling invalidates both. Failures throw, rather than emitting an artifact that looks finished.
+`afterAllArtifactBuild` runs `build/notarize-dmg.cjs` (installed by `policy scaffold`), which signs, notarizes and staples the container in that order. Notarization needs a signed artifact, and a ticket only staples to the exact bytes submitted, so signing after stapling invalidates both. Failures throw, rather than emitting an artifact that looks finished.
 
 Enforced at two points, because config being right is not evidence the credentials resolved. `check` FAILs when `afterAllArtifactBuild` is absent or points at a missing file. `verify-ready --release` assesses the built DMG itself with `spctl -a -t open --context context:primary-signature` plus `stapler validate`. Verify by hand with the same command. The `--context` flag is what makes it the disk-image evaluation rather than a different policy that can report a pass Gatekeeper would not give the customer.
 

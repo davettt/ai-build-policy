@@ -21,9 +21,46 @@
  * requires a signed artifact, and a ticket can only be stapled to the exact
  * bytes that were submitted — signing after stapling invalidates both.
  *
- * Failures throw. A build that cannot notarize must not produce an artifact
- * that looks finished: silently emitting an unsigned DMG is precisely the
- * failure mode this file exists to end.
+ * This hook does those three things and nothing else. It deliberately does NOT
+ * verify its own work, and does not delete artifacts.
+ *
+ * It used to do both, and that combination was the only thing here that ever
+ * failed. The check read spctl's stdout, but spctl writes its verdict to
+ * stderr, so it compared against an empty string and reported "rejected" for
+ * every DMG however well signed — an assertion that could not pass on any
+ * artifact. The cleanup then deleted the correctly signed, notarized and
+ * stapled DMG it had just condemned. Signing itself never failed once.
+ *
+ * The check is not merely fixed but removed, because it was redundant: `policy
+ * verify-ready --release` assesses the finished DMG before anything ships, so
+ * an unsigned container still cannot reach a customer. Verifying in two places
+ * bought nothing and added a step that could invent failures and destroy good
+ * output. Keep verification at the release gate, where a false alarm costs a
+ * message rather than a notarization round-trip.
+ *
+ * If a signing step genuinely fails, this throws and the build stops with a
+ * non-zero exit. The unsigned DMG is left on disk on purpose: the release gate
+ * will refuse it, and a file you can inspect beats a file that vanished.
+ *
+ * The extension is .cjs, not .js, and that is load-bearing. This file is
+ * CommonJS and most projects here set `"type": "module"`. The intuition is that
+ * a .js file would then be ESM and die at load with "require is not defined in
+ * ES module scope" — but that is not what Node 24 does, and the truth is worse.
+ * Its CommonJS syntax detection runs the body happily, so nothing throws by
+ * either load path; what it produces is a namespace with no `default`. Measured
+ * on Node 24.20.0, `"type": "module"`:
+ *
+ *   require('./hook.js')   -> loads, default: undefined
+ *   import('./hook.js')    -> loads, default: undefined
+ *   require('./hook.cjs')  -> loads, default: function
+ *
+ * So a .js copy leaves electron-builder with no hook function to call: the
+ * build finishes, reports success, and ships an unsigned DMG, while `check`
+ * confirms `afterAllArtifactBuild` points at a file that exists. That is the
+ * exact failure this file was written to prevent, reproduced inside the fix and
+ * hidden from the check meant to catch it. A crash would be the good outcome.
+ * .cjs is CommonJS whatever the host package declares, so one template works in
+ * both kinds of project — do not "tidy" it back to .js.
  */
 
 const { execFileSync } = require('node:child_process');
@@ -121,23 +158,7 @@ exports.default = async function afterAllArtifactBuild(buildResult) {
     console.log(`  • stapling DMG       ${name}`);
     run('xcrun', ['stapler', 'staple', dmg]);
 
-    // Assert the outcome rather than trust the steps. `--context
-    // context:primary-signature` is the disk-image evaluation specifically:
-    // without it spctl assesses the DMG under the wrong policy and can report a
-    // pass that Gatekeeper would not give the customer.
-    const assessed = run('spctl', [
-      '-a',
-      '-t',
-      'open',
-      '--context',
-      'context:primary-signature',
-      '-vv',
-      dmg,
-    ]);
-    if (!/accepted/.test(assessed)) {
-      throw new Error(`DMG signed and stapled but Gatekeeper still rejects it:\n${assessed}`);
-    }
-    console.log(`  • verified           ${name} — Gatekeeper accepts the container`);
+    console.log(`  • done               ${name} — signed, notarized, stapled`);
   }
 
   // No new artifacts: the DMGs were modified in place, and electron-builder
