@@ -353,6 +353,33 @@ function releaseDmgPath(dir, version) {
   return match ? path.join(dir, 'release', match) : null;
 }
 
+/** Project-relative source files whose contents match `pattern`. Used to ask
+ *  "does this project already do X", where X may live in any file. */
+function sourceFilesMatching(dir, pattern) {
+  const hits = [];
+  const walk = (d) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (['node_modules', 'dist', 'release', 'build', 'coverage'].includes(e.name)) continue;
+      if (e.name.startsWith('.')) continue;
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!/\.(ts|tsx|js|jsx|mjs|cjs)$/.test(e.name)) continue;
+      if (pattern.test(readFile(full))) hits.push(path.relative(dir, full));
+    }
+  };
+  walk(dir);
+  return hits.sort();
+}
+
 function diffHash(dir) {
   // Hash the changed-file list + their current contents. Deliberately
   // staging-invariant: `git add` must not invalidate a gates marker, so we
@@ -818,6 +845,88 @@ function auditElectronStandards(dir, proj) {
     findings.push(
       `no shell.openExternal() found — without setWindowOpenHandler, links open inside the app in a chromeless Electron window instead of the user's browser (project-standards § Electron)`,
     );
+  }
+  // The will-navigate origin must name the same host the window is loaded from.
+  // 127.0.0.1 and localhost are the same machine but not the same string, and
+  // this comparison is a string prefix test: load from one and guard with the
+  // other and every in-app navigation looks external, so the app throws its own
+  // pages to the browser and the window is left stranded. Both hosts are
+  // correct choices; only the mismatch is a bug, so this checks agreement
+  // rather than mandating either.
+  // The running version must be visible without an update being available.
+  //
+  // Every app already holds APP_VERSION, but most only ever render it inside
+  // the update banner, which appears solely on a version mismatch. In the
+  // normal state the user has no way to answer "what version are you running?"
+  // — the first question any bug report needs. macOS does expose it through
+  // About and Finder's Get Info, but that is a per-app menu the project can
+  // replace, and "click the app name in the menu bar" is a poor answer for a
+  // support workflow that should be the same in every app.
+  //
+  // Matched on an interpolation of the version identifier, so passing it to a
+  // server (`process.env.APP_VERSION = app.getVersion()`) does not count as
+  // showing it. Renders near `updateAvailable` are excluded as banner text.
+  const VERSION_RENDER = /\{\s*_*APP_VERSION_*\s*\}|\$\{\s*_*APP_VERSION_*\s*\}/;
+  let versionShown = null;
+  for (const f of sourceFilesMatching(dir, VERSION_RENDER)) {
+    // A dedicated banner component is banner text wherever it sits in the file.
+    // Matching only on a variable name missed Music_Discovery, which calls its
+    // state `update` rather than `updateAvailable`.
+    if (/update[-_]?banner/i.test(path.basename(f))) continue;
+    const lines = readFile(path.join(dir, f)).split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (!VERSION_RENDER.test(lines[i])) continue;
+      const nearby = lines.slice(Math.max(0, i - 8), i + 8).join('\n');
+      if (/updateAvailable|update-banner|is available|update\.version/i.test(nearby)) continue;
+      versionShown = `${f}:${i + 1}`;
+      break;
+    }
+    if (versionShown) break;
+  }
+  if (!versionShown) {
+    findings.push(
+      `the running version is never shown outside the update banner — a user cannot answer "which version are you on?" unless a mismatch happens to be showing. Render it in the settings/about surface, e.g. \`{APP_NAME} v{__APP_VERSION__}\` (project-standards § Electron)`,
+    );
+  }
+
+  // The rest of the settings footer. One surface, the same in every app, so a
+  // support instruction ("open Settings, scroll to the bottom") is portable.
+  // Each is matched on what it actually is rather than on the word, to avoid
+  // passing on an unrelated mention.
+  if (sourceFilesMatching(dir, /©|&copy;|\\u00a9/).length === 0) {
+    findings.push(
+      `no copyright notice in the UI — the settings footer should name who made the app and when, e.g. \`© {year} David Tiong\` (project-standards § Electron)`,
+    );
+  }
+  // The attribution file ships (verify-ready --release requires it) but is
+  // inside the bundle where nobody can reach it. A link makes it reachable.
+  if (
+    exists(path.join(dir, 'THIRD-PARTY-LICENSES.txt')) &&
+    sourceFilesMatching(dir, /THIRD-PARTY-LICENSES|[Tt]hird[- ][Pp]arty [Ll]icen[cs]e|[Oo]pen[- ][Ss]ource [Ll]icen[cs]e/)
+      .length === 0
+  ) {
+    findings.push(
+      `THIRD-PARTY-LICENSES.txt ships but nothing in the UI links to it — the file is inside the bundle where a user cannot find it (project-standards § Electron)`,
+    );
+  }
+  // Mandated since the Diagnostics Logging section was written, never checked,
+  // and consequently present in 1 of 11 apps. Once a DMG is on a user's
+  // machine, logs the user can send are the only way to see what happened.
+  if (sourceFilesMatching(dir, /[Ee]xport [Dd]iagnostics/).length === 0) {
+    findings.push(
+      `no "Export diagnostics" affordance — logs cannot leave the user's machine, so a bug report carries no evidence. Reference implementation: education-enablement/electron/main.js:127 (project-standards § Diagnostics Logging)`,
+    );
+  }
+
+  for (const f of sourceFilesMatching(dir, /will-navigate/)) {
+    const src = readFile(path.join(dir, f));
+    const loaded = (src.match(/loadURL\s*\(\s*[`'"]https?:\/\/([^:/`'"]+)/) || [])[1];
+    const guarded = (src.match(/serverOrigin\s*=\s*[`'"]https?:\/\/([^:/`'"]+)/) || [])[1];
+    if (loaded && guarded && loaded !== guarded) {
+      findings.push(
+        `${f} loads the window from ${loaded} but will-navigate guards ${guarded} — the origin test is a string compare, so every in-app navigation would be treated as external and opened in the browser (project-standards § Electron)`,
+      );
+    }
   }
   // Where the update banner points. A URL baked into a shipped DMG cannot be
   // changed for anyone who already installed it, so it must point at a page we
@@ -2318,6 +2427,37 @@ function cmdScaffold(dir) {
   const created = [];
   const skipped = [];
 
+  /**
+   * Copy a reference implementation only when the project does not already
+   * have the capability, wherever it lives.
+   *
+   * copy() below tests the destination path, which is right for config files:
+   * one canonical location, present or absent. It is wrong for the two
+   * templates that are working code, because an existing app may implement the
+   * same thing in a file of its own. identity-practice encrypts with
+   * AES-256-CBC inline in server/ai.js, so the path server/secret-storage.js
+   * was free and scaffold wrote a second, unimported copy of the scheme — dead
+   * duplicate code, and duplicated crypto is the worst kind to leave lying
+   * around, since the two copies can later disagree about the format on disk.
+   *
+   * No check requires these files. They exist so a NEW app does not get
+   * assembled by copying whichever project is nearest, which is a reason to
+   * write them once and never a reason to add a second copy to a project that
+   * already works.
+   */
+  const copyUnlessImplemented = (tpl, dest, pattern, what) => {
+    if (exists(path.join(dir, dest))) {
+      skipped.push(dest);
+      return;
+    }
+    const found = sourceFilesMatching(dir, pattern).filter((f) => f !== dest);
+    if (found.length > 0) {
+      skipped.push(`${dest} (${what} already implemented in ${found[0]})`);
+      return;
+    }
+    copy(tpl, dest);
+  };
+
   const copy = (tpl, dest) => {
     const destPath = path.join(dir, dest);
     if (exists(destPath)) {
@@ -2355,8 +2495,18 @@ function cmdScaffold(dir) {
     // Electron app meant copying whichever project was nearest, which is how a
     // one-off divergence (an in-app licence gate, safeStorage, a hardcoded
     // port) spreads as though it were house style.
-    copy('electron-main.js', 'electron/main.js');
-    copy('secret-storage.js', 'server/secret-storage.js');
+    copyUnlessImplemented(
+      'electron-main.js',
+      'electron/main.js',
+      /new BrowserWindow\s*\(/,
+      'the Electron main process',
+    );
+    copyUnlessImplemented(
+      'secret-storage.js',
+      'server/secret-storage.js',
+      /createCipheriv\s*\(\s*['"]aes-256-cbc['"]/,
+      'AES-256-CBC secret storage',
+    );
     // Copied into build/ rather than generated, because it is real signing code
     // that must stay identical across apps: a per-project copy that drifts is
     // how one app quietly stops stapling. build/ is committed (it holds source

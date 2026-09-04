@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.31
-**Last updated:** 2026-09-04
+**Version:** 2.32
+**Last updated:** 2026-09-05
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -195,6 +195,24 @@ Checklist of what "done" looks like.
   Revisit if the stored value ever becomes something other than a user's own API key.
 
 - **Native modules** (e.g. better-sqlite3): add `"postinstall": "npx @electron/rebuild -f -w <module>"` and `"asarUnpack": ["**/*.node"]` in electron-builder config.
+- **The running version is visible without an update being available.** A user filing a bug report needs to answer "which version are you on?". In 5 of 11 Electron apps here the only place the version appeared was the update banner, which shows solely on a mismatch. macOS does expose it through About and Finder's Get Info, but that is a per-app menu a project can replace, and "click the app name in the menu bar" is a poor instruction to give the same way across every app.
+
+  **Required:** the settings surface carries a footer line naming the app and version — `<App Name> v2.0.2`. Settings is the mandate because every app has one, it has room for the full string, and one consistent instruction ("open Settings, scroll to the bottom") then works everywhere, which is the whole point for support.
+
+  **Optional:** an additional always-visible version, bottom-left or near the logo. Good where there is spare chrome; not mandated, because a content-focused app like a reader should not spend permanent screen space on it. The best content model pairs name and version with a privacy line in the settings footer.
+
+  `check` FAILs when the version identifier is only ever interpolated inside the update banner. Passing it to a server (`process.env.APP_VERSION = app.getVersion()`) is not showing it.
+- **The settings footer is the same surface in every app.** One place, and one support instruction ("open Settings, scroll to the bottom") that works whichever app the user is in. That portability is the point; a version sitting somewhere different in each app barely helps someone talking a user through it.
+
+  ```
+  <App Name> v2.0.2
+  © 2026 <Your Name>
+  Licences · Privacy · Export diagnostics
+  ```
+
+  Each line earns its place. The **version** answers the first question any bug report needs. The **copyright notice** names who made the app and when, which matters for a paid product; it is identification rather than protection, since copyright subsists without it. Drop "All rights reserved" — it is a Buenos Aires Convention relic that stopped doing any work once every relevant country joined Berne. **Licences** links `THIRD-PARTY-LICENSES.txt`, which every app ships and none currently surfaces, leaving it inside the bundle where a user cannot reach it. **Export diagnostics** is the support path (§ Diagnostics Logging).
+
+  Adapt the content to the app: a project with no AI needs no privacy line, and the licences link applies once the app ships an attribution file. `check` FAILs on a missing copyright notice, on a shipped `THIRD-PARTY-LICENSES.txt` that nothing links to, and on a missing "Export diagnostics" affordance.
 - **External links open in the user's browser.** `setWindowOpenHandler` must call `shell.openExternal` and deny the window, and `will-navigate` must do the same for any URL outside the local server origin. Both are needed: the first catches `target="_blank"` and `window.open`, the second catches a plain in-page link that would otherwise replace the app's UI with a web page and strand the user with no way back. Without them Electron opens a new `BrowserWindow` — Chromium with no address bar, no back button and no session shared with the browser the user actually uses. Denying the window without opening externally is worse than doing nothing, because the link then silently does nothing at all. `check` FAILs an Electron project with no `shell.openExternal` call.
 - **The update banner links to the app's changelog page, not to a store.** A URL baked into a shipped DMG cannot be changed for anyone who already installed it. The changelog page is the one end of that link that stays editable, so it is what the app must point at; the changelog page then carries the download link. Pointing an installed app straight at a store means that if distribution ever moves, every copy already out there has a dead link and no route to the update. `check` FAILs an Electron project whose source fetches a `version.json` but contains no `/changelog/` URL, and the marketing-site half is checked separately (below).
 - **Site-side, checked when `policy check` runs in the marketing-site repo:** every app directory publishing a `version.json` must have a `changelog/index.html`, that page must link to the store so a customer sent there by the banner can actually download, and the `url` field in `version.json` must be that changelog page. These are obligations rather than tidiness because the far end of the link lives in software already on customers' machines and cannot be fixed there.
