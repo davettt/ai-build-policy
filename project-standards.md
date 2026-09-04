@@ -202,17 +202,23 @@ Checklist of what "done" looks like.
   **Optional:** an additional always-visible version, bottom-left or near the logo. Good where there is spare chrome; not mandated, because a content-focused app like a reader should not spend permanent screen space on it. The best content model pairs name and version with a privacy line in the settings footer.
 
   `check` FAILs when the version identifier is only ever interpolated inside the update banner. Passing it to a server (`process.env.APP_VERSION = app.getVersion()`) is not showing it.
-- **The settings footer is the same surface in every app.** One place, and one support instruction ("open Settings, scroll to the bottom") that works whichever app the user is in. That portability is the point; a version sitting somewhere different in each app barely helps someone talking a user through it.
+- **The settings footer is the same surface in every app.** One place, and one support instruction ("open Settings, look at the bottom") that works whichever app the user is in. That portability is the point; a version sitting somewhere different in each app barely helps someone talking a user through it.
+
+  **Settings means whatever that app uses**: a route, an inline panel, or a modal. The footer goes at the foot of that surface whichever shape it takes. The checks match content anywhere in the source, not a file name or a route, so no shape is favoured and none needs a settings page invented for it.
+
+  **Export diagnostics may live in the app menu instead.** That is often the better home: a menu item still works when the app's own UI is misbehaving, which is exactly when someone needs to send logs. Either location satisfies the check.
 
   ```
   <App Name> v2.0.2
   © 2026 <Your Name>
-  Licences · Privacy · Export diagnostics
+  Terms · Open source licences · Export diagnostics
   ```
 
-  Each line earns its place. The **version** answers the first question any bug report needs. The **copyright notice** names who made the app and when, which matters for a paid product; it is identification rather than protection, since copyright subsists without it. Drop "All rights reserved" — it is a Buenos Aires Convention relic that stopped doing any work once every relevant country joined Berne. **Licences** links `THIRD-PARTY-LICENSES.txt`, which every app ships and none currently surfaces, leaving it inside the bundle where a user cannot reach it. **Export diagnostics** is the support path (§ Diagnostics Logging).
+  **"Licences" alone is the wrong label**, because it names two different things and shows only one. A buyer reads it as the licence they bought; the file behind it is dependency attribution. So the footer carries both, named for what each is: **Terms** links the product terms page (which is also where the BYOK privacy disclosure lives), and **Open source licences** links `THIRD-PARTY-LICENSES.txt`. The check enforces the distinction by accepting only the specific wording: "Open source licences" and "Third-party licences" pass, bare "Licences" does not.
 
-  Adapt the content to the app: a project with no AI needs no privacy line, and the licences link applies once the app ships an attribution file. `check` FAILs on a missing copyright notice, on a shipped `THIRD-PARTY-LICENSES.txt` that nothing links to, and on a missing "Export diagnostics" affordance.
+  Each line earns its place. The **version** answers the first question any bug report needs. The **copyright notice** names who made the app and when, which matters for a paid product; it is identification rather than protection, since copyright subsists without it. Drop "All rights reserved" — it is a Buenos Aires Convention relic that stopped doing any work once every relevant country joined Berne. **Open source licences** links `THIRD-PARTY-LICENSES.txt`, which apps ship and none surfaces, leaving it inside the bundle where a user cannot reach it. **Export diagnostics** is the support path (§ Diagnostics Logging).
+
+  Adapt the content to the app: a project with no AI needs no privacy disclosure, and the open source licences link applies once the app ships an attribution file. `check` FAILs on a missing copyright notice, on a shipped `THIRD-PARTY-LICENSES.txt` that nothing links to, and on a missing "Export diagnostics" affordance.
 - **External links open in the user's browser.** `setWindowOpenHandler` must call `shell.openExternal` and deny the window, and `will-navigate` must do the same for any URL outside the local server origin. Both are needed: the first catches `target="_blank"` and `window.open`, the second catches a plain in-page link that would otherwise replace the app's UI with a web page and strand the user with no way back. Without them Electron opens a new `BrowserWindow` — Chromium with no address bar, no back button and no session shared with the browser the user actually uses. Denying the window without opening externally is worse than doing nothing, because the link then silently does nothing at all. `check` FAILs an Electron project with no `shell.openExternal` call.
 - **The update banner links to the app's changelog page, not to a store.** A URL baked into a shipped DMG cannot be changed for anyone who already installed it. The changelog page is the one end of that link that stays editable, so it is what the app must point at; the changelog page then carries the download link. Pointing an installed app straight at a store means that if distribution ever moves, every copy already out there has a dead link and no route to the update. `check` FAILs an Electron project whose source fetches a `version.json` but contains no `/changelog/` URL, and the marketing-site half is checked separately (below).
 - **Site-side, checked when `policy check` runs in the marketing-site repo:** every app directory publishing a `version.json` must have a `changelog/index.html`, that page must link to the store so a customer sent there by the banner can actually download, and the `url` field in `version.json` must be that changelog page. These are obligations rather than tidiness because the far end of the link lives in software already on customers' machines and cannot be fixed there.
@@ -731,7 +737,20 @@ Once a DMG is on a user's machine you are blind — unless the app logs.
 
 - Structured local logging (timestamped, levelled) to the app's log directory; rotate, cap size.
 - Log operational events and errors — **never** user content, API keys, or request/response bodies.
-- An "Export diagnostics" menu item that zips the logs for the user to email support. This is the privacy-respecting alternative to crash telemetry (which stays a deliberate per-app product decision).
+- An "Export diagnostics" menu item that zips the logs for the user to email support. This is the privacy-respecting alternative to crash telemetry (which stays a deliberate per-app product decision). Label it to fit the surface: "Diagnostics" in a narrow modal, "Export diagnostics…" in a menu. `check` matches the capability (the word near something that actually writes a file), not the wording.
+
+**A leak test is mandatory wherever diagnostics can be exported.** `check` FAILs an app that has the feature without one. The bundle is a file the user emails out, and these apps hold customer records, personal journals and BYOK keys. The failure mode is silent: the user sends it, and neither party knows what was inside.
+
+Two designs, and the difference matters. A payload built from an **allowlist** of named fields (version, platform, schema version, error counts) cannot leak, because nothing unlisted can appear. A payload that **dumps log files** is more useful for debugging but is only as safe as every `log.*` call site, forever. One careless `log.info('saved', { entry })` and the promise printed at the top of the bundle becomes false. Dumping logs is allowed; carrying that risk untested is not.
+
+The test writes known canaries through the app's real paths (a piece of user content, and an API-key-shaped string), then asserts neither appears in the diagnostics output:
+
+```js
+assert.ok(!body.includes('Photosynthesis'), 'diagnostics leaked the source material');
+assert.ok(!body.includes('smoke-test-key'), 'diagnostics leaked the API key');
+```
+
+Log call sites are where leaks actually enter. One app drops provider error text on its AI routes, because a provider that echoes the offending request would put the user's wording into the bundle, and truncating "only bounds the leak rather than removing it". That judgment is right and cannot be enforced by reading code, which is why the canary test exists.
 
 ### Third-Party License Attribution (shipped apps)
 

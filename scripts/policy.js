@@ -912,10 +912,48 @@ function auditElectronStandards(dir, proj) {
   // Mandated since the Diagnostics Logging section was written, never checked,
   // and consequently present in 1 of 11 apps. Once a DMG is on a user's
   // machine, logs the user can send are the only way to see what happened.
-  if (sourceFilesMatching(dir, /[Ee]xport [Dd]iagnostics/).length === 0) {
-    findings.push(
-      `no "Export diagnostics" affordance — logs cannot leave the user's machine, so a bug report carries no evidence. Reference implementation: education-enablement/electron/main.js:127 (project-standards § Diagnostics Logging)`,
+  // Matched on the capability, not the wording, so the label can be whatever
+  // fits the surface — "Diagnostics" in a narrow modal, "Export diagnostics…"
+  // in a menu. What must exist is diagnostics that can leave the machine, so a
+  // file-producing action has to appear alongside the word: a bare mention of
+  // "diagnostics" in a comment or an endpoint path is not an affordance.
+  // Required within a few lines of each other, not merely in the same file: a
+  // server file can mention diagnostics in a comment and call writeFile a
+  // hundred lines away for something unrelated, which passed on coincidence.
+  const DELIVERS_FILE =
+    /showSaveDialog|writeFileSync|writeFile\(|createObjectURL|new Blob|download\s*=|Content-Disposition|attachment;/;
+  const diagnosticsExport = sourceFilesMatching(dir, /diagnostics/i).filter((f) => {
+    const lines = readFile(path.join(dir, f)).split('\n');
+    return lines.some(
+      (l, i) =>
+        /diagnostics/i.test(l) &&
+        DELIVERS_FILE.test(lines.slice(Math.max(0, i - 6), i + 6).join('\n')),
     );
+  });
+  if (diagnosticsExport.length === 0) {
+    findings.push(
+      `no way to export diagnostics — logs cannot leave the user's machine, so a bug report carries no evidence. Needs a "Diagnostics" action that writes a file (menu item or settings footer). Reference: education-enablement/electron/main.js:127 (project-standards § Diagnostics Logging)`,
+    );
+  } else {
+    // Shipping diagnostics without a leak test is the riskier state of the two.
+    // The bundle is a file the user emails out, and these apps hold customer
+    // records, personal journals and BYOK keys. A payload that dumps log files
+    // is only as safe as every log call site, forever, and the failure is
+    // silent: the user sends the file and neither party knows what was in it.
+    // A test that writes known canaries through the app's real paths and then
+    // asserts they are absent from the bundle is the only thing that keeps the
+    // promise true as the code changes. Required only where diagnostics exist,
+    // so it lands with the feature rather than ahead of it.
+    const leakTest = sourceFilesMatching(dir, /diagnostic/i).filter(
+      (f) => /(^|\/)tests?\//.test(f) && /canary|leak|redact|must not (appear|contain)/i.test(
+        readFile(path.join(dir, f)),
+      ),
+    );
+    if (leakTest.length === 0) {
+      findings.push(
+        `diagnostics can be exported but no test proves the bundle is clean — it is a file the user emails out, and these apps hold customer records, journals and BYOK keys. Add a test that writes known canaries (user content, an API key) through the app's normal paths and asserts none appear in the diagnostics output (project-standards § Diagnostics Logging)`,
+      );
+    }
   }
 
   for (const f of sourceFilesMatching(dir, /will-navigate/)) {
