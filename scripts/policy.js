@@ -558,6 +558,27 @@ function auditSite(dir) {
           `banner can read what changed but cannot download it`,
       );
     }
+    // Someone arriving from the banner is mid-task and needs to know a new DMG
+    // installs over the old one without losing their data. Without it the safe
+    // assumption is that it might not, which stalls the update.
+    if (/[Aa]pplications|install|replace|drag/.test(html)) {
+      ok(`Site: ${app}/changelog/ explains how to install the update`);
+    } else {
+      fail(
+        `Site: ${app}/changelog/ does not say how to install over an existing copy — ` +
+          `a customer sent here by the banner is left guessing whether their data survives`,
+      );
+    }
+    // The version the site advertises must be the one the page documents.
+    // Otherwise the banner names a release the customer can then read nothing
+    // about, which is the state that prompted this whole rule.
+    const advertised = readJSON(path.join(dir, app, 'version.json'));
+    if (advertised && advertised.version && !html.includes(advertised.version)) {
+      fail(
+        `Site: ${app}/version.json advertises ${advertised.version} but the changelog page ` +
+          `does not mention it — the banner sends customers to a page with no entry for the release it named`,
+      );
+    }
   }
 
   // The URL each app is told to visit must be the changelog page. This is the
@@ -870,8 +891,8 @@ function auditElectronStandards(dir, proj) {
   let versionShown = null;
   for (const f of sourceFilesMatching(dir, VERSION_RENDER)) {
     // A dedicated banner component is banner text wherever it sits in the file.
-    // Matching only on a variable name missed Music_Discovery, which calls its
-    // state `update` rather than `updateAvailable`.
+    // Matching only on a variable name missed an app that calls its state
+    // `update` rather than `updateAvailable`.
     if (/update[-_]?banner/i.test(path.basename(f))) continue;
     const lines = readFile(path.join(dir, f)).split('\n');
     for (let i = 0; i < lines.length; i++) {
@@ -932,7 +953,7 @@ function auditElectronStandards(dir, proj) {
   });
   if (diagnosticsExport.length === 0) {
     findings.push(
-      `no way to export diagnostics — logs cannot leave the user's machine, so a bug report carries no evidence. Needs a "Diagnostics" action that writes a file (menu item or settings footer). Reference: education-enablement/electron/main.js:127 (project-standards § Diagnostics Logging)`,
+      `no way to export diagnostics — logs cannot leave the user's machine, so a bug report carries no evidence. Needs a "Diagnostics" action that writes a file (menu item or settings footer). The reference implementation is named in project-standards § Diagnostics Logging`,
     );
   } else {
     // Shipping diagnostics without a leak test is the riskier state of the two.
@@ -956,6 +977,30 @@ function auditElectronStandards(dir, proj) {
     }
   }
 
+  // setWindowOpenHandler must test the origin, exactly as will-navigate does.
+  // An unconditional openExternal reads as correct and is not: the app's own
+  // pages are served over the local server, so a target="_blank" link to
+  // something like /api/licenses gets handed to the user's browser as
+  // http://127.0.0.1:<random port>/api/licenses — raw text on a localhost port
+  // that dies when the app quits. App content belongs in the app; only URLs
+  // outside the server origin belong in the browser.
+  for (const f of sourceFilesMatching(dir, /setWindowOpenHandler/)) {
+    const lines = readFile(path.join(dir, f)).split('\n');
+    const i = lines.findIndex((l) => /setWindowOpenHandler/.test(l));
+    // Bounded to the handler's own body, ending at its closing `});`. A fixed
+    // line window let the will-navigate block that usually follows bleed in,
+    // and its serverOrigin passed the test for a handler that has no origin
+    // check at all — a false pass on exactly the apps this is meant to catch.
+    let end = i + 1;
+    while (end < lines.length && !/^\s*\}\)\s*;/.test(lines[end])) end++;
+    const body = lines.slice(i, end + 1).join('\n');
+    if (!/serverOrigin|startsWith\(|localhost|127\.0\.0\.1/.test(body)) {
+      findings.push(
+        `${f}: setWindowOpenHandler sends every URL to the browser, including the app's own — a target="_blank" link to a local route opens as http://127.0.0.1:<port>/... in the user's browser. Allow same-origin URLs and openExternal only the rest, as will-navigate already does (project-standards § Electron)`,
+      );
+    }
+  }
+
   for (const f of sourceFilesMatching(dir, /will-navigate/)) {
     const src = readFile(path.join(dir, f));
     const loaded = (src.match(/loadURL\s*\(\s*[`'"]https?:\/\/([^:/`'"]+)/) || [])[1];
@@ -971,6 +1016,26 @@ function auditElectronStandards(dir, proj) {
   // control and can re-target — the app's changelog page, which in turn carries
   // the download link. Pointing straight at a store means that if distribution
   // ever moves, every installed copy has a dead link and no route to the update.
+  // The update banner must fire on a simple mismatch, not a semver "newer
+  // than" comparison. This is not style: the mismatch check is what makes the
+  // banner self-testing at every release. Install the new DMG while the site
+  // still lists the old version and the banner MUST appear, which is the same
+  // code path a customer's old copy hits; update the site and it MUST clear.
+  // A "newer than" comparison shows nothing in that state, so the release
+  // checklist's banner verification silently passes without testing anything.
+  // Matched on the version comparison itself, not on "localeCompare appears in
+  // a file mentioning version". That looser form was wrong in both directions
+  // at once: it flagged an app whose localeCompare calls sort dates, and missed
+  // two that build the version URL without the literal "version.json".
+  const semverCompare = sourceFilesMatching(
+    dir,
+    /\.version\s*\.localeCompare|localeCompare\s*\(\s*_*APP_VERSION/,
+  );
+  if (semverCompare.length > 0) {
+    findings.push(
+      `${semverCompare[0]}: the update check compares versions with localeCompare instead of testing for a mismatch — installing a build newer than the site then shows no banner, so the release checklist's "banner VISIBLE" step passes without exercising anything (project-standards § Electron)`,
+    );
+  }
   if (versionCheck && !changelogLink) {
     findings.push(
       `${versionCheck} checks for updates but no /changelog/ URL appears in the source — the update link must point at the app's changelog page, the one URL that can be re-targeted after the DMG ships (project-standards § Electron)`,
@@ -2472,8 +2537,8 @@ function cmdScaffold(dir) {
    * copy() below tests the destination path, which is right for config files:
    * one canonical location, present or absent. It is wrong for the two
    * templates that are working code, because an existing app may implement the
-   * same thing in a file of its own. identity-practice encrypts with
-   * AES-256-CBC inline in server/ai.js, so the path server/secret-storage.js
+   * same thing in a file of its own. One app here encrypts with
+   * AES-256-CBC inline in its ai module, so the path server/secret-storage.js
    * was free and scaffold wrote a second, unimported copy of the scheme — dead
    * duplicate code, and duplicated crypto is the worst kind to leave lying
    * around, since the two copies can later disagree about the format on disk.

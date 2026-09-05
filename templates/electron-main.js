@@ -80,17 +80,41 @@ async function createWindow() {
   // catches target="_blank" and window.open; will-navigate catches a plain
   // in-page link that would otherwise replace the app's own UI with a web page
   // and strand the user with no way back.
+  // Both handlers test the origin, and they must agree. An unconditional
+  // openExternal here looks right and is not: the app's own pages are reached
+  // over the local server, so a target="_blank" link to something like
+  // /api/licenses would be handed to the user's browser as
+  // http://127.0.0.1:55714/api/licenses — a random port on localhost, showing
+  // raw text, dead the moment the app quits. App content belongs in the app.
+  const serverOrigin = `http://127.0.0.1:${port}`;
+
   win.webContents.setWindowOpenHandler(({ url }) => {
+    // Same-origin content opens in its own window, with overrides so it is a
+    // real window the user can close. A bare `action: 'allow'` is not enough:
+    // whatever the user opens has to be dismissible, or they are left staring
+    // at a text file with no way back to the app. Anything reached from a link
+    // needs an exit.
+    if (url.startsWith(serverOrigin)) {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: { width: 800, height: 700, minWidth: 480 },
+      };
+    }
     shell.openExternal(url);
     return { action: 'deny' };
   });
 
   win.webContents.on('will-navigate', (event, url) => {
-    const serverOrigin = `http://127.0.0.1:${port}`;
     if (!url.startsWith(serverOrigin)) {
       event.preventDefault();
       shell.openExternal(url);
     }
+    // Same-origin navigation is allowed to proceed, which is right for the
+    // app's own routes. It is wrong for a link to something like
+    // /api/licenses: the main window navigates away from the app UI to a text
+    // file with no back button, and the user is stuck. Give such links
+    // target="_blank" so they take the handler above and get a closable
+    // window, or render the content in the app behind a close control.
   });
 
   win.loadURL(`http://127.0.0.1:${port}`);
