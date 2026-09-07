@@ -729,6 +729,35 @@ These patterns apply to all local-first apps that store data as JSON files. They
 **Cascade deletes:**
 - When deleting a parent entity, always clean up child entities (e.g., deleting a job must also remove its tasks from `tasks.json`). Orphaned records waste space and appear in backups.
 
+**Commit the lockfile.** `check` FAILs a project whose `.gitignore` excludes `package-lock.json`. Without a committed lockfile `npm ci` cannot run at all, so CI resolves versions live on every push and a peer-dependency conflict that a pinned tree would have sailed past instead surfaces as a broken install. It also makes the integrity check pointless, since there is nothing in git to verify. The shared template has never ignored it; projects that do have drifted.
+
+**Nothing should sit above a project that Node can resolve from.** A `node_modules` in a parent directory satisfies imports a project never declared, so it runs locally and fails in CI, where only its own tree exists. That reads as a CI-only bug and is really a local false positive. `check` FAILs when it finds one within three levels up — from a clean state, its reappearance means `npm install` was run in the wrong directory.
+
+### SQL schema changes (D1, SQLite)
+
+**Use the platform's migration tracking, and write idempotent DDL where the engine supports it.** Those are two separate mechanisms and both are needed. Running each change exactly once is the migration runner's job (D1 migrations, or the equivalent). Being safe to re-run is the schema author's, and only for the statements that have a guarded form.
+
+Not a blanket "all SQL must be idempotent" rule, because SQLite cannot express it. Verified against sqlite 3.51, which is what D1 is built on:
+
+```
+CREATE TABLE IF NOT EXISTS …            OK, safe to repeat
+CREATE INDEX IF NOT EXISTS …            OK, safe to repeat
+ALTER TABLE t ADD COLUMN IF NOT EXISTS  syntax error
+ALTER TABLE t ADD COLUMN c INT  (twice) duplicate column name: c
+```
+
+So:
+
+- `CREATE TABLE` and `CREATE INDEX` always carry `IF NOT EXISTS`. Leaving them bare turns a re-run into a hard failure for no benefit. `check` FAILs any `.sql` file with an unguarded one.
+- `ADD COLUMN` has no guarded form, so it goes in its own numbered migration and relies on the runner to apply it once. Do not try to make it idempotent by hand.
+- Postgres does support `ADD COLUMN IF NOT EXISTS`; this constraint is SQLite's, not SQL's. Check the engine before assuming either way.
+
+**A reset script must not be reachable against production.** A file that begins `DROP TABLE` is a reset, not a baseline, and `IF NOT EXISTS` on the `CREATE`s below it achieves nothing since the tables were just dropped. `check` therefore skips the idempotency rule for such files and instead FAILs any npm script that points one at `--remote` or a production environment. Documentation saying "do not run this against production" is not a control: anything reachable in one command eventually gets run, especially when the script is named like a routine migration. Use the migration runner for remote schema changes, keep reset scripts local-only, or gate them behind an explicit confirmation flag.
+
+Seed data is the case where idempotency does apply cleanly: `INSERT OR IGNORE` (or `ON CONFLICT DO NOTHING`) makes re-seeding safe without a reset.
+
+One schema definition per project. A second copy that nothing executes drifts from the migrations that do run, and then it is worse than absent, because it reads as authoritative.
+
 ### Data Migration, Backups & Downgrade Guard (commercial/Electron apps)
 
 User data outlives any single app version. Data loss on upgrade is the worst possible outcome for a paid app — worse than any bug the gates catch.

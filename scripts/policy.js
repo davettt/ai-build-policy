@@ -1400,6 +1400,119 @@ function cmdCheck(dir) {
     else warn('No public/manifest.json — web apps should ship PWA icons');
   }
 
+  // The lockfile must be committed. Without it `npm ci` cannot run at all, CI
+  // resolves versions live on every push, and a peer-dependency conflict that a
+  // lockfile would have pinned past surfaces as a broken install instead. It
+  // also makes the integrity check meaningless: there is nothing in git to
+  // verify. Two projects had drifted to ignoring it; the template never did.
+  const giRaw = readFile(path.join(dir, '.gitignore'));
+  if (/^\/?package-lock\.json\s*$/m.test(giRaw)) {
+    fail(
+      `.gitignore excludes package-lock.json — npm ci cannot run without it, so installs are ` +
+        `resolved live and are not reproducible. Remove that line and commit the lockfile ` +
+        `(project-standards § Supply Chain Security)`,
+    );
+  } else if (proj.hasPkg && !exists(path.join(dir, 'package-lock.json'))) {
+    warn(`No package-lock.json — run npm install and commit it so npm ci is reproducible`);
+  }
+
+  // A node_modules above the project root shadows missing local dependencies.
+  // Node resolution walks upward, so a project can run locally on packages it
+  // never declared and then fail in CI, where only its own tree exists. The
+  // failure looks like a CI-only bug and is really a local false positive.
+  for (let up = path.dirname(path.resolve(dir)), hops = 0; hops < 3; hops++) {
+    if (exists(path.join(up, 'node_modules'))) {
+      // A FAIL rather than a warning, now that the portfolio root is clear.
+      // While one existed above every project this could only have been noise,
+      // since no project could fix it. From a clean state its reappearance
+      // means `npm install` was run in the wrong directory — the mistake that
+      // created the original 496 MB tree — and that is worth stopping on.
+      fail(
+        `A node_modules exists above this project (${up}/node_modules) — Node resolves upward, so ` +
+          `missing local dependencies can be satisfied from it and the gap only appears in CI. ` +
+          `This usually means npm install was run in the wrong directory; remove it`,
+      );
+      break;
+    }
+    const parent = path.dirname(up);
+    if (parent === up) break;
+    up = parent;
+  }
+
+  // SQL schema: idempotent where the engine allows it.
+  //
+  // Not a blanket "all SQL must be idempotent" rule, because SQLite (and so D1)
+  // has no idempotent ADD COLUMN: `ALTER TABLE t ADD COLUMN IF NOT EXISTS` is a
+  // syntax error, and repeating a plain ADD COLUMN fails with "duplicate column
+  // name". Verified against sqlite 3.51. Running each migration exactly once is
+  // the migration runner's job; what the schema author controls is the DDL that
+  // *does* have a guarded form, and leaving that unguarded turns a re-run into
+  // a hard failure for no reason.
+  const sqlFiles = [];
+  const walkSql = (d, depth) => {
+    if (depth > 4) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (['node_modules', 'dist', 'release', 'coverage', '.git'].includes(e.name)) continue;
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) walkSql(full, depth + 1);
+      else if (e.name.endsWith('.sql')) sqlFiles.push(full);
+    }
+  };
+  walkSql(dir, 0);
+  const unguarded = [];
+  const destructive = [];
+  for (const f of sqlFiles) {
+    const src = readFile(f);
+    // A file that drops its tables is a reset script, not a baseline schema.
+    // Demanding IF NOT EXISTS there is noise: the tables were dropped moments
+    // earlier, so the guard decorates a statement that cannot collide, and it
+    // disguises what the file does. What matters for these is that nothing can
+    // point them at production, which is checked separately below.
+    if (/\bDROP\s+TABLE\b/i.test(src)) {
+      destructive.push(path.relative(dir, f));
+      continue;
+    }
+    for (const kind of ['TABLE', 'INDEX']) {
+      const all = (src.match(new RegExp(`CREATE\\s+(?:UNIQUE\\s+)?${kind}\\s`, 'gi')) || []).length;
+      const safe = (
+        src.match(new RegExp(`CREATE\\s+(?:UNIQUE\\s+)?${kind}\\s+IF\\s+NOT\\s+EXISTS`, 'gi')) || []
+      ).length;
+      if (all > safe) unguarded.push(`${path.relative(dir, f)} (CREATE ${kind})`);
+    }
+  }
+  // A reset script reachable against the remote database is a data-loss
+  // command sitting behind a routine-sounding npm script. The docs saying "do
+  // not run this on production" are not a control: anything that can be typed
+  // in one command eventually is, and this one is named like a migration.
+  if (destructive.length > 0 && proj.pkg && proj.pkg.scripts) {
+    for (const [name, cmd] of Object.entries(proj.pkg.scripts)) {
+      const hitsReset = destructive.some((d) => String(cmd).includes(path.basename(d)));
+      if (hitsReset && /--remote|--env\s+production|\bprod\b/.test(String(cmd))) {
+        fail(
+          `npm script "${name}" runs a DROP TABLE script against the remote database: ${cmd}. ` +
+            `Use the migration runner for remote schema changes and keep reset scripts local-only, ` +
+            `or gate this behind an explicit confirmation flag (project-standards § SQL schema changes)`,
+        );
+      }
+    }
+  }
+
+  if (sqlFiles.length > 0) {
+    if (unguarded.length === 0) ok(`SQL schema uses IF NOT EXISTS where the engine supports it`);
+    else
+      fail(
+        `SQL without IF NOT EXISTS, so re-running the schema fails instead of no-opping: ${unguarded.join(', ')}. ` +
+          `CREATE TABLE/INDEX have a guarded form and should use it; ADD COLUMN has none in SQLite, so that belongs ` +
+          `in its own tracked migration (project-standards § Data Migration)`,
+      );
+  }
+
   // Smoke/integration tiers must be real. `check` used to accept any script
   // named test:smoke, so an `echo 'no tests'` or a bare `npm run build` passed
   // the gate while exercising nothing — green with zero coverage is worse than
