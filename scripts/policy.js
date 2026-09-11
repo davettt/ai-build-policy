@@ -65,6 +65,9 @@ const RESET = '\x1b[0m';
 
 const results = { pass: 0, warn: 0, fail: 0, lines: [] };
 let hookMode = false;
+// Set while the audit runs inside another command (gates), where finish()
+// must return rather than end the process.
+let embedded = false;
 
 function ok(msg) {
   results.pass++;
@@ -91,6 +94,40 @@ function sh(cmd, cwd) {
   } catch (e) {
     return { ok: false, out: ((e.stdout || '') + (e.stderr || '')).trim(), code: e.status };
   }
+}
+
+/**
+ * Run a command with an argv array and no shell.
+ *
+ * Use this whenever an argument comes from the filesystem or a scraped file:
+ * `sh()` builds a shell string, and quoting is not protection there, because
+ * `$(...)` expands inside double quotes. A DMG filename or a URL read out of
+ * source is attacker-influencable in principle, and the cost of argv is
+ * nothing. `--` where the tool supports it stops a hostile value being read as
+ * an option.
+ */
+function shArgs(cmd, args, cwd) {
+  try {
+    const r = require('child_process').spawnSync(cmd, args, {
+      cwd,
+      encoding: 'utf8',
+      shell: false,
+    });
+    const out = `${r.stdout || ''}${r.stderr || ''}`.trim();
+    return { ok: r.status === 0, out, code: r.status };
+  } catch (e) {
+    return { ok: false, out: String((e && e.message) || e), code: 1 };
+  }
+}
+
+/** spctl's disk-image assessment. Its verdict goes to stderr and it exits 0 on
+ *  success, so both streams are captured; see the release check for why. */
+function assessDmg(dmgPath, cwd) {
+  return shArgs(
+    'spctl',
+    ['-a', '-t', 'open', '--context', 'context:primary-signature', '-vv', '--', dmgPath],
+    cwd,
+  );
 }
 
 /**
@@ -832,7 +869,11 @@ function auditElectronStandards(dir, proj) {
         if (!callsOpenAI && /api\.openai\.com|from\s+['"]openai['"]|require\(['"]openai['"]\)/.test(t))
           callsOpenAI = rel;
         if (!opensExternal && /shell\s*\.\s*openExternal/.test(t)) opensExternal = true;
-        if (!versionCheck && /version\.json/.test(t)) versionCheck = rel;
+        // Matched on intent, not one spelling. One app reads the URL from an
+        // env var, so it never contains "version.json" and a literal match
+        // reported it as having no banner at all.
+        if (!versionCheck && /version\.json|VERSION_CHECK_URL|updateAvailable|setUpdate/.test(t))
+          versionCheck = rel;
         if (!changelogLink && /\/changelog\/?['"`]|\/changelog\/?\$/.test(t)) changelogLink = true;
       }
     }
@@ -897,7 +938,12 @@ function auditElectronStandards(dir, proj) {
     const lines = readFile(path.join(dir, f)).split('\n');
     for (let i = 0; i < lines.length; i++) {
       if (!VERSION_RENDER.test(lines[i])) continue;
-      const nearby = lines.slice(Math.max(0, i - 8), i + 8).join('\n');
+      // A tight window. At ±8 it reached past a settings footer into the
+      // persistent "x available" line a few rows below and excluded the footer
+      // as banner text — a false positive in a gate that now blocks. Banner
+      // markup sits on or beside the render it belongs to; anything further is
+      // a different element.
+      const nearby = lines.slice(Math.max(0, i - 2), i + 3).join('\n');
       if (/updateAvailable|update-banner|is available|update\.version/i.test(nearby)) continue;
       versionShown = `${f}:${i + 1}`;
       break;
@@ -1027,14 +1073,105 @@ function auditElectronStandards(dir, proj) {
   // a file mentioning version". That looser form was wrong in both directions
   // at once: it flagged an app whose localeCompare calls sort dates, and missed
   // two that build the version URL without the literal "version.json".
-  const semverCompare = sourceFilesMatching(
-    dir,
-    /\.version\s*\.localeCompare|localeCompare\s*\(\s*_*APP_VERSION/,
-  );
-  if (semverCompare.length > 0) {
-    findings.push(
-      `${semverCompare[0]}: the update check compares versions with localeCompare instead of testing for a mismatch — installing a build newer than the site then shows no banner, so the release checklist's "banner VISIBLE" step passes without exercising anything (project-standards § Electron)`,
+  // The banner must fire on drift, not on "newer than".
+  //
+  // Stated positively: the comparison has to be an equality test against the
+  // running version. An earlier version of this denylisted `localeCompare` and
+  // therefore enforced nothing — `semver.gt(...)` and `parseFloat(...) >` both
+  // violate the rule and sailed past. Verified: of four comparison styles, the
+  // denylist caught one.
+  //
+  // Drift rather than newer-than is what makes the banner self-testing at each
+  // release. Install a build the site does not yet list and it must appear,
+  // which is the same code path a customer's stale copy hits; update the site
+  // and it must clear. A "newer than" test shows nothing in that state, so the
+  // release checklist's banner step passes while exercising nothing.
+  if (versionCheck) {
+    // Searched in the file that does the update check, not project-wide, and
+    // covering both ways an app names its running version. Getting this wrong
+    // in each direction at once: a `typeof __APP_VERSION__ !== 'undefined'`
+    // guard in an unrelated settings page satisfied a project-wide search for
+    // an app whose real comparison is localeCompare, while an app that does
+    // compare correctly was flagged because it reads `app.getVersion()` rather
+    // than the build-time constant. typeof guards are excluded for that reason.
+    const SELF = String.raw`(?:_*APP_VERSION_*|app\.getVersion\(\))`;
+    const MISMATCH = new RegExp(String.raw`[!=]==\s*${SELF}|${SELF}\s*[!=]==`);
+    // typeof guards are stripped before testing rather than excluded by a
+    // lookaround. `typeof X !== 'undefined'` is an existence check, not a
+    // version comparison, and every lookaround spelling of "not that one"
+    // leaked: `\s*` backtracks over the space so the lookahead lands on the
+    // wrong character and matches anyway. Deleting the construct first cannot
+    // backtrack.
+    const checkFile = readFile(path.join(dir, versionCheck)).replace(
+      /typeof\s+[\w$.]+\s*[!=]==\s*['"`]undefined['"`]/g,
+      '',
     );
+    const checksDrift = MISMATCH.test(checkFile);
+    if (!checksDrift) {
+      findings.push(
+        `${versionCheck}: the update check never compares for inequality against the running version, ` +
+          `so it is testing "is the site newer" rather than "does the site differ". Installing a build the site ` +
+          `does not yet list then shows no banner, and the release checklist's banner step passes without ` +
+          `exercising anything (project-standards § Electron)`,
+      );
+    }
+  }
+
+  // An app that ships a DMG must HAVE an update check. Every other banner rule
+  // is conditional on one existing, which is the trap that let DiagramSnap ship
+  // several DMGs, with a version.json published for it on the site, and no
+  // banner in the app at all: it passed every banner check by having no banner.
+  // A rule that presupposes the feature can never require it.
+  if (!versionCheck && builtDmgVersions(dir).size > 0) {
+    findings.push(
+      `no update check at all, yet this app ships a DMG — customers have no way to learn a new version exists, ` +
+        `and the site already publishes a version.json for it. Fetch it on launch and show the banner (project-standards § Electron)`,
+    );
+  }
+  // If the app ships a CSP, connect-src must permit the update host.
+  //
+  // One app shipped DMGs whose banner could never fire: its index.html carried
+  // `connect-src 'self'`, so the fetch to the marketing site was blocked inside
+  // the app before any request left. Nothing to do with the server's CORS. It
+  // hit only that app because it is the only one with a CSP at all — its best
+  // security practice was what broke the feature, which is why nobody suspected
+  // it, and why the other apps' banners kept working.
+  //
+  // Parsed out of the meta tag's content attribute, not by matching the bare
+  // word: an earlier attempt matched "connect-src" inside the explanatory
+  // comment above the tag and read the comment as the policy. The host is taken
+  // from source, since the URL lives in a constant, not in the HTML.
+  const updateHost = (() => {
+    for (const f of sourceFilesMatching(dir, /VERSION_CHECK_URL|version\.json/)) {
+      const m = readFile(path.join(dir, f)).match(/https:\/\/([a-z0-9.-]+)[^\s'"`]*version\.json/i);
+      if (m) return m[1];
+    }
+    return null;
+  })();
+  if (updateHost) {
+    for (const f of ['index.html', 'public/index.html', 'src/index.html']) {
+      const full = path.join(dir, f);
+      if (!exists(full)) continue;
+      const html = readFile(full);
+      // The content attribute is delimited by one quote character and its VALUE
+      // contains the other (`'self'`), so the capture may exclude only the
+      // delimiter. Excluding both truncated the policy at `'self'` and read the
+      // directive as absent — the same mistake that made this check miss the
+      // very bug it was written for.
+      const meta =
+        html.match(/http-equiv="Content-Security-Policy"[^>]*?content="([^"]*)"/is) ||
+        html.match(/http-equiv='Content-Security-Policy'[^>]*?content='([^']*)'/is);
+      if (!meta) continue;
+      const connect = (meta[1].match(/connect-src([^;]*)/i) || [])[1];
+      if (connect === undefined) continue; // no connect-src: default-src governs, checked below
+      if (!connect.includes(updateHost)) {
+        findings.push(
+          `${f}: the CSP restricts connect-src to${connect.replace(/\s+/g, ' ').trimEnd()} but the app fetches ${updateHost} — ` +
+            `the update check is blocked inside the app before any request leaves, so the banner silently never appears. ` +
+            `Add https://${updateHost} to connect-src (project-standards § Electron)`,
+        );
+      }
+    }
   }
   if (versionCheck && !changelogLink) {
     findings.push(
@@ -1151,7 +1288,7 @@ function auditTrackedPrivacy(dir) {
   } else ok('No absolute home paths in tracked files');
 }
 
-function cmdCheck(dir) {
+function cmdCheck(dir, flags = []) {
   guardLocalPath(dir);
   const proj = detectProject(dir);
   const reg = loadRegistry();
@@ -1695,14 +1832,33 @@ function cmdCheck(dir) {
 
 function checkStaleness(dir, reg) {
   const state = loadState(dir);
+  // Enforce the verdict health recorded, at no cost here. This is the half that
+  // makes staleness bite: health does the network work and writes what it
+  // found, check blocks on it every time gates run. Without this the rule was
+  // only as strong as remembering to run a maintenance command.
+  const recordedStale = (loadState(dir).staleDeps || []).filter(Boolean);
+  if (recordedStale.length > 0) {
+    fail(
+      `${recordedStale.length} dependency update(s) overdue as of the last health run: ` +
+        `${recordedStale.slice(0, 4).join('; ')}${recordedStale.length > 4 ? ', …' : ''} — run: policy deps-update`,
+    );
+  }
+
   const healthDays = (reg.staleness && reg.staleness.healthRunDays) || 30;
   if (state.lastHealthRun) {
     const d = daysSince(state.lastHealthRun);
     if (d > healthDays)
-      warn(`Maintenance overdue: last 'policy health' run ${d} days ago (run: policy health)`);
+      // A FAIL, not a warning. health is the only place dependency staleness is
+      // measured, and nothing forced it to run, so an unrun health check meant
+      // staleness was simply unenforced. Now that compliance blocks gates, an
+      // overdue health run stops work until it is done.
+      fail(`Maintenance overdue: last 'policy health' run ${d} days ago (run: policy health)`);
     else ok(`Maintenance current (last health run ${d} days ago)`);
   } else {
-    warn(`No maintenance record — run 'policy health' to establish one`);
+    // Never run is the weakest state, not the mildest: dependency staleness has
+    // never been measured here at all. Treating it more leniently than an
+    // overdue run would exempt exactly the projects that need it most.
+    fail(`No maintenance record — dependency staleness has never been measured here. Run: policy health`);
   }
 
   // Dependency drift inside the declared ranges. Warns rather than fails: a
@@ -1752,6 +1908,9 @@ function checkStaleness(dir, reg) {
 }
 
 function finish() {
+  // Embedded in another command: the caller inspects results and prints its
+  // own summary, so this must neither report nor exit.
+  if (embedded) return;
   if (hookMode) {
     if (results.fail === 0 && results.warn === 0) {
       console.log('Policy compliance: PASS. No gaps.');
@@ -1803,6 +1962,40 @@ const GATE_ORDER = [
   { name: 'Integration tests', script: 'test:integration' },
 ];
 
+/**
+ * Run the compliance audit in-process and return its FAIL lines.
+ *
+ * Compliance was advisory: `check` reported at session start and nothing bound
+ * on it, so a project could fail every structural rule and still gate, commit
+ * and ship. The only thing standing in the gap was a line of prose telling a
+ * human to fix FAIL items first, which is the exact failure mode this policy
+ * exists to remove, sitting at its centre.
+ *
+ * It belongs in `gates` rather than at release. Gates run before work is
+ * presented, so a gap is found while the fix is cheap. Binding it at release
+ * instead would surface structural problems after testing and force a retest.
+ */
+function complianceFailures(dir) {
+  const saved = { ...results, lines: [...results.lines] };
+  const savedHook = hookMode;
+  results.pass = 0;
+  results.warn = 0;
+  results.fail = 0;
+  results.lines = [];
+  hookMode = true; // suppress the per-line output; we only want the verdict
+  embedded = true; // finish() must return here, not exit the gates run
+  try {
+    cmdCheck(dir);
+  } catch {
+    /* a crashing audit must not take the gates down */
+  }
+  const failures = results.lines.filter((l) => l.startsWith('FAIL: ')).map((l) => l.slice(6));
+  Object.assign(results, saved);
+  hookMode = savedHook;
+  embedded = false;
+  return failures;
+}
+
 function cmdGates(dir, flags) {
   guardLocalPath(dir);
   const proj = detectProject(dir);
@@ -1822,11 +2015,61 @@ function cmdGates(dir, flags) {
   // empty diff is NOT that case — it means the work is already committed, and
   // the review gate must still run so a never-reviewed tree cannot slip past.
   const changedNow = changedFiles(dir);
+  // Hash of the source alone. The marker's diffHash covers the whole tree, so
+  // adding the CHANGELOG entry the Stop hook requires invalidates it and the
+  // next gates run re-reviews source the reviewer has already read — the same
+  // code plus one prose line, at full cost against a small rolling allowance.
+  // Keyed on source instead, an unchanged codebase is not re-reviewed however
+  // many times the changelog, docs or config move.
+  const sourceOnlyHash = () => {
+    const files = changedNow.filter(isSourceFile).sort();
+    if (files.length === 0) return null;
+    const h = crypto.createHash('sha256');
+    h.update(files.join('\n'));
+    for (const f of files) h.update('\0' + readFile(path.join(dir, f)));
+    return h.digest('hex');
+  };
+  const srcHash = sourceOnlyHash();
+  const prevMarker = readJSON(path.join(dir, '.policy', 'gates.json'));
+  // Only carries forward a review that actually happened: the previous marker
+  // must record the gate AND the source must be byte-identical. Anything else
+  // re-runs it, so this can shorten the path but never skip a first review.
+  const alreadyReviewed =
+    !withReview &&
+    srcHash !== null &&
+    prevMarker &&
+    prevMarker.reviewedSourceHash === srcHash &&
+    Array.isArray(prevMarker.gates) &&
+    prevMarker.gates.includes('CodeRabbit review');
   const skipReview =
-    !withReview && changedNow.length > 0 && changedNow.filter(isSourceFile).length === 0;
+    !withReview &&
+    ((changedNow.length > 0 && changedNow.filter(isSourceFile).length === 0) || alreadyReviewed);
   const willRunReview = !fast && !skipReview && gates.some((g) => g.script === 'review');
 
   section(`Quality gates (${fast ? 'fast/pre-commit' : 'full'}): ${path.resolve(dir)}`);
+
+  // Compliance first: the cheapest gate, and it describes structure, so a gap
+  // found here is fixed before any time goes into tests, a build or a DMG.
+  //
+  // No mechanism exists to accept a failure as known debt. A gate that lets you
+  // record failures as acceptable is a report with extra steps, and an escape
+  // hatch reachable by whoever just got stopped is the thing this policy exists
+  // to remove. Compliance is either met or the gates do not run.
+  if (!fast) {
+    const failures = complianceFailures(dir);
+    if (failures.length > 0) {
+      console.log(`  ${RED}✗${RESET} Compliance (${failures.length})`);
+      for (const f of failures) console.log(`      ${RED}•${RESET} ${f}`);
+      console.log(
+        `\n${RED}${BOLD}Gates stopped at Compliance.${RESET} No other gate ran.\n` +
+          `Most of these are mechanical: ${DIM}policy scaffold${RESET} fixes the missing files and scripts, ` +
+          `and template drift is a copy from build-policy/templates/.\n`,
+      );
+      process.exit(1);
+    }
+    console.log(`  ${GREEN}✓${RESET} Compliance`);
+  }
+
 
   // A filtered lockfile installs fine here and fails CI on Linux, so it must be
   // caught before the work is presented rather than by a red pipeline later.
@@ -1884,7 +2127,9 @@ function cmdGates(dir, flags) {
     }
     if (g.whenSourceChanges && skipReview) {
       console.log(
-        `  ${DIM}skipped${RESET} ${g.name} ${DIM}(no source in this diff — review allowance saved for code changes; force: gates --with-review)${RESET}`,
+        alreadyReviewed
+          ? `  ${DIM}skipped${RESET} ${g.name} ${DIM}(source unchanged since the last review — carried forward; force: gates --with-review)${RESET}`
+          : `  ${DIM}skipped${RESET} ${g.name} ${DIM}(no source in this diff — review allowance saved for code changes; force: gates --with-review)${RESET}`,
       );
       continue;
     }
@@ -1939,7 +2184,19 @@ function cmdGates(dir, flags) {
       files: verifiedFiles,
       contentHash: contentHash(dir, verifiedFiles),
       timestamp: new Date().toISOString(),
-      gates: report.map((r) => r.gate),
+      // A carried-forward review is recorded as a pass, because the code was
+      // reviewed — verify-ready --release refuses to ship without this, and it
+      // must not be tricked by the carry-forward or defeated by it.
+      gates: alreadyReviewed
+        ? [...new Set([...report.map((r) => r.gate), 'CodeRabbit review'])]
+        : report.map((r) => r.gate),
+      // The source the review actually examined. Absent when the diff has no
+      // source, so a later source change cannot inherit an unrelated pass.
+      reviewedSourceHash:
+        srcHash !== null &&
+        (alreadyReviewed || report.some((r) => r.gate === 'CodeRabbit review'))
+          ? srcHash
+          : null,
     };
     fs.mkdirSync(path.join(dir, '.policy'), { recursive: true });
     // Trailing newline keeps the marker prettier-clean in projects where
@@ -2312,7 +2569,7 @@ function verifyRelease(dir, proj, flags) {
       // a FAIL here would demand a check on a file the build order says should
       // not exist yet.
     } else {
-      const assessed = sh(
+      const assessed = assessDmg(
         // 2>&1 is required, not defensive. spctl writes its verdict to stderr
         // and exits 0 on success, and sh() returns stdout only on success (it
         // merges both streams only on failure). Without the redirect this reads
@@ -2320,10 +2577,10 @@ function verifyRelease(dir, proj, flags) {
         // is reported as having no usable signature — refusing to ship the one
         // artifact that is actually fine. The bug hid because the obvious test
         // is an unsigned DMG, which exits non-zero and takes the merged path.
-        `spctl -a -t open --context context:primary-signature -vv ${JSON.stringify(dmgPath)} 2>&1`,
+        dmgPath,
         dir,
       );
-      const stapled = sh(`xcrun stapler validate ${JSON.stringify(dmgPath)}`, dir);
+      const stapled = shArgs('xcrun', ['stapler', 'validate', dmgPath], dir);
       if (/accepted/.test(assessed.out) && stapled.ok) {
         ok(`DMG container signed, notarized and stapled (${path.basename(dmgPath)})`);
       } else {
@@ -2334,6 +2591,52 @@ function verifyRelease(dir, proj, flags) {
             `Wire build/notarize-dmg.cjs in as afterAllArtifactBuild (policy scaffold installs it) and rebuild.`,
         );
       }
+    }
+  }
+
+  // The update endpoint must actually be fetchable from inside the app.
+  //
+  // Music Discovery shipped DMGs whose banner could never fire: the app is
+  // served from localhost, so reading version.json is a cross-origin request,
+  // and without an Access-Control-Allow-Origin header the browser blocks it
+  // before any app code runs. Nothing caught it because every check reads the
+  // repo, and the header is served by a Cloudflare dashboard rule that no file
+  // here describes. A correct banner and a working banner are different claims,
+  // and only one of them can be verified by reading code.
+  //
+  // At release rather than in `check`: it is a network call, and the
+  // session-start hook has a 10 second budget.
+  const verUrl = sourceFilesMatching(dir, /version\.json/)
+    .map((f) => (readFile(path.join(dir, f)).match(/https:\/\/[^\s'"`]+version\.json/) || [])[0])
+    .find(Boolean);
+  if (verUrl) {
+    // argv, not a shell string. The URL is scraped from project source, and the
+    // pattern that finds it excludes quotes and backticks but not `$`, `(` or
+    // `)` — and `$(...)` still expands inside double quotes, so a crafted URL
+    // in any scanned file would have executed. Verified before fixing.
+    // `--` stops curl reading a hostile URL as an option.
+    let headOut = '';
+    try {
+      const r = require('child_process').spawnSync(
+        'curl',
+        ['-sI', '--max-time', '10', '--', verUrl],
+        { cwd: dir, encoding: 'utf8', shell: false },
+      );
+      headOut = `${r.stdout || ''}${r.stderr || ''}`;
+    } catch {
+      headOut = '';
+    }
+    const status = (headOut.match(/HTTP\/[\d.]+ (\d{3})/) || [])[1];
+    const cors = /access-control-allow-origin/i.test(headOut);
+    if (status !== '200') {
+      fail(`Update endpoint ${verUrl} returned ${status || 'no response'} — the banner can never fire`);
+    } else if (!cors) {
+      fail(
+        `Update endpoint ${verUrl} sends no Access-Control-Allow-Origin header. The app reads it cross-origin ` +
+          `from localhost, so the browser blocks the request before any app code runs and the banner silently never appears`,
+      );
+    } else {
+      ok(`Update endpoint reachable and CORS-enabled (${verUrl})`);
     }
   }
 
@@ -2586,6 +2889,43 @@ function cmdHealth(dir, flags) {
   checkStaleness(dir, reg);
 
   const state = loadState(dir);
+  // Record WHICH updates have been available too long, not just that health
+  // ran. The network work belongs here — release dates need `npm view <pkg>
+  // time`, one call per package, which cannot sit in a session-start check on a
+  // 10 second budget. `check` then enforces the recorded verdict for free.
+  //
+  // Minor and patch only. Majors keep going through `policy upgrade` and its
+  // decision record; being behind a major is a decision, being behind a patch
+  // for months is neglect, and security fixes ride in patches.
+  const graceDays = (loadRegistry().staleness || {}).depsStaleDays || 30;
+  const stale = [];
+  try {
+    const list = JSON.parse(sh('npm outdated --json', dir).out || '{}');
+    for (const [name, info] of Object.entries(list)) {
+      const cur = String(info.current || '').split('.');
+      const wanted = String(info.wanted || '').split('.');
+      if (!cur[0] || cur[0] !== wanted[0]) continue; // major: not this rule
+      if (info.current === info.wanted) continue;
+      const times = sh(`npm view ${safeToken(name, 'package name')} time --json`, dir);
+      let released = null;
+      try {
+        released = JSON.parse(times.out || '{}')[info.wanted];
+      } catch {
+        /* unreadable: skip rather than guess */
+      }
+      if (!released) continue;
+      const age = Math.floor((Date.now() - new Date(released)) / 86400000);
+      if (age > graceDays) stale.push(`${name} ${info.current} -> ${info.wanted} (${age}d old)`);
+    }
+  } catch {
+    /* npm unavailable: leave the previous verdict rather than clearing it */
+  }
+  if (stale.length > 0) {
+    fail(
+      `${stale.length} minor/patch update(s) available for more than ${graceDays} days: ${stale.slice(0, 5).join('; ')}${stale.length > 5 ? ', …' : ''} — run: policy deps-update`,
+    );
+  } else ok(`No minor/patch update older than ${graceDays} days`);
+  state.staleDeps = stale;
   state.lastHealthRun = new Date().toISOString();
   saveState(dir, state);
   console.log(`\n${DIM}Recorded health run in .policy/state.json${RESET}`);
@@ -3130,12 +3470,123 @@ function readStdinJSON() {
 /** Stop hook: block turn-end when source changed without a CHANGELOG update
  *  or without a full-gates pass on the current tree. One combined block per
  *  turn (stop_hook_active guard), so all reasons are reported together. */
+/**
+ * Did this turn state content that is not in the project's data files?
+ *
+ * The failure this exists for: a session presented a table of in-app tips for
+ * the developer to review, reconstructed from memory after a context
+ * summarisation rather than read from the file. Thirteen of the fourteen
+ * entries did not exist. Had they been approved, content that is not in the
+ * product would have been signed off, and nothing in the transcript would have
+ * looked unusual.
+ *
+ * An earlier version of this checked process — "was the file read since it was
+ * last written" — and would have missed the real incident. The file HAD been
+ * read, correctly, and quoted accurately at the time; a summarisation two
+ * hundred messages later destroyed the knowledge while leaving the read in the
+ * transcript. Process is the wrong thing to check, because the transcript keeps
+ * evidence of a read that the model no longer benefits from.
+ *
+ * So this verifies the claim instead. Identifiers in the closing message are
+ * compared against the identifiers that actually exist in the project's data
+ * files. Anchored by requiring at least one real match, so the message is
+ * demonstrably about that dataset rather than coincidentally containing
+ * kebab-case, and it only fires on two or more absentees, since fabrication
+ * comes in lists and a single miss is more likely a rename.
+ *
+ * Measured against the real transcript: the accurate table scored 14 real / 0
+ * absent, the fabricated one 1 real / 13 absent.
+ */
+function fabricatedContentIds(transcriptPath, dir) {
+  let finalText = '';
+  try {
+    for (const line of fs.readFileSync(transcriptPath, 'utf8').split('\n')) {
+      let o;
+      try {
+        o = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (o.type !== 'assistant') continue;
+      const c = (o.message || {}).content;
+      if (!Array.isArray(c)) continue;
+      for (const b of c) if (b.type === 'text' && b.text) finalText = b.text;
+    }
+  } catch {
+    return null;
+  }
+  if (!finalText) return null;
+
+  // Vocabulary: every `id` in every JSON data file the project ships.
+  const vocab = new Set();
+  const collect = (node) => {
+    if (Array.isArray(node)) node.forEach(collect);
+    else if (node && typeof node === 'object') {
+      if (typeof node.id === 'string') vocab.add(node.id);
+      Object.values(node).forEach(collect);
+    }
+  };
+  const walkData = (d, depth) => {
+    if (depth > 4) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (['node_modules', 'dist', 'release', 'coverage', '.git', 'local_data'].includes(e.name))
+        continue;
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) walkData(full, depth + 1);
+      else if (e.name.endsWith('.json') && !/package(-lock)?\.json$/.test(e.name)) {
+        const j = readJSON(full);
+        if (j) collect(j);
+      }
+    }
+  };
+  walkData(dir, 0);
+  if (vocab.size === 0) return null;
+
+  const cited = new Set();
+  for (const m of finalText.matchAll(/`([a-z]+(?:-[a-z]+)+)`|\|\s*([a-z]+(?:-[a-z]+)+)\s*\|/g))
+    cited.add(m[1] || m[2]);
+
+  const present = [...cited].filter((t) => vocab.has(t));
+  const absent = [...cited].filter((t) => !vocab.has(t));
+  if (present.length >= 1 && absent.length >= 2) return { present, absent };
+  return null;
+}
+
 function cmdHookStop() {
   const input = readStdinJSON();
   if (input.stop_hook_active) process.exit(0); // never loop
   const dir = process.cwd();
   const proj = detectProject(dir);
   if (!proj.hasPkg || !proj.isGit) process.exit(0);
+
+  // Checked before the source-changed gate below, because describing a file's
+  // contents changes nothing on disk. The turn that fabricated a tip list
+  // touched no source at all, so anything behind that gate could not have seen
+  // it.
+  if (input.transcript_path) {
+    const bogus = fabricatedContentIds(input.transcript_path, dir);
+    if (bogus) {
+      console.log(
+        JSON.stringify({
+          decision: 'block',
+          reason:
+            `BUILD-POLICY: this turn cites ${bogus.absent.length} identifiers that do not exist in the project's data files: ` +
+            `${bogus.absent.slice(0, 8).join(', ')}${bogus.absent.length > 8 ? ', …' : ''}. ` +
+            `It also cites ${bogus.present.length} that do, so the message is about that data and part of it is invented. ` +
+            `Re-read the data file and correct the list before ending the turn. If the developer was asked to review or approve this content, ` +
+            `say plainly that the earlier list was wrong — approving content that is not in the product is the failure this check exists to prevent.`,
+        }),
+      );
+      process.exit(0);
+    }
+  }
+
   const changed = changedFiles(dir);
   const sourceChanged = changed.filter(isSourceFile);
   if (sourceChanged.length === 0) process.exit(0);
@@ -3235,6 +3686,49 @@ function cmdHookPretool() {
     );
     process.exit(0);
   }
+  // Installs must go through Socket, and the alias does not guarantee that.
+  //
+  // `npm` is an alias for `socket npm`, which exists ONLY in an interactive
+  // shell. Measured: `bash -c 'type npm'` and `zsh -c 'type npm'` both resolve
+  // straight to the nvm binary, as does `command npm`. So every scripted
+  // install — a package.json script, anything inside a subshell, a hook —
+  // bypasses Socket completely. The wrapper protects npm typed by hand, not npm
+  // run by tooling, which is the larger share of installs.
+  //
+  // The documented rules forbid `socket wrapper --disable`, the nvm binary and
+  // unsetting the alias, but not alias evasion, because they were written about
+  // the wrapper rather than about how a shell resolves a name.
+  //
+  // Only mutating commands are gated. Read-only npm (ls, view, outdated, run)
+  // installs nothing and is left alone.
+  if (input.tool_name === 'Bash') {
+    const MUTATES = /\b(?:install|i|add|update|up|upgrade|ci|dedupe)\b/;
+    const evasion = /\bcommand\s+npm\b|\\npm\b|\/\.nvm\/[^\s]*\/bin\/npm\b/.test(cmd);
+    const bareNpm = /(?:^|[;&|(]|&&|\|\|)\s*npm\s+([a-z-]+)/.exec(cmd);
+    const scripted = /\b(?:bash|sh|zsh)\s+-c\b[^\n]*\bnpm\s/.test(cmd);
+    const mutating =
+      (bareNpm && MUTATES.test(bareNpm[1])) || (evasion && MUTATES.test(cmd)) || (scripted && MUTATES.test(cmd));
+    const alreadySocket = /\bsocket\s+(?:npm|raw-npm)\b/.test(cmd);
+    if (mutating && !alreadySocket) {
+      console.log(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason:
+              'BUILD-POLICY: this installs or updates packages without Socket. The `npm` -> `socket npm` alias exists only in an ' +
+              'interactive shell, so `command npm`, a subshell, or anything scripted resolves straight to the raw binary and is never scanned. ' +
+              'Run it explicitly: `socket npm <cmd>`. ' +
+              'If Socket is returning 429, do NOT bypass silently — check `socket organization quota`, score the exact target with ' +
+              '`socket package score npm <pkg>@<version> --markdown`, then use `socket raw-npm <cmd>` and run `socket scan create --report --no-interactive` ' +
+              'immediately after (project-standards § Supply Chain Security).',
+          },
+        }),
+      );
+      process.exit(0);
+    }
+  }
+
   // Raw `semgrep scan` drifts from the gate's flags (that drift is exactly how
   // CI failed where local passed). Steer to the policy-defined invocation.
   if (input.tool_name === 'Bash' && /\bsemgrep\s+scan\b/.test(cmd) && !/npm run sast/.test(cmd)) {
@@ -3497,7 +3991,7 @@ function main() {
     case 'setup-machine':
       return cmdSetupMachine();
     case 'check':
-      return cmdCheck(dir);
+      return cmdCheck(dir, flags);
     case 'gates':
       return cmdGates(dir, flags);
     case 'verify-marker':

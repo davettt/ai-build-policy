@@ -6,7 +6,8 @@
     "healthRunDays": 30,
     "registryReviewDays": 90,
     "depsDriftPackages": 10,
-    "depsRefreshDays": 30
+    "depsRefreshDays": 30,
+    "depsStaleDays": 30
   },
   "entries": {
     "anthropic-model-fast": {
