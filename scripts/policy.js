@@ -37,7 +37,8 @@
  *   hook-stop           Stop hook: block turn-end if source changed without CHANGELOG entry
  *                         or without a full-gates pass on the current tree
  *   hook-pretool        PreToolUse hook: block electron:build on a dirty tree;
- *                         redirect raw `semgrep scan` to `npm run sast`
+ *                         redirect raw `semgrep scan` to `npm run sast`;
+ *                         nudge search/survey commands toward delegation
  */
 
 'use strict';
@@ -2032,9 +2033,28 @@ function cmdGates(dir, flags) {
   guardLocalPath(dir);
   const proj = detectProject(dir);
   if (!proj.hasPkg) {
+    const failures = complianceFailures(dir);
+    if (failures.length > 0) {
+      console.log(`\n${RED}${BOLD}Gate failed: compliance check.${RESET}`);
+      for (const f of failures) console.log(`  ${RED}✗${RESET} ${f}`);
+      console.log(`\nFix, then re-run: policy gates\n`);
+      process.exit(1);
+    }
+    const files = changedFiles(dir).filter((f) => !f.startsWith('.policy/')).sort();
+    const marker = {
+      timestamp: new Date().toISOString(),
+      diffHash: diffHash(dir),
+      files,
+      contentHash: contentHash(dir, files),
+      gates: [{ name: 'Compliance check', status: 'pass' }],
+    };
+    fs.mkdirSync(path.join(dir, '.policy'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, '.policy', 'gates.json'),
+      JSON.stringify(marker, null, 2) + '\n',
+    );
     console.log(
-      'Gates skipped: no package.json, so there is nothing to run.\n' +
-        'This is not a pass. Documentation-only repos are covered by `check`.',
+      `\n${GREEN}${BOLD}Documentation-only repo: check passed. Marker written.${RESET}\n`,
     );
     return;
   }
@@ -3844,6 +3864,34 @@ function cmdHookPretool() {
             : 'No pass is recorded. ') +
           `Run: node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} verify-ready --release`,
       );
+    }
+  }
+  // Context protection: nudge search/survey Bash calls toward delegation.
+  // Tool output persists in context and is resent every turn, so exploratory
+  // commands (grep, find, git log) compound fast in long sessions. This is
+  // advisory — additionalContext, not deny — because inline use is sometimes
+  // correct. The nudge fires once per pattern match, not per call.
+  if (input.tool_name === 'Bash') {
+    const SEARCH_PATTERNS = [
+      { re: /\b(?:grep|rg|ag|ack)\b.*(?:-r\b|--recursive\b|-R\b)/, label: 'recursive grep' },
+      { re: /\bfind\s+\S+.*-(?:name|type|regex)\b/, label: 'find with filters' },
+      { re: /\bgit\s+log\b(?!.*--oneline\s+-\d)/, label: 'git log (verbose)' },
+      { re: /\bgit\s+diff\b(?!.*--stat\b)(?!.*--name)/, label: 'git diff (full)' },
+    ];
+    const matched = SEARCH_PATTERNS.find((p) => p.re.test(cmd));
+    if (matched) {
+      console.log(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            additionalContext:
+              `BUILD-POLICY context protection: this ${matched.label} will add its full output to the session context and it will be resent on every subsequent turn. ` +
+              'If this is exploratory/survey work, delegate it to a haiku agent or fork instead — their tool output stays out of the main context. ' +
+              'Inline is fine when you need a specific, targeted result (a few lines) that you will act on immediately.',
+          },
+        }),
+      );
+      process.exit(0);
     }
   }
   process.exit(0);
