@@ -1128,6 +1128,38 @@ function auditElectronStandards(dir, proj) {
         `and the site already publishes a version.json for it. Fetch it on launch and show the banner (project-standards § Electron)`,
     );
   }
+  // A server that reads the version from the environment needs the main process
+  // to put it there.
+  //
+  // One app's diagnostics bundle reported "App version: development" from a
+  // real DMG. It read `process.env.npm_package_version ?? process.env.APP_VERSION
+  // ?? 'development'`, and its main process set neither. npm_package_version
+  // exists only when npm launched the process, so it is present under `npm run`
+  // and absent in a packaged app: the chain reads correctly in development and
+  // wrongly in production, which is the inverse of a useful fallback. The
+  // bundle's whole purpose is to say which version the user is running.
+  // A server that reads the version from the environment needs the main process
+  // to put it there.
+  //
+  // Presence only, deliberately. I tightened this to demand the assignment sit
+  // inside `whenReady` and before the server import, on the theory that
+  // `app.getVersion()` returns nothing at module load. Measured on Electron: it
+  // returns the correct version both before and after `whenReady`, so placement
+  // does not matter and the stricter rule flagged three correct apps. The real
+  // incident was simply an older build installed over a newer fix.
+  const readsEnvVersion = sourceFilesMatching(
+    dir,
+    /process\.env\.(?:APP_VERSION|npm_package_version)/,
+  ).filter((f) => !/electron\//.test(f));
+  if (readsEnvVersion.length > 0 && sourceFilesMatching(dir, /process\.env\.APP_VERSION\s*=/).length === 0) {
+    findings.push(
+      `${readsEnvVersion[0]} reads the version from the environment, but nothing sets process.env.APP_VERSION — ` +
+        `in a packaged app npm_package_version is unset, so this reports "development" from a real build. ` +
+        `Set it in the Electron main: process.env.APP_VERSION = app.getVersion() ` +
+        `(project-standards § Diagnostics Logging)`,
+    );
+  }
+
   // If the app ships a CSP, connect-src must permit the update host.
   //
   // One app shipped DMGs whose banner could never fire: its index.html carried

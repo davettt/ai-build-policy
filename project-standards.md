@@ -808,6 +808,12 @@ Once a DMG is on a user's machine you are blind — unless the app logs.
 - Log operational events and errors — **never** user content, API keys, or request/response bodies.
 - An "Export diagnostics" menu item that zips the logs for the user to email support. This is the privacy-respecting alternative to crash telemetry (which stays a deliberate per-app product decision). Label it to fit the surface: "Diagnostics" in a narrow modal, "Export diagnostics…" in a menu. `check` matches the capability (the word near something that actually writes a file), not the wording.
 
+**The bundle must state the real version.** A diagnostics export reported `App version: development`. The chain was `process.env.npm_package_version ?? process.env.APP_VERSION ?? 'development'`, and nothing set either: `npm_package_version` exists only when npm launched the process, so it is present under `npm run` and absent in a packaged app. Set it in the Electron main — `process.env.APP_VERSION = app.getVersion()` — and `check` FAILs when something reads the version from the environment and nothing assigns it.
+
+Placement does not matter, despite appearances. `app.getVersion()` returns the correct value both before and after `app.whenReady()` (measured), so a module-top-level assignment is fine. A check demanding it sit inside `whenReady` was written on the opposite assumption and flagged three correct apps before being reverted.
+
+The incident that prompted this turned out to be an older build installed over a newer fix: the shipped DMG contained the assignment, the copy in /Applications did not. When diagnostics reports the wrong version, confirm which build is actually running before changing code.
+
 **A leak test is mandatory wherever diagnostics can be exported.** `check` FAILs an app that has the feature without one. The bundle is a file the user emails out, and these apps hold customer records, personal journals and BYOK keys. The failure mode is silent: the user sends it, and neither party knows what was inside.
 
 Two designs, and the difference matters. A payload built from an **allowlist** of named fields (version, platform, schema version, error counts) cannot leak, because nothing unlisted can appear. A payload that **dumps log files** is more useful for debugging but is only as safe as every `log.*` call site, forever. One careless `log.info('saved', { entry })` and the promise printed at the top of the bundle becomes false. Dumping logs is allowed; carrying that risk untested is not.
