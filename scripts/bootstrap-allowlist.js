@@ -75,18 +75,42 @@ async function main() {
     const publisher = (registry.maintainers || [])[0]?.name || 'unknown';
     const weeklyDownloads = downloads?.downloads || 0;
 
+    const latest = registry['dist-tags']?.latest;
+    const timeData = registry.time || {};
+    const latestPublishDate = latest && timeData[latest] ? timeData[latest] : null;
+    const lastPubDate = latestPublishDate ? latestPublishDate.split('T')[0] : null;
+    const deprecated =
+      latest && registry.versions && registry.versions[latest]
+        ? registry.versions[latest].deprecated || null
+        : null;
+
+    let maintenance = 'maintained';
+    if (deprecated) {
+      maintenance = 'deprecated';
+    } else if (latestPublishDate) {
+      const days = Math.floor((Date.now() - new Date(latestPublishDate)) / 86400000);
+      if (days > 540) maintenance = 'dormant';
+    }
+
     const entry = {
       repo: cleanRepo || 'UNKNOWN',
       publisher,
       weeklyDownloads,
       versions,
       verified: new Date().toISOString().split('T')[0],
+      lastPublished: lastPubDate,
+      repoArchived: false,
+      maintenance,
+      successor: deprecated || null,
+      notes: '',
     };
 
     const issueList = [];
     if (versions <= 1) issueList.push('single version');
     if (weeklyDownloads < 100) issueList.push('very low downloads');
     if (!cleanRepo) issueList.push('no repo URL');
+    if (maintenance === 'deprecated') issueList.push('deprecated');
+    if (maintenance === 'dormant') issueList.push('dormant (18+ months since last publish)');
 
     if (issueList.length > 0) {
       console.log(`FLAGGED (${issueList.join(', ')})`);

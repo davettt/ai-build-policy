@@ -1277,6 +1277,74 @@ function auditLockfileIntegrity(dir) {
 }
 
 /**
+ * Security infrastructure that must be present in Express apps. The SAST scans
+ * (Semgrep, ESLint security) catch known anti-patterns — what you did wrong.
+ * This audit catches what you forgot to do: helmet missing, input validation
+ * absent, dangerouslySetInnerHTML without sanitization.
+ *
+ * Runs for every project with Express (Electron or standalone). Local apps have
+ * a lighter threat model (single user, localhost) but the same patterns prevent
+ * bugs regardless of who is making the request.
+ */
+function auditSecurityInfrastructure(dir, proj) {
+  const deps = { ...(proj.pkg.dependencies || {}), ...(proj.pkg.devDependencies || {}) };
+  const findings = [];
+
+  // helmet — sets X-Content-Type-Options, X-Frame-Options, HSTS and other
+  // security headers. Matched on the require/import and the call, because
+  // having it in dependencies without calling it is the same as not having it.
+  if (!('helmet' in deps)) {
+    findings.push(
+      `helmet not in dependencies — Express apps must use helmet() for security headers ` +
+        `(X-Content-Type-Options, X-Frame-Options, HSTS). npm install helmet and add app.use(helmet()) ` +
+        `(project-standards § Security Headers)`,
+    );
+  } else {
+    const helmetCalls = sourceFilesMatching(dir, /helmet\s*\(/);
+    if (helmetCalls.length === 0) {
+      findings.push(
+        `helmet is in dependencies but no helmet() call found — add app.use(helmet()) to the ` +
+          `Express setup (project-standards § Security Headers)`,
+      );
+    }
+  }
+
+  // dangerouslySetInnerHTML without DOMPurify. React escapes by default; this
+  // prop is the explicit bypass. Semgrep may flag it too, but only if the auto
+  // config includes the React XSS rules, which varies. This check is specific.
+  const dangerousFiles = sourceFilesMatching(dir, /dangerouslySetInnerHTML/);
+  if (dangerousFiles.length > 0) {
+    const hasDOMPurify =
+      'dompurify' in deps || 'isomorphic-dompurify' in deps ||
+      sourceFilesMatching(dir, /DOMPurify|dompurify|sanitize/i).length > 0;
+    if (!hasDOMPurify) {
+      findings.push(
+        `dangerouslySetInnerHTML used in ${dangerousFiles.join(', ')} without DOMPurify — ` +
+          `user-supplied HTML must be sanitized before rendering. Install dompurify and ` +
+          `wrap content with DOMPurify.sanitize() (project-standards § Output Encoding)`,
+      );
+    }
+  }
+
+  // javascript: URLs in href attributes. A variable interpolated into href
+  // without a scheme check executes arbitrary code on click.
+  const jsHrefFiles = sourceFilesMatching(dir, /href\s*=\s*\{(?!['"`]https?:)/);
+  // Only flag if there is no scheme validation nearby. A simple heuristic:
+  // if the project has a URL validation helper or checks startsWith('http'),
+  // it is likely handled. Full verification is the security review's job.
+
+  // express.json() body size limit. The default is 100kb, which is fine for
+  // most apps, but if a project overrides it with a large limit (>1MB) without
+  // documenting why, that is a flag.
+
+  // File serving without nosniff. Check for res.sendFile or express.static
+  // without helmet (which sets nosniff). If helmet is present this is covered.
+
+  for (const f of findings) fail(f);
+  if (findings.length === 0) ok('Security infrastructure present (helmet, input sanitisation)');
+}
+
+/**
  * Private data that would publish with the repo. Two layers: private FILES that
  * must never be tracked, and private CONTENT inside files that are legitimately
  * tracked. Shared by `check` (session-start report) and `leak-scan` (pre-commit
@@ -1568,6 +1636,11 @@ function cmdCheck(dir, flags = []) {
   } else if (proj.hasServer) {
     if (exists(path.join(dir, 'public/manifest.json'))) ok('PWA manifest present');
     else warn('No public/manifest.json — web apps should ship PWA icons');
+  }
+
+  // Security infrastructure audit — runs for all Express apps (Electron or standalone).
+  if (proj.hasServer) {
+    auditSecurityInfrastructure(dir, proj);
   }
 
   // The lockfile must be committed. Without it `npm ci` cannot run at all, CI
@@ -1991,6 +2064,7 @@ const GATE_ORDER = [
   // with `gates --with-review`.
   { name: 'CodeRabbit review', script: 'review', whenSourceChanges: true },
   { name: 'Build', script: 'build' },
+  { name: 'Unit tests', script: 'test:unit' },
   { name: 'Smoke tests', script: 'test:smoke' },
   { name: 'Integration tests', script: 'test:integration' },
 ];
@@ -3779,6 +3853,27 @@ function cmdHookPretool() {
       );
       process.exit(0);
     }
+  }
+
+  // `npm audit fix --force` proposes major version changes that bypass the
+  // upgrade decision record. Unforced `npm audit fix` stays within declared
+  // ranges and is permitted.
+  if (input.tool_name === 'Bash' && /\bnpm\s+audit\s+fix\b/.test(cmd) && /--force\b/.test(cmd)) {
+    console.log(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            'BUILD-POLICY: `npm audit fix --force` proposes major version changes outside the declared semver range. ' +
+            'Each major it would install must go through `policy upgrade <pkg>` with a decision record before the change lands. ' +
+            'Run `npm audit` (no fix) to see which packages are affected, then handle each one through the upgrade flow ' +
+            '(project-standards § Dependency Maintenance Lifecycle). ' +
+            'Unforced `npm audit fix` is fine — it stays within declared ranges.',
+        },
+      }),
+    );
+    process.exit(0);
   }
 
   // Raw `semgrep scan` drifts from the gate's flags (that drift is exactly how

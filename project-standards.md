@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.34
-**Last updated:** 2026-09-13
+**Version:** 2.36
+**Last updated:** 2026-09-19
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -255,6 +255,43 @@ Note the site-wide CORS rule is dashboard configuration, outside version control
 - **Diagnostics:** structured local logging + "Export diagnostics" — see § Diagnostics Logging.
 - **Privacy disclosure:** BYOK apps send user content to the configured AI provider — state this consistently in the app's settings UI, README/listing, and the site's terms page. No commercial release without the disclosure in place.
 - **Both providers, not one.** A BYOK app must wire up Anthropic *and* OpenAI. Supporting one makes an account with that vendor a condition of using the app, which is a purchase barrier rather than a preference: a buyer who already pays OpenAI should not need a second vendor relationship to open something they bought. `check` FAILs an Electron project that calls one provider and not the other, matching on the SDK import or API host rather than the vendor's name, since settings copy, type unions and stale-key migrations mention providers an app never calls. Apps with no AI at all are not flagged. The reference shape is a `MODELS` map keyed by provider with per-provider stored keys and a per-provider validation path.
+
+### External State Must Be Subscribed, Not Polled Once
+
+Anything controlled outside React (system appearance, window focus, online version metadata, calendar date) needs an event listener or scheduled recheck. Reading it once at mount and never again leads to hard-refresh symptoms: the value is stale, a reload fixes it, and the user learns to distrust the app.
+
+**Two failures that both shipped:**
+
+One app read `window.matchMedia('(prefers-color-scheme: dark)').matches` once in a `useState` initialiser. Switching macOS appearance did nothing until the user quit and reopened. Another fetched `version.json` once on mount; if the site was updated while the app was open, the banner never appeared until the next launch. For an Electron app that stays in the dock, that could be days.
+
+**System appearance (dark/light mode):**
+
+The correct pattern is a `useEffect` that attaches a `change` listener to the media query:
+
+```tsx
+useEffect(() => {
+  const media = window.matchMedia('(prefers-color-scheme: dark)');
+  const handle = (e: MediaQueryListEvent) => setIsDark(e.matches);
+  media.addEventListener('change', handle);
+  return () => media.removeEventListener('change', handle);
+}, []);
+```
+
+Pure CSS `@media (prefers-color-scheme: dark)` updates automatically and needs no listener. Prefer it for anything expressible in CSS. The listener is needed only when JavaScript must know the theme (conditional rendering, chart colours, canvas drawing).
+
+An app that sets a fixed class or `color-scheme` on `<html>` at startup and never updates it overrides the media query for every descendant, so CSS-only dark mode also breaks. If the app supports manual theme override, the "system" option must re-attach the listener.
+
+**Update banner (version check):**
+
+The version fetch should recheck periodically while the app is open, not only on mount. A `setInterval` of 30-60 minutes is enough. The CDN cache-buster (`?t=${Date.now()}`) handles caching, but the fetch has to actually run. Clear the interval on unmount.
+
+**General principle:** for any value sourced from outside the React tree, ask: "if this changes while the app is open, will the UI reflect it?" If the answer is "only after a restart", add a listener or a recheck interval. This applies to:
+
+- System appearance (`matchMedia`)
+- Version metadata (periodic refetch)
+- Window focus/blur (`visibilitychange` or `focus`/`blur` events)
+- Network status (`navigator.onLine` + `online`/`offline` events)
+- System locale changes (rare, but `languagechange` event exists)
 
 **DMG Build, Code Signing & Notarization:**
 
@@ -708,15 +745,67 @@ Keep minimal:
 
 ## Security
 
-- No secrets in code
-- Validate all user input (use Zod schemas on API endpoints)
-- Rate limiting on public/expensive endpoints
-- Rate limiting + lockout on auth endpoints (e.g. 5 failed attempts)
-- CORS restricted to app domain (not wildcard), regex must be anchored (e.g. `/^https?:\/\/localhost(:\d+)?$/` not `/localhost/`)
-- Content Security Policy headers on cloud apps
-- Return generic error messages to clients — log details server-side only (no stack traces, DB names, or internals in responses)
-- `npm audit` / security check required before every commit
-- No high or critical vulnerabilities allowed
+Security is built in, not added after. Every input boundary validates, every output boundary encodes, and the gates enforce it. The scans (Semgrep, ESLint security plugin) catch known anti-patterns. The checks below catch what the scans cannot: infrastructure that should be present but is missing.
+
+### Security Headers (Express Apps)
+
+Every Express app must use `helmet` for HTTP security headers. `helmet()` sets `X-Content-Type-Options: nosniff`, `X-Frame-Options`, `Strict-Transport-Security`, and other defaults that prevent common attacks. `check` FAILs an Express project that does not call `helmet()`.
+
+For Electron apps serving on localhost, `helmet` still applies. The headers protect the renderer from loading unexpected content types or being framed by a malicious page if a link escapes the app.
+
+**Content Security Policy.** For cloud/SaaS apps, configure CSP through `helmet`'s `contentSecurityPolicy` option. For local Express apps, the default `helmet()` CSP is sufficient. Never set `'unsafe-inline'` or `'unsafe-eval'` in production CSP without documenting why in a code comment.
+
+### Input Validation
+
+Every value that crosses a trust boundary must be validated before use. Trust boundaries are: HTTP request bodies, query parameters, URL parameters, file uploads (covered in § File Uploads), WebSocket messages, IPC messages from the renderer in Electron apps, and clipboard data.
+
+**Server-side validation is mandatory.** Client-side validation is a convenience for the user, not a security control. Every API endpoint must validate its inputs server-side. Use Zod schemas for structured validation on Express routes. The schema defines what is accepted; everything else is rejected with a 400 and a message that names the field, not the internal structure.
+
+**Never spread request bodies onto stored objects.** `{ ...defaults, ...req.body }` allows arbitrary fields to pollute stored data. Use an `ALLOWED_FIELDS` allowlist and a `pick()` helper (covered in § Data Safety). This is field-level input validation; Zod is structural validation. Both are required.
+
+**URL and path parameters.** Route parameters used in file paths or database lookups must be validated against a strict pattern. The standard `validateParam` middleware (`^[a-zA-Z0-9_-]+$`) prevents path traversal and injection. Never pass a raw route parameter to `path.join()`, `fs.readFile()`, or a database query without validation.
+
+**Electron IPC.** Messages from the renderer to main process cross a trust boundary in Electron apps, because the renderer runs web content. Validate IPC message arguments in the main process handler the same way you would validate an HTTP request body. Never pass IPC arguments to `shell.openExternal()`, `fs` operations, or `child_process` without validation.
+
+### Output Encoding
+
+Every value that crosses an output boundary must be encoded for its context. Output boundaries are: HTML responses, JSON responses, URL construction, and file system paths.
+
+**React/JSX.** JSX escapes interpolated values by default, which prevents XSS in the common case. The exceptions that bypass this protection:
+
+- `dangerouslySetInnerHTML`: never use it with user-supplied content. If HTML rendering is required (e.g. rich text from a trusted source), sanitize with DOMPurify first. Semgrep flags unguarded use.
+- Dynamic `href` attributes: a `javascript:` URL in an `<a href>` executes when clicked. Validate that URLs start with `http://`, `https://`, or a known safe scheme before rendering. `check` FAILs a project that interpolates a variable into `href` without a scheme check in the same component.
+- Dynamic `src` attributes on `<script>`, `<iframe>`, `<embed>`, `<object>`: never set these from user input.
+
+**Vanilla JS (non-React apps).** Apps that build HTML with template literals or DOM manipulation have no automatic escaping. Every user-supplied value inserted into HTML must be escaped. Use `textContent` for text nodes, never `innerHTML` with user data. `document.createElement` + `textContent` is the safe pattern; string interpolation into HTML is not. Semgrep and ESLint security catch `innerHTML` assignments.
+
+**JSON responses.** Express's `res.json()` handles encoding. Never build JSON responses with string concatenation.
+
+**Error responses.** Return generic error messages to clients. Log the details server-side only. Never expose stack traces, database names, internal paths, or query structures in HTTP responses. This applies to both error handlers and validation failure messages (name the field, not the table).
+
+### CORS
+
+CORS is restricted to the app's own domain, never a wildcard (`*`). The origin regex must be anchored on both ends. `/localhost/` matches `evil-localhost.com`; `/^https?:\/\/localhost(:\d+)?$/` does not. `check` already verifies anchored CORS patterns in Electron apps (§ Electron).
+
+For local apps, the CORS origin should match the host the app loads from (`http://localhost:<port>` or `http://127.0.0.1:<port>`). The `will-navigate` and CORS origins must agree (covered in § Electron standards).
+
+### Rate Limiting
+
+**Local apps:** rate limiting on expensive endpoints (AI calls, export operations, file processing) prevents accidental runaway requests. A simple in-memory counter is sufficient since these are single-user apps.
+
+**Cloud/SaaS apps:** `express-rate-limit` on all public endpoints. Auth endpoints (login, signup, password reset) must have stricter limits with lockout after repeated failures (e.g. 5 failed login attempts triggers a 15-minute cooldown). Rate limit responses must return `429 Too Many Requests` with a `Retry-After` header.
+
+### CSRF Protection
+
+Local apps served on localhost are not vulnerable to CSRF in the traditional sense (same-origin policy protects them), but cloud/SaaS apps must implement CSRF tokens on state-changing endpoints. Use the `csurf` middleware or the double-submit cookie pattern.
+
+### Secrets
+
+- No secrets in code. `check` runs betterleaks/gitleaks on every commit.
+- No high or critical npm audit vulnerabilities allowed. `npm audit --audit-level=high --omit=dev` runs in the quality gate.
+- API keys encrypted at rest with AES-256-CBC and a machine-derived key (covered in § Electron).
+- `.env` is gitignored and never committed.
+- Error messages never expose secret values, API keys, or internal credentials.
 
 ### Data Safety (Local JSON Apps)
 
@@ -1025,6 +1114,103 @@ Wire `deps:check` into `npm run quality`. Dependabot PRs only bump versions of a
 
 **Bootstrap:** For existing projects, run the bootstrap script to generate the initial allowlist from current dependencies. Review the output for any flagged packages before committing.
 
+### Dependency Maintenance Lifecycle
+
+Allowlist and Socket cover whether a package is *legitimate* and *safe to install*. Neither covers whether it is *maintained*. A package can pass every supply-chain check, have clean audits, and still be abandoned, archived, or superseded by a fork. What you get is not a compromised release but a vulnerability that will never be patched.
+
+**Extended allowlist fields.** `verify-package.js` and `bootstrap-allowlist.js` record these alongside the existing fields:
+
+```json
+{
+  "html-to-docx": {
+    "repo": "https://github.com/nicksrandall/html-to-docx",
+    "publisher": "nicksrandall",
+    "weeklyDownloads": 45000,
+    "versions": 42,
+    "verified": "2026-09-14",
+    "lastPublished": "2024-03-15",
+    "repoArchived": false,
+    "maintenance": "maintained",
+    "successor": null,
+    "notes": ""
+  }
+}
+```
+
+| Field | Source | What it means |
+|---|---|---|
+| `lastPublished` | `npm view <pkg> time` (latest version's date) | When the maintainer last shipped |
+| `repoArchived` | GitHub API (`archived` field) | Whether the source repo is read-only |
+| `maintenance` | Assessed during verification and re-verification | One of: `maintained`, `dormant`, `deprecated`, `superseded` |
+| `successor` | npm deprecation message, README, or manual research | The replacement package, if one exists |
+| `notes` | Free text | Why a dormant or superseded package is kept, or migration status |
+
+**Maintenance categories:**
+
+- **maintained**: active releases within the last 18 months, or a stable API with recent issue triage (some packages are finished, not abandoned).
+- **dormant**: no release in 18+ months, repo not archived, no announced successor. Not necessarily a problem, but security patches will not come.
+- **deprecated**: npm `deprecated` flag set, or repo archived, or maintainer has announced end-of-life.
+- **superseded**: a maintained fork or successor exists and is recommended by the original maintainer or community. Migration should be planned.
+
+**Re-verification.** `policy health` re-checks the maintenance status of allowlisted packages:
+
+- Standard packages: every 180 days from their `verified` date.
+- Security-sensitive packages (parsers, converters, serializers, crypto, auth): every 90 days. Sensitivity is determined by the package's role, not its name.
+- A re-verification queries `npm view <pkg> time` for latest publish date, checks the GitHub API for archive status, and updates the allowlist entry.
+
+`check` FAILs when any allowlisted package has a `verified` date older than its review window. `health` does the network calls and updates the entries; `check` enforces the recorded state.
+
+**What triggers a migration decision:**
+
+- `maintenance` is `deprecated` or `superseded`: plan migration. The `successor` field names the target; verify it independently before adopting.
+- `maintenance` is `dormant` AND the package has unresolved high advisories: the vulnerability will not be patched upstream. Investigate forks or replacements immediately.
+- `npm audit` recommends a downgrade or reports no fix available: do not accept a downgrade as a resolution. A downgrade trades a known vulnerability for the regression risk of an older version, and "no fix" from npm means the maintainer has not acted, which is a maintenance signal.
+- `npm audit fix --force` proposes a major version change: stop. `--force` is never a solution by itself. It can introduce breaking changes, and the `--force` flag exists precisely because npm knows the change is not safe within the declared range. Any major change proposed by `--force` goes through `policy upgrade <pkg>` and its decision record, same as a deliberate major bump.
+
+**Successor/fork investigation.** When any of the above triggers fire, investigate before migrating. A fork that is newer than the original is not automatically safer. Forks inherit the original's code but not its release discipline, maintainer base, or governance. Evaluate the fork on its own merits, not by comparison with the package it replaced.
+
+**Consider whether a different approach removes the dependency entirely.** A fork keeps the same architecture and the same risk surface; a different package that solves the problem differently can eliminate both. The puppeteer → pdfmake migration is the reference case: Puppeteer downloads a ~150MB Chromium binary to render HTML to PDF, but Electron apps already are Chromium, so the dependency was architecturally redundant. pdfmake generates PDFs as pure JavaScript with no binary dependency. That was not a fork investigation but an approach change, and it removed more risk than any fork could have.
+
+Before evaluating forks, ask: does this problem have a solution that avoids the dependency class entirely? A pure-JS library over a native binary, a built-in platform API over a third-party wrapper, or a simpler data format over a complex parser. If the answer is yes, evaluate that option first.
+
+**Step 1: Identify candidates.**
+
+1. Check the npm deprecation message for a recommended successor.
+2. Check the repo README, issues, and community discussions for fork recommendations.
+3. Search npm for scoped forks (e.g. `@turbodocx/html-to-docx` forking `html-to-docx`).
+4. Search for packages that solve the same problem with a different approach (different architecture, fewer dependencies, no native binaries).
+
+**Step 2: Evaluate the candidate independently.** Run `deps:verify`, which covers the basic checks. Then assess the following, which `deps:verify` cannot measure:
+
+| Check | What to look for | Risk if absent |
+|---|---|---|
+| Maintainer count | More than one npm maintainer | Single-account compromise or bus-factor failure takes down the package |
+| Release discipline | CHANGELOG matches published versions; develop/main branch version matches npm | Stale version metadata suggests ad-hoc releases without merge-back |
+| Install scripts | No `postinstall` or `preinstall` in the published package | Install-time scripts expand supply-chain exposure; most are unnecessary |
+| CI pinning | GitHub Actions pinned by commit SHA, not floating tags (`@v5`) | Floating tags can be force-pushed by the action maintainer |
+| Publishing method | npm provenance attestation linking builds to a specific commit | Without provenance, a compromised token can publish anything |
+| Credential model | Tokenless trusted publishing (OIDC) preferred over npm token secrets | Token stored as a repo secret can be exfiltrated by a malicious PR |
+| Claims vs evidence | Marketing claims ("production battle-tested") substantiated by tests, users, or ecosystem adoption | Unsubstantiated claims are noise, not assurance |
+
+A fork can pass every automated check (Socket, audit, licence) while scoring poorly on governance. Automated tools catch malicious packages; governance checks catch fragile ones.
+
+**Step 3: Controlled adoption.** Do not switch to a caret range on day one.
+
+1. Pin the exact version initially (`@turbodocx/html-to-docx@1.23.1`, not `^1.23.1`).
+2. Verify the npm provenance attestation against the tagged commit.
+3. Inspect the published tarball (`npm pack <pkg>@<version>`) and compare its bundled output with a build from that tag's source.
+4. Install with `--ignore-scripts` during evaluation if the package declares install scripts that are not needed for functionality.
+5. Run Socket scan, `npm audit`, and licence checks.
+6. Run the project's existing tests against the candidate replacement.
+7. For parsers, converters, and serializers: test malformed, malicious, and edge-case input, since document parsing is the exposed risk surface.
+8. Only widen to a version range after the first pinned version has been in production for at least one release cycle.
+
+**Step 4: Record the decision.** Write the assessment in the allowlist entry's `notes` field, including which version was evaluated and any conditions on adoption. A conditional approval (pin-only, scripts-disabled) is a valid outcome and better than either blind adoption or indefinite deferral.
+
+**`npm audit fix --force` is never unattended.** The PreToolUse hook denies `npm audit fix --force` in any Bash command. The unforced `npm audit fix` is permitted because it stays within declared ranges. When `--force` is needed, the session must run `policy upgrade <pkg>` for each major it proposes, producing a decision record per package before the change lands.
+
+**Socket remains one signal, not the final verdict.** Socket is strongest at detecting malicious packages, typosquats, and install-time supply-chain attacks. It does not assess ecosystem succession, maintainer activity, or whether a package has a maintained fork. Allowlist re-verification covers the maintenance dimension that Socket does not.
+
 ### GitHub Actions CI
 
 All projects with a GitHub repo have `.github/workflows/ci.yml`. The canonical template is `build-policy/templates/ci.yml` — `policy scaffold` installs it and `policy check` flags drift from it. **CI is the audit evidence layer**: timestamped, third-party-hosted proof that no code reached main without passing the gates.
@@ -1057,17 +1243,22 @@ GitHub Actions versions are tracked in `registry.json` with verified dates, and 
 - Track storage usage per user in database
 
 ### API & Auth
-- Never rely on frontend route guards for access control — protect every route server-side
-- Apply auth middleware at the router level (not per-route) to prevent gaps
-- Validate resource ownership server-side on every request (prevent IDOR — never trust client-supplied IDs alone)
-- Store auth tokens in httpOnly cookies, not localStorage (localStorage is readable by any script via XSS)
-- Set expiry on all JWTs — implement refresh token rotation for SaaS apps
+
+These rules apply to every Express app, local or cloud. The threat model differs (local apps have no untrusted network attacker), but the patterns prevent bugs regardless of who is on the other side of the request.
+
+- **Server-side route protection.** Auth middleware at the router level, not per-route. A missing middleware on one route is an open door; mounting it at the router makes the default secure and the exception explicit.
+- **Resource ownership validation.** Validate that the requesting user owns the resource on every request. Client-supplied IDs (route params, query params, request body) are input, not proof of ownership. This prevents IDOR (Insecure Direct Object Reference) even in single-user local apps, where the "user" is the app's own renderer making fetch calls.
+- **Auth token storage.** Store tokens in httpOnly cookies, not localStorage. localStorage is readable by any script running in the page context, so a single XSS vulnerability exfiltrates every stored token.
+- **JWT expiry.** Set expiry on all JWTs. For SaaS apps, implement refresh token rotation so a leaked token has a bounded lifetime.
+- **No frontend-only access control.** Frontend route guards (React Router `ProtectedRoute`, conditional renders) are UI convenience. They are not access control. The server must reject unauthorized requests regardless of what the client renders.
 
 ### SaaS / Cloud Apps
-- Auth token (JWT) verification on all API routes
-- Webhook signature verification (LemonSqueezy, Stripe, etc.)
-- Input validation on all endpoints (Zod schemas)
-- Subscription/access control middleware
+
+- JWT verification on all API routes, applied as middleware before handlers.
+- Webhook signature verification on all payment/subscription endpoints (LemonSqueezy, Stripe, etc.). Verify the signature before parsing the body.
+- Input validation on all endpoints with Zod schemas (covered in § Input Validation).
+- Subscription/access control middleware that checks the user's plan before serving gated features.
+- HTTPS only, with HSTS headers via `helmet`.
 
 ---
 
