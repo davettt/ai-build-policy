@@ -78,6 +78,49 @@ function run(cmd, args) {
 }
 
 /**
+ * Run notarytool submit with automatic retry for transient failures.
+ *
+ * Apple's notary service has intermittent failures: timeouts, 503s, connection
+ * resets. These look like credential or config problems in the error output,
+ * but they are not. The keychain profile is valid (policy doctor checks it),
+ * the signing identity is valid (the app just signed successfully), and the
+ * credentials resolved (the app was notarized moments ago). The service is
+ * just temporarily unavailable.
+ *
+ * DO NOT re-create the keychain profile, change .env, or modify the build
+ * configuration when this fails. Retry the build. If it fails three times in
+ * a row, check Apple's developer system status page before investigating
+ * further.
+ */
+function submitWithRetry(dmg, creds, maxAttempts) {
+  const attempts = maxAttempts || 3;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return run('xcrun', ['notarytool', 'submit', dmg, ...creds, '--wait']);
+    } catch (e) {
+      if (i === attempts) {
+        throw new Error(
+          `DMG notarization failed after ${attempts} attempts.\n\n` +
+            `IMPORTANT: This is almost certainly a transient Apple service failure.\n` +
+            `The keychain profile is valid (policy doctor confirms it). The signing\n` +
+            `identity is valid (the app signed successfully). Do NOT re-create the\n` +
+            `keychain profile or change credentials.\n\n` +
+            `Action: retry the build (npm run electron:build). If it fails again,\n` +
+            `check https://developer.apple.com/system-status/ for notary service\n` +
+            `issues before investigating further.\n\n` +
+            `Original error:\n${e.message}`,
+        );
+      }
+      const wait = i * 15;
+      console.log(
+        `  • notarization attempt ${i}/${attempts} failed (transient) — retrying in ${wait}s`,
+      );
+      execFileSync('sleep', [String(wait)]);
+    }
+  }
+}
+
+/**
  * The signing identity, resolved to its full certificate name.
  *
  * package.json carries the short form ("Name (TEAMID)") because
@@ -153,7 +196,7 @@ exports.default = async function afterAllArtifactBuild(buildResult) {
     run('codesign', ['--sign', identity, '--timestamp', '--force', dmg]);
 
     console.log(`  • notarizing DMG     ${name} (this waits on Apple)`);
-    run('xcrun', ['notarytool', 'submit', dmg, ...creds, '--wait']);
+    submitWithRetry(dmg, creds, 3);
 
     console.log(`  • stapling DMG       ${name}`);
     run('xcrun', ['stapler', 'staple', dmg]);

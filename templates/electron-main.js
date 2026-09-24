@@ -14,6 +14,14 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// MANDATORY. Loopback only, everywhere: the probe below, the server's own
+// listen() (server/index.js must call listen(port, '127.0.0.1', ...)), the URL
+// the window loads, and the origin the guards compare against. The local API has
+// no authentication, so a server listening on every interface is readable and
+// writable by anyone on the same Wi-Fi. `check` FAILs a listen() without a
+// loopback host (project-standards § Network Exposure).
+const HOST = '127.0.0.1';
+
 // MANDATORY. Bind to port 0, let the OS assign a free port, release it, then
 // hand it to the server. A hardcoded port collides with the PM2 dev instance or
 // any other local server, which silently connects the app to the wrong process
@@ -21,7 +29,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 function findFreePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
-    server.listen(0, () => {
+    server.listen(0, HOST, () => {
       const port = server.address().port;
       server.close(() => resolve(port));
     });
@@ -33,7 +41,7 @@ function waitForServer(port, maxAttempts = 30) {
   return new Promise((resolve, reject) => {
     let attempts = 0;
     const tick = () => {
-      const socket = net.connect(port, '127.0.0.1');
+      const socket = net.connect(port, HOST);
       socket.on('connect', () => {
         socket.end();
         resolve();
@@ -45,6 +53,75 @@ function waitForServer(port, maxAttempts = 30) {
       });
     };
     tick();
+  });
+}
+
+// MANDATORY. Origin test by parsed origin, never by string prefix:
+// url.startsWith(serverOrigin) also accepts http://127.0.0.1:<port>.evil.com,
+// which would then load inside an app window.
+function isAppUrl(url, serverOrigin) {
+  try {
+    return new URL(url).origin === serverOrigin;
+  } catch {
+    return false;
+  }
+}
+
+// MANDATORY. Only web and mail links leave the app. shell.openExternal hands
+// any scheme to the OS (file:, smb:, custom URL handlers), and many of these
+// apps store URLs the user typed in, so this is the only filter they pass.
+function openExternalSafely(url) {
+  try {
+    const { protocol } = new URL(url);
+    if (protocol === 'https:' || protocol === 'http:' || protocol === 'mailto:') {
+      shell.openExternal(url);
+    }
+  } catch {
+    // Unparseable URL: ignore.
+  }
+}
+
+// External links go to the user's real browser, never to an Electron window.
+// MANDATORY. Without these handlers Electron's default takes over and a
+// target="_blank" link opens a new BrowserWindow: a Chromium window with no
+// address bar, no back button, no bookmarks and no session shared with the
+// browser the user actually uses.
+//
+// setWindowOpenHandler catches target="_blank" and window.open; will-navigate
+// catches a plain in-page link that would otherwise replace the app's UI with a
+// web page. Same-origin content (e.g. /api/licenses) opens in its own closable
+// window, and that child gets the same guards via did-create-window — a child
+// without them is a window that can navigate anywhere. If the app never needs a
+// child window, deny them all instead.
+function guardNavigation(contents, serverOrigin) {
+  contents.setWindowOpenHandler(({ url }) => {
+    if (isAppUrl(url, serverOrigin)) {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 800,
+          height: 700,
+          minWidth: 480,
+          webPreferences: { nodeIntegration: false, contextIsolation: true },
+        },
+      };
+    }
+    openExternalSafely(url);
+    return { action: 'deny' };
+  });
+
+  contents.on('did-create-window', (child) => {
+    guardNavigation(child.webContents, serverOrigin);
+  });
+
+  contents.on('will-navigate', (event, url) => {
+    if (!isAppUrl(url, serverOrigin)) {
+      event.preventDefault();
+      openExternalSafely(url);
+    }
+    // Same-origin navigation proceeds, which is right for the app's own routes
+    // and wrong for a link to something like /api/licenses: give such links
+    // target="_blank" so they get a closable window.
   });
 }
 
@@ -86,38 +163,10 @@ async function createWindow() {
   // /api/licenses would be handed to the user's browser as
   // http://127.0.0.1:55714/api/licenses — a random port on localhost, showing
   // raw text, dead the moment the app quits. App content belongs in the app.
-  const serverOrigin = `http://127.0.0.1:${port}`;
+  const serverOrigin = `http://${HOST}:${port}`;
+  guardNavigation(win.webContents, serverOrigin);
 
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    // Same-origin content opens in its own window, with overrides so it is a
-    // real window the user can close. A bare `action: 'allow'` is not enough:
-    // whatever the user opens has to be dismissible, or they are left staring
-    // at a text file with no way back to the app. Anything reached from a link
-    // needs an exit.
-    if (url.startsWith(serverOrigin)) {
-      return {
-        action: 'allow',
-        overrideBrowserWindowOptions: { width: 800, height: 700, minWidth: 480 },
-      };
-    }
-    shell.openExternal(url);
-    return { action: 'deny' };
-  });
-
-  win.webContents.on('will-navigate', (event, url) => {
-    if (!url.startsWith(serverOrigin)) {
-      event.preventDefault();
-      shell.openExternal(url);
-    }
-    // Same-origin navigation is allowed to proceed, which is right for the
-    // app's own routes. It is wrong for a link to something like
-    // /api/licenses: the main window navigates away from the app UI to a text
-    // file with no back button, and the user is stuck. Give such links
-    // target="_blank" so they take the handler above and get a closable
-    // window, or render the content in the app behind a close control.
-  });
-
-  win.loadURL(`http://127.0.0.1:${port}`);
+  win.loadURL(serverOrigin);
 }
 
 app.whenReady().then(createWindow);

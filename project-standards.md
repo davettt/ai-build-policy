@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.36
-**Last updated:** 2026-09-19
+**Version:** 2.38
+**Last updated:** 2026-09-24
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -195,7 +195,7 @@ Checklist of what "done" looks like.
   Revisit if the stored value ever becomes something other than a user's own API key.
 
 - **Native modules** (e.g. better-sqlite3): add `"postinstall": "npx @electron/rebuild -f -w <module>"` and `"asarUnpack": ["**/*.node"]` in electron-builder config.
-- **The running version is visible without an update being available.** A user filing a bug report needs to answer "which version are you on?". In 5 of 11 Electron apps here the only place the version appeared was the update banner, which shows solely on a mismatch. macOS does expose it through About and Finder's Get Info, but that is a per-app menu a project can replace, and "click the app name in the menu bar" is a poor instruction to give the same way across every app.
+- **The running version is visible without an update being available.** A user filing a bug report needs to answer "which version are you on?". If the only place the version appears is the update banner, it shows solely on a mismatch. macOS does expose it through About and Finder's Get Info, but that is a per-app menu a project can replace, and "click the app name in the menu bar" is a poor instruction to give the same way across every app.
 
   **Required:** the settings surface carries a footer line naming the app and version — `<App Name> v2.0.2`. Settings is the mandate because every app has one, it has room for the full string, and one consistent instruction ("open Settings, scroll to the bottom") then works everywhere, which is the whole point for support.
 
@@ -245,8 +245,8 @@ Note the site-wide CORS rule is dashboard configuration, outside version control
   **One entry per shipped release, covering everything since the previous shipped release.** Versions that were built but never shipped do not get entries. If 1.5.6 is the last release and 1.5.9 is going out, that is a single `1.5.9` entry covering 1.5.7 through 1.5.9 as one bullet list, not three entries. A git tag marks a release, so tags and changelog entries should correspond.
 
   **Written for customers, not mirrored from the repo `CHANGELOG.md`.** The repo changelog is a development record: per-version, detailed, and it names internal tooling, scripts and file paths. The public entry states user-visible impact in plain language, and bundles internal work into one "under the hood" line or omits it. Do not reveal implementation detail that only helps someone probing the app.
-- **Site-side, checked when `policy check` runs in the marketing-site repo:** every app directory publishing a `version.json` must have a `changelog/index.html`, that page must link to the store so a customer sent there by the banner can actually download, and the `url` field in `version.json` must be that changelog page. These are obligations rather than tidiness because the far end of the link lives in software already on customers' machines and cannot be fixed there.
-- **No in-app license gate** — the store download is the gate (matches all shipping apps). An activation check puts a network dependency in the startup path, burns an activation on every validation, and needs somewhere to store the key.
+- **Site-side, checked when `policy check` runs in the marketing-site repo:** every app directory publishing a `version.json` must have a `changelog/index.html`, that page must link to the store so a customer sent there by the banner can actually download, and the `url` field in `version.json` must be that changelog page. These are obligations rather than tidiness because the far end of the link lives in software already installed and cannot be fixed there.
+- **No in-app license gate** — the store download is the gate. An activation check puts a network dependency in the startup path, burns an activation on every validation, and needs somewhere to store the key.
 - **These four are enforced, not advisory.** `check` FAILs an Electron project that carries a puppeteer dependency, calls the store licence API, uses `safeStorage`, or has no `findFreePort()`. Matching is on imports and calls, so discussing `safeStorage` in a comment (to record that a project moved off it) does not flag.
 - **Electron itself is audited, despite being a devDependency.** The `security` script is `--omit=dev` because the gate models shipped risk and dev dependencies do not ship. Electron is the exception: electron-builder bundles it into the DMG, so Chromium is in the shipped artifact while sitting in `devDependencies`. `gates` therefore audits the full tree for Electron projects and FAILs on an Electron high or critical advisory only, leaving dev-chain advisories out of the gate. It runs in `gates` rather than `check` because it is a network call and the session-start hook has a 10 second budget. When it fires, check whether the fix is inside the declared range: if so `policy deps-update` resolves it, otherwise it needs a major upgrade decision (`policy upgrade electron`).
 - **Scaffolding a new app: never copy an existing project wholesale.** `policy scaffold` writes `electron/main.js` (with `findFreePort()`, `contextIsolation`, no `titleBarStyle`) and `server/secret-storage.js` (AES-256-CBC, machine-derived key, `enc:` prefix, plaintext migration). A freshly scaffolded app passes the Electron checks with no edits, so there is nothing to copy from another project. Where a worked example helps beyond that, the reference is named here for the specific pattern — copying a project chosen for being nearby is how a one-off divergence becomes a convention.
@@ -339,7 +339,7 @@ Legacy projects using `APPLE_ID`/`APPLE_TEAM_ID`/`APPLE_APP_SPECIFIC_PASSWORD` i
 }
 ```
 
-**`mac.notarize` covers the app, not the DMG. Both are required.** electron-builder submits and staples the `.app`, then packages that stapled app into a disk image afterwards, and never submits the container itself. Every DMG built this way is unsigned: `codesign` reports "code object is not signed at all" and `spctl` "no usable signature" on the DMG, while the app inside verifies as "Notarized Developer ID". Checked across four shipping apps here and identical in all of them, so it is a builder default rather than a per-project mistake.
+**`mac.notarize` covers the app, not the DMG. Both are required.** electron-builder submits and staples the `.app`, then packages that stapled app into a disk image afterwards, and never submits the container itself. Every DMG built this way is unsigned: `codesign` reports "code object is not signed at all" and `spctl` "no usable signature" on the DMG, while the app inside verifies as "Notarized Developer ID". It is a builder default rather than a per-project mistake.
 
 It is easy to miss because a stapled app is approved however it arrives. Dragging the app to Applications works, and installs succeed. The gap is at *download* time: Gatekeeper evaluates the quarantined disk image when it is opened, before the app inside is reachable, and an unsigned container is the case that produces "Apple cannot check it for malicious software".
 
@@ -381,7 +381,7 @@ Icon: `build/icon.png` (512x512 PNG). electron-builder converts to `.icns` autom
 - Prefer the fast tier (Haiku) for app AI features; use the smart tier only when the task requires it
 - Implement caching to reduce API costs
 - Rate limiting on expensive endpoints
-- **Model IDs — the source of truth is `build-policy/registry.json`.** Never invent IDs; copy from the registry (which mirrors the shipping apps). Each registry entry carries a `verified` date; `policy health`/`check` flag entries past their review window — when flagged, web-search the current models, update the registry and every shipping app consistently. Don't ship stale IDs.
+- **Model IDs — the source of truth is `build-policy/registry.json`.** Never invent IDs; copy from the registry. Each registry entry carries a `verified` date; `policy health`/`check` flag entries past their review window — when flagged, web-search the current models, update the registry and every shipping app consistently. Don't ship stale IDs.
 - **Model entries review every 60 days, not the registry default of 90.** Model families now turn over faster than a quarter, and a stale entry costs more than an out-of-date name: Sonnet 5 superseded Sonnet 4.6 at a *lower* price ($2/$10 per MTok against $3/$15), so sitting on the old ID meant paying more for less. Each model entry records its price at verification, so a review can answer "is the newer one cheaper" without researching the model it replaced. Compare price as well as capability, and in both directions — a newer model is not automatically dearer.
 
 ---
@@ -755,6 +755,21 @@ For Electron apps serving on localhost, `helmet` still applies. The headers prot
 
 **Content Security Policy.** For cloud/SaaS apps, configure CSP through `helmet`'s `contentSecurityPolicy` option. For local Express apps, the default `helmet()` CSP is sufficient. Never set `'unsafe-inline'` or `'unsafe-eval'` in production CSP without documenting why in a code comment.
 
+### Network Exposure (Local Servers)
+
+A local app's Express server usually has no authentication, because its only client is meant to be the app's own window. So the server itself has to make sure that window is its only client. That takes three layers, and `check` FAILs each one separately:
+
+1. **Bind to loopback: `app.listen(port, '127.0.0.1', ...)`.** Leaving out the host makes Node listen on every interface, which makes the API reachable from the local network, not just from this Mac. A mode switch such as `IS_ELECTRON ? '127.0.0.1' : undefined` counts as the same failure: it leaves the server reachable in exactly the mode that runs all the time. Bind unconditionally. `process.env.HOST || '127.0.0.1'` is acceptable. Port-0 probes (`findFreePort`) are exempt, and should bind `127.0.0.1` anyway. Use `127.0.0.1` in the Electron main, the test runner and the Vite proxy (`changeOrigin: true`), not `localhost`: Node can resolve `localhost` to `::1`, which a `127.0.0.1` listener refuses.
+2. **Check the Host header.** Loopback binding doesn't stop DNS rebinding. A website re-resolves its own domain to `127.0.0.1` and reads the API through the user's own browser, which is on the same machine. That request still carries the attacker's hostname, so reject any request whose `Host` isn't `127.0.0.1:<port>` or `localhost:<port>` with a 403, before any route runs.
+3. **Exact-origin CORS.** Allow only `http://127.0.0.1:<port>` and `http://localhost:<port>`. `cors()` with no options, `origin: '*'` and `origin: true` accept every website. A regex that matches `localhost` on any port accepts every other local dev server's page.
+
+Electron link handling belongs to the same boundary. The window's origin test must compare `new URL(url).origin === serverOrigin`, not `url.startsWith(serverOrigin)`, because a prefix test also accepts `http://127.0.0.1:<port>.evil.com`. `shell.openExternal` must only receive `https:`, `http:` and `mailto:` URLs, since it passes any other scheme (file:, smb:, custom handlers) to the OS. Many of these apps store URLs the user typed in, so that filter is the only one those URLs pass. Same-origin child windows get the same guards, via `did-create-window`, or are denied outright. `templates/electron-main.js` implements all of this, and `check` FAILs the prefix test and an unfiltered `openExternal`.
+
+The macOS firewall is not a substitute. It ships switched off, and when it's on, "Automatically allow downloaded signed software" is enabled by default, which covers every signed app. The app has to protect itself.
+
+**Tests.** Every server has an integration test that sends a foreign `Host` (a raw `http.request`, since `fetch` can't override `Host`) and asserts a 403. It also sends a request with `Origin: http://localhost:9999` and asserts there's no `Access-Control-Allow-Origin` header.
+
+
 ### Input Validation
 
 Every value that crosses a trust boundary must be validated before use. Trust boundaries are: HTTP request bodies, query parameters, URL parameters, file uploads (covered in § File Uploads), WebSocket messages, IPC messages from the renderer in Electron apps, and clipboard data.
@@ -785,9 +800,9 @@ Every value that crosses an output boundary must be encoded for its context. Out
 
 ### CORS
 
-CORS is restricted to the app's own domain, never a wildcard (`*`). The origin regex must be anchored on both ends. `/localhost/` matches `evil-localhost.com`; `/^https?:\/\/localhost(:\d+)?$/` does not. `check` already verifies anchored CORS patterns in Electron apps (§ Electron).
+CORS is restricted to the app's own origin, never a wildcard (`*`). For cloud apps, any origin regex must be anchored on both ends: `/localhost/` matches `evil-localhost.com`.
 
-For local apps, the CORS origin should match the host the app loads from (`http://localhost:<port>` or `http://127.0.0.1:<port>`). The `will-navigate` and CORS origins must agree (covered in § Electron standards).
+For local apps, list the exact origins the app loads from (`http://127.0.0.1:<port>` and `http://localhost:<port>`), not a regex. The earlier advice here, `/^https?:\/\/localhost(:\d+)?$/`, is anchored but accepts **any** port, so any other local dev server's page can read the API. `check` now FAILs it (§ Network Exposure). The `will-navigate` and CORS origins must agree (covered in § Electron standards).
 
 ### Rate Limiting
 
@@ -903,7 +918,7 @@ Placement does not matter, despite appearances. `app.getVersion()` returns the c
 
 The incident that prompted this turned out to be an older build installed over a newer fix: the shipped DMG contained the assignment, the copy in /Applications did not. When diagnostics reports the wrong version, confirm which build is actually running before changing code.
 
-**A leak test is mandatory wherever diagnostics can be exported.** `check` FAILs an app that has the feature without one. The bundle is a file the user emails out, and these apps hold customer records, personal journals and BYOK keys. The failure mode is silent: the user sends it, and neither party knows what was inside.
+**A leak test is mandatory wherever diagnostics can be exported.** `check` FAILs an app that has the feature without one. The bundle is a file the user emails out, and an app can hold personal data and API keys. The failure mode is silent: the user sends it, and neither party knows what was inside.
 
 Two designs, and the difference matters. A payload built from an **allowlist** of named fields (version, platform, schema version, error counts) cannot leak, because nothing unlisted can appear. A payload that **dumps log files** is more useful for debugging but is only as safe as every `log.*` call site, forever. One careless `log.info('saved', { entry })` and the promise printed at the top of the bundle becomes false. Dumping logs is allowed; carrying that risk untested is not.
 

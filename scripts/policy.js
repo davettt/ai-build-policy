@@ -39,6 +39,9 @@
  *   hook-pretool        PreToolUse hook: block electron:build on a dirty tree;
  *                         redirect raw `semgrep scan` to `npm run sast`;
  *                         nudge search/survey commands toward delegation
+ *   hook-posttool       PostToolUse/PostToolUseFailure hook: when a DMG build's
+ *                         notarization cannot reach the keychain profile from the
+ *                         session, hand the build to the developer's Terminal
  */
 
 'use strict';
@@ -696,9 +699,10 @@ function auditPolicyRepo(root) {
   }
 
   const hooks = readJSON(path.join(root, 'machine/hooks.json'));
-  if (hooks && hooks.SessionStart && hooks.Stop && hooks.PreToolUse) {
-    ok('Claude hook events present: SessionStart, Stop, PreToolUse');
-  } else fail('machine/hooks.json missing one of SessionStart, Stop, PreToolUse');
+  const HOOK_EVENTS = ['SessionStart', 'Stop', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure'];
+  if (hooks && HOOK_EVENTS.every((e) => hooks[e])) {
+    ok(`Claude hook events present: ${HOOK_EVENTS.join(', ')}`);
+  } else fail(`machine/hooks.json missing one of ${HOOK_EVENTS.join(', ')}`);
 
   const preCommit = readFile(path.join(root, 'templates/pre-commit'));
   for (const needle of ['leak-scan', 'verify-marker', 'gates --fast']) {
@@ -1048,6 +1052,28 @@ function auditElectronStandards(dir, proj) {
     }
   }
 
+  // Origin tests must compare origins, not prefixes, and openExternal must only
+  // receive web/mail URLs. `url.startsWith('http://127.0.0.1:5000')` also
+  // accepts http://127.0.0.1:5000.evil.com, which then loads inside an app
+  // window; and openExternal hands any scheme (file:, smb:, custom handlers) to
+  // the OS — including URLs the user typed into the app's own records.
+  // project-standards § Network Exposure.
+  for (const f of sourceFilesMatching(dir, /setWindowOpenHandler|will-navigate/)) {
+    const src = readFile(path.join(dir, f))
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    if (/\.startsWith\(\s*(serverOrigin|appOrigin|origin|[`'"]https?:\/\/(127\.0\.0\.1|localhost))/.test(src)) {
+      findings.push(
+        `${f}: the app-origin test is a string prefix (startsWith), which also accepts http://127.0.0.1:<port>.evil.com. Compare new URL(url).origin === serverOrigin (project-standards § Network Exposure)`,
+      );
+    }
+    if (/shell\s*\.\s*openExternal\s*\(/.test(src) && !/\.protocol\b|\{\s*protocol\s*\}/.test(src)) {
+      findings.push(
+        `${f}: shell.openExternal receives any URL scheme — file:, smb: and custom handlers go straight to the OS. Allow only https:, http: and mailto: via new URL(url).protocol (project-standards § Network Exposure)`,
+      );
+    }
+  }
+
   for (const f of sourceFilesMatching(dir, /will-navigate/)) {
     const src = readFile(path.join(dir, f));
     const loaded = (src.match(/loadURL\s*\(\s*[`'"]https?:\/\/([^:/`'"]+)/) || [])[1];
@@ -1342,6 +1368,145 @@ function auditSecurityInfrastructure(dir, proj) {
 
   for (const f of findings) fail(f);
   if (findings.length === 0) ok('Security infrastructure present (helmet, input sanitisation)');
+}
+
+/**
+ * Network exposure of the local server. These apps have no authentication: the
+ * API is meant for the app's own window, so anything that can connect can read
+ * and change every record. `app.listen(port)` with no host listens on every
+ * interface, which puts that API on the LAN — anyone on the same café or office
+ * Wi-Fi could call it while the app runs (pm2 tools run all day, on fixed ports).
+ * Found 2026-09-24: 12+ projects, including a shipped Gumroad app. The macOS
+ * firewall does not cover it by default: it ships off, and when on it
+ * auto-allows signed apps. project-standards § Network Exposure.
+ *
+ * Three independent layers, each FAILed on its own:
+ *  1. listen() on loopback. Resolves `HOST`-style identifiers to their literal
+ *     in the same file; an unresolvable identifier WARNs rather than guessing.
+ *     Port-0 probes (findFreePort) are exempt: the socket closes immediately.
+ *  2. A Host-header allowlist, which is what stops DNS rebinding — loopback
+ *     binding alone does not, because the rebound request comes from the user's
+ *     own browser on the same machine.
+ *  3. CORS limited to exact origins: no wildcard, no bare cors(), no regex
+ *     accepting any localhost port (any other local dev server's page).
+ */
+const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1'];
+
+function serverSourceFiles(dir) {
+  const files = [];
+  const walk = (d) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      if (
+        ['node_modules', 'dist', 'release', 'build', 'coverage', 'tests', 'test', '__tests__'].includes(
+          e.name,
+        )
+      )
+        continue;
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (/\.(js|mjs|cjs|ts)$/.test(e.name) && !/\.(test|spec)\./.test(e.name)) files.push(full);
+    }
+  };
+  walk(dir);
+  return files;
+}
+
+function auditNetworkExposure(dir) {
+  const findings = [];
+  const warnings = [];
+  let listens = 0;
+  let hostCheck = false;
+
+  for (const full of serverSourceFiles(dir)) {
+    const rel = path.relative(dir, full);
+    const src = readFile(full);
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+
+    if (/req\.headers\.host\b|req\.headers\[['"]host['"]\]|req\.hostname\b|req\.get\(\s*['"]host['"]\s*\)/i.test(code))
+      hostCheck = true;
+
+    // .listen(<port>[, <host>][, <callback>]) — capture the first two arguments.
+    const re = /\.listen\(\s*([^,()]+?)\s*(?:,\s*([^,()]+?|\([^)]*\)\s*=>|async\s*\([^)]*\)\s*=>|function\b)\s*)?[,)]/g;
+    let m;
+    while ((m = re.exec(code))) {
+      const port = m[1].trim();
+      const second = (m[2] || '').trim();
+      if (port === '0') continue; // findFreePort probe
+      // Only Express/http servers: a port-like first argument.
+      if (!/^(\d+|[A-Za-z_$][\w$.]*(\s*\|\|\s*\d+)?)$/.test(port)) continue;
+      listens++;
+      const isCallback = !second || /=>|^function\b|^async\b|^(cb|callback|done|onListen\w*)$/.test(second);
+      if (isCallback) {
+        findings.push(
+          `${rel}: listen(${port}) has no host, so the server listens on every network interface — anyone on the same Wi-Fi can call its unauthenticated API. Use listen(port, '127.0.0.1', ...) (project-standards § Network Exposure)`,
+        );
+        continue;
+      }
+      const lit = second.match(/^['"`]([^'"`]+)['"`]$/);
+      if (lit) {
+        if (!LOOPBACK_HOSTS.includes(lit[1]))
+          findings.push(
+            `${rel}: listen(${port}, '${lit[1]}') exposes the server beyond this Mac — bind '127.0.0.1' (project-standards § Network Exposure)`,
+          );
+        continue;
+      }
+      // An identifier: find its declaration here or in another server file
+      // (e.g. `export const HOST = process.env.HOST || '127.0.0.1'` in config.js).
+      const declRe = new RegExp(
+        `(?:export\\s+)?(?:const|let|var)\\s+${second.replace(/[$.]/g, '\\$&')}\\s*=\\s*([^;\\n]+)`,
+      );
+      let expr = (code.match(declRe) || [])[1];
+      if (!expr)
+        for (const other of serverSourceFiles(dir)) {
+          expr = (readFile(other).match(declRe) || [])[1];
+          if (expr) break;
+        }
+      const literals = expr ? [...expr.matchAll(/['"`]([^'"`]+)['"`]/g)].map((x) => x[1]) : [];
+      // `IS_ELECTRON ? '127.0.0.1' : undefined` is loopback in the app and every
+      // interface under pm2 — the same exposure, in the mode that runs all day.
+      if (expr && (/\bundefined\b|\bnull\b/.test(expr) || literals.some((l) => !LOOPBACK_HOSTS.includes(l)))) {
+        findings.push(
+          `${rel}: listen(${port}, ${second}) where ${second} = ${expr.trim()} — not loopback in every mode (undefined or a non-loopback address means every interface). Bind '127.0.0.1' unconditionally (project-standards § Network Exposure)`,
+        );
+      } else if (!expr || literals.length === 0) {
+        warnings.push(
+          `${rel}: listen(${port}, ${second}) — cannot resolve '${second}' to a literal; confirm it is always '127.0.0.1' (project-standards § Network Exposure)`,
+        );
+      }
+    }
+
+    // CORS: wildcard, reflect-anything, bare cors(), or any-port localhost regex.
+    if (/\bcors\s*\(\s*\)/.test(code))
+      findings.push(
+        `${rel}: cors() with no options allows every origin — pass the app's exact origin(s) (project-standards § Network Exposure)`,
+      );
+    if (/origin\s*:\s*(?:['"]\*['"]|true\b)/.test(code))
+      findings.push(
+        `${rel}: CORS origin is a wildcard — any website can read the API. Pass the app's exact origin(s) (project-standards § Network Exposure)`,
+      );
+    if (/origin\s*:\s*\/[^/\n]*localhost[^/\n]*\(\s*:\\d\+\s*\)\??/.test(code))
+      findings.push(
+        `${rel}: CORS accepts localhost on any port — a page from any other local dev server can read this API. Use the exact origin, e.g. \`http://127.0.0.1:\${port}\` (project-standards § Network Exposure)`,
+      );
+  }
+
+  if (listens > 0 && !hostCheck) {
+    findings.push(
+      `no Host-header check — binding to 127.0.0.1 does not stop DNS rebinding, where a website re-resolves its domain to 127.0.0.1 and reads the API through the user's own browser. Reject requests whose Host is not 127.0.0.1:<port> or localhost:<port> with a 403 (project-standards § Network Exposure)`,
+    );
+  }
+
+  for (const f of findings) fail(f);
+  for (const w of warnings) warn(w);
+  if (findings.length === 0 && warnings.length === 0 && listens > 0)
+    ok('Local server bound to loopback, Host header checked, CORS exact-origin');
 }
 
 /**
@@ -1642,6 +1807,9 @@ function cmdCheck(dir, flags = []) {
   if (proj.hasServer) {
     auditSecurityInfrastructure(dir, proj);
   }
+  // Unconditional: servers also live outside server/ (monorepo apps/server,
+  // src/server). Silent when no listen() exists.
+  auditNetworkExposure(dir);
 
   // The lockfile must be committed. Without it `npm ci` cannot run at all, CI
   // resolves versions live on every push, and a peer-dependency conflict that a
@@ -3482,9 +3650,16 @@ function cmdDoctor() {
       });
       ok(`Notarization keychain profile "${profile}" valid (verified with Apple)`);
     } catch {
+      // A Claude Code session shell intermittently cannot reach the profile
+      // even though it is valid (a fresh session or the developer's Terminal
+      // can). Re-creating credentials on this warning alone is the wrong fix,
+      // so the message routes to the Terminal check first.
       warn(
-        `Notarization keychain profile "${profile}" not verifiable (missing, or offline) — ` +
-          `set up with: xcrun notarytool store-credentials ${profile} --apple-id <id> --team-id <team> --password <app-specific>`,
+        `Notarization keychain profile "${profile}" not verifiable from this shell (missing, offline, or ` +
+          `unreachable from a Claude session). Confirm in Terminal.app first: ` +
+          `xcrun notarytool history --keychain-profile ${profile} — if that lists history, the profile is fine; ` +
+          `do not re-create it. Only if Terminal also says "No Keychain password item": ` +
+          `xcrun notarytool store-credentials ${profile} --apple-id <id> --team-id <team> --password <app-specific>`,
       );
     }
   }
@@ -3585,12 +3760,56 @@ function cmdSetupMachine() {
 
 // ------------------------------------------------------------- hook modes
 
+// A DMG build invocation, shared by the pre- and post-build hooks. Matched as a
+// command word, not anywhere in the string. The bare-substring form denied
+// `grep electron-builder package.json` and any heredoc mentioning the DMG flow,
+// which is a different trade from the --ack-manual guard: there, the false
+// positives cost a doc edit and the pattern protects a signature that must
+// never be forged. Here the guard protects an ordering (gates -> commit ->
+// build), a real invocation always appears as a command word, and blocking
+// inspection of a build config makes diagnosing a broken build harder than the
+// guard is worth.
+const BUILD_INVOCATION =
+  /(?:^|[;&|(]|&&|\|\||\bnpm\s+run\s+|\bnpx\s+|\byarn\s+|\bpnpm\s+(?:run\s+)?)\s*(?:electron:build\b|electron-builder\b)/;
+
 function readStdinJSON() {
   try {
     return JSON.parse(fs.readFileSync(0, 'utf8'));
   } catch {
     return {};
   }
+}
+
+/** PostToolUse / PostToolUseFailure hook: after a DMG build whose notarization
+ *  could not reach the keychain profile, hand the build to the developer.
+ *
+ *  A Claude Code session shell intermittently cannot read the notarytool
+ *  profile even though it is valid: one app's 2026-09-18 build failed with "No
+ *  Keychain password item found", then the identical command in a fresh session
+ *  notarized twenty minutes later, and 2026-09-24's failed build notarized
+ *  first time from the developer's Terminal. Every session that met the error
+ *  diagnosed it anew and proposed re-creating credentials or unlocking the
+ *  keychain. The fix that works is to run the build outside the session, so
+ *  the hook says exactly that. Exit 2 + stderr reaches Claude on both events
+ *  (a failing build fires PostToolUseFailure; a piped `| tail` build exits 0
+ *  and fires PostToolUse). */
+function cmdHookPosttool() {
+  const input = readStdinJSON();
+  const cmd = (input.tool_input && input.tool_input.command) || '';
+  if (input.tool_name !== 'Bash' || !BUILD_INVOCATION.test(cmd)) process.exit(0);
+  const output = JSON.stringify(input.tool_response || '') + JSON.stringify(input.error || '');
+  if (!/No Keychain password item found/.test(output)) process.exit(0);
+  const dir = input.cwd || process.cwd();
+  process.stderr.write(
+    'BUILD-POLICY: notarization could not reach the keychain profile from this Claude session. ' +
+      'This is session-scoped, not a credentials problem: the same build notarizes from the ' +
+      "developer's Terminal (or a fresh session). Do NOT re-create the profile, unlock the keychain, " +
+      'edit .env, retry here, or look for another cause. Hand the build to the developer:\n' +
+      `  In Terminal.app: cd "${dir}" && npm run electron:build\n` +
+      'Ask them to report back when it prints "signed, notarized, stapled", then resume the release ' +
+      'flow at the codesign verification step (codesign --verify --deep --strict on the .app).\n',
+  );
+  process.exit(2);
 }
 
 /** Stop hook: block turn-end when source changed without a CHANGELOG update
@@ -3894,16 +4113,6 @@ function cmdHookPretool() {
     );
     process.exit(0);
   }
-  // Matched as a command word, not anywhere in the string. The bare-substring
-  // form denied `grep electron-builder package.json` and any heredoc mentioning
-  // the DMG flow, which is a different trade from the --ack-manual guard above:
-  // there, the false positives cost a doc edit and the pattern protects a
-  // signature that must never be forged. Here the guard protects an ordering
-  // (gates -> commit -> build), a real invocation always appears as a command
-  // word, and blocking inspection of a build config makes diagnosing a broken
-  // build harder than the guard is worth.
-  const BUILD_INVOCATION =
-    /(?:^|[;&|(]|&&|\|\||\bnpm\s+run\s+|\bnpx\s+|\byarn\s+|\bpnpm\s+(?:run\s+)?)\s*(?:electron:build\b|electron-builder\b)/;
   if (input.tool_name === 'Bash' && BUILD_INVOCATION.test(cmd)) {
     const dir = process.cwd();
     const deny = (reason) => {
@@ -4191,6 +4400,8 @@ function main() {
       return cmdHookStop();
     case 'hook-pretool':
       return cmdHookPretool();
+    case 'hook-posttool':
+      return cmdHookPosttool();
     default:
       console.log(readFile(__filename).match(/\/\*\*[\s\S]*?\*\//)[0]);
       process.exit(command ? 1 : 0);

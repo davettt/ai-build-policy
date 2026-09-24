@@ -35,5 +35,29 @@
         }
       ]
     }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "Bash",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node \"$HOME/path/to/build-policy/scripts/policy.js\" hook-posttool",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "PostToolUseFailure": [
+    {
+      "matcher": "Bash",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node \"$HOME/path/to/build-policy/scripts/policy.js\" hook-posttool",
+          "timeout": 10
+        }
+      ]
+    }
   ]
 }
