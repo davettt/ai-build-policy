@@ -1,6 +1,6 @@
 # Build & Development Policy
 
-**Version:** 2.49
+**Version:** 2.51
 **Last updated:** 2026-09-27
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
@@ -140,6 +140,7 @@ Root commit exception: CodeRabbit cannot review before HEAD exists, so the initi
 | Step | Enforced by |
 |---|---|
 | Dependency health: outdated, audit, Socket scan (`--socket`) | `policy health`; `check` flags every session once >30 days overdue |
+| Homebrew installs verify bottle attestations, refuse insecure redirects and require cask checksums | `~/.homebrew/brew.env` written by `setup-machine`; `doctor` FAILs a missing setting, `HOMEBREW_NO_VERIFY_ATTESTATIONS`, or a signed-out `gh`; PreToolUse refuses `brew install`/`upgrade`/`reinstall`/`bundle` while attestation checks are off |
 | Tooling currency: model IDs, action versions, tool choices re-verified on schedule | `registry.json` verified-dates; `check`/`health` flag stale entries — then web-search, update, propagate; `check` WARNs per project on AI model IDs that drift from the registry |
 | Claude responses read by content-block type, so a thinking-by-default model cannot break parsing | `check` FAILs `content[0].text` in a project that names a thinking-by-default model (Sonnet 5, Opus 5/5.5, Fable, Mythos) and WARNs on it anywhere else |
 | Dependabot PRs: minor/patch only, Socket-scanned before merge | `dependabot-reviewer` agent per branch; allowlist gate passes version-only bumps |
@@ -231,6 +232,8 @@ Only a session opened in build-policy edits the public copy. `policy mirror-sync
 
 | Version | Date | Changes |
 |---|---|---|
+| 2.51 | 2026-09-27 | Homebrew installs are verified, like npm's. `~/.homebrew/brew.env`, which Homebrew reads on every run including non-interactive shells, now sets `HOMEBREW_VERIFY_ATTESTATIONS=1` (bottle build provenance verified with `gh attestation verify`), `HOMEBREW_NO_INSECURE_REDIRECT=1` and `HOMEBREW_CASK_OPTS=--require-sha`. The attestation variable is presence-based, so `=false` also turns it on; only `HOMEBREW_NO_VERIFY_ATTESTATIONS` turns it off. Attestations cover bottles from homebrew/core and supported taps, not source builds, casks or bottles already cached. `setup-machine` merges the settings into brew.env; `doctor` FAILs when one is missing, when the off switch is set, or when `gh` is signed out; the PreToolUse hook refuses brew install, upgrade, reinstall and bundle while attestation checks are off, counting settings given on the command line. |
+| 2.50 | 2026-09-27 | Public commit messages are checked before push. `policy mirror`, which the public repo's pre-push guard runs, reads the messages of commits not yet pushed and FAILs a blocklisted name, a portfolio count, a remediation action, or incident and plan wording. |
 | 2.49 | 2026-09-27 | Desktop apps show their own icon and name in the window. project-standards § Electron Desktop Apps requires the app icon (the same artwork as `build/icon.png`) beside the product name, in the header or sidebar, on every screen, since once the window is in front the Dock icon is out of sight. `check` FAILs an Electron app whose renderer has no icon or logo image and no logo component. |
 | 2.48 | 2026-09-27 | Desktop apps with an update banner offer a manual Check for updates control beside the version line in Settings. It calls the same check as launch, focus and the hourly timer, bypasses the one-hour throttle, and reports up to date, update available or a failed check, keeping the last known state on failure. `check` FAILs an Electron app without the control and a status message, and flags a version check that runs only in the main process. The release checklist exercises the manual check after the site version changes, and a relaunch still confirms the automatic check. |
 | 2.47 | 2026-09-27 | Build-policy changes are handed off, and only a build-policy session touches the public mirror. The claim has a lifecycle in `.policy/owner.json`: editing (only the owning session writes) → handed-off → released by the developer's commit. New `policy handoff` declares the change complete; it is refused unless `check` passes and unless run by the owning session, and an app session's Stop hook blocks until it has handed off. After handoff only sessions opened in build-policy may write, to review and fix it, and only they write the public mirror at any time. New `policy mirror-sync` copies `scripts/` and `templates/`, bumps the public headers and lists the history rows still to write by hand. `policy mirror` FAILs newly added public text that says where a rule was found, a product plan, an app identified by what it does, a data-loss incident, or an API path in a history row. Bash writes are judged by their targets, following `cd` between segments. |

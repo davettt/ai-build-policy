@@ -4078,6 +4078,34 @@ function cmdMirror() {
   };
   walk(PUBLIC_ROOT);
   if (leaks === 0) ok('No blocklisted terms or private patterns found in public mirror');
+
+  // Commit messages are published too. Each change is committed in two repos
+  // with two messages, and twice the private one (with per-app counts) landed
+  // in the public repo. Checked for commits not yet pushed, so the pre-push
+  // guard stops them while `git commit --amend` can still reword them.
+  const upstream = sh('git rev-parse --abbrev-ref @{u}', PUBLIC_ROOT).ok;
+  const log = sh(`git log --format=%h%x00%B%x1e ${upstream ? '@{u}..HEAD' : '-1 HEAD'}`, PUBLIC_ROOT);
+  const messageRules = [
+    ...terms.map(({ term }) => [new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), `names "${term}"`]),
+    [/\b\d+\s+(of\s+\d+\s+)?(projects?|apps?)\b|\b\d+\s+of\s+\d+\b/i, 'a portfolio count'],
+    [/\bAction:/, 'a remediation action'],
+    [/\b(found|raised|discovered|reported)\s+(in|while|by)\b|\bwhile preparing\b|\bfor sale\b/i, 'incident or plan detail'],
+  ];
+  let badMessages = 0;
+  for (const entry of (log.ok ? log.out : '').split('\x1e').filter((e) => e.trim())) {
+    const [sha, body] = entry.trim().split('\0');
+    for (const [re, what] of messageRules) {
+      const m = (body || '').match(re);
+      if (m) {
+        fail(
+          `Public commit ${sha} message contains ${what} ("${m[0]}") — this is the private repo's message. ` +
+            `Reword before pushing: git -C ../build-policy-public commit --amend (latest commit) or an interactive rebase in a terminal`,
+        );
+        badMessages++;
+      }
+    }
+  }
+  if (badMessages === 0) ok(`Public commit messages ${upstream ? 'not yet pushed' : '(latest)'} carry no private detail`);
   return finish();
 }
 
@@ -4166,6 +4194,52 @@ function cmdMirrorSync() {
   return finish();
 }
 
+/**
+ * Homebrew install safety, the counterpart of Socket + min-release-age for npm.
+ *
+ * Settings live in brew.env, which Homebrew reads on every run, including the
+ * non-interactive shells a Claude session uses. A line in .zshrc would reach
+ * interactive shells only, the same gap the `socket npm` alias has. Verified
+ * on Homebrew 7.0.6: with HOMEBREW_VERIFY_ATTESTATIONS set, a fresh bottle
+ * download runs `gh attestation verify` and prints nothing when it passes.
+ * The variable is presence-based, so "=false" also turns it on; only
+ * HOMEBREW_NO_VERIFY_ATTESTATIONS turns it off. Attestations cover bottles
+ * from homebrew/core and supported taps, not source builds, casks or bottles
+ * already in the download cache, so casks get --require-sha.
+ */
+const BREW_REQUIRED = [
+  ['HOMEBREW_VERIFY_ATTESTATIONS', '1', 'verifies each bottle\'s build provenance with gh'],
+  ['HOMEBREW_NO_INSECURE_REDIRECT', '1', 'refuses HTTPS-to-HTTP download redirects'],
+  ['HOMEBREW_CASK_OPTS', '--require-sha', 'refuses casks without a checksum'],
+];
+
+function brewEnvFiles() {
+  const prefix = process.env.HOMEBREW_PREFIX || (exists('/opt/homebrew') ? '/opt/homebrew' : '/usr/local');
+  const user = process.env.XDG_CONFIG_HOME
+    ? path.join(process.env.XDG_CONFIG_HOME, 'homebrew', 'brew.env')
+    : path.join(os.homedir(), '.homebrew', 'brew.env');
+  return { system: '/etc/homebrew/brew.env', prefix: path.join(prefix, 'etc', 'homebrew', 'brew.env'), user };
+}
+
+/** Effective Homebrew settings from brew.env files (user over prefix over system) and the environment. */
+function brewSettings(extraEnv = {}) {
+  const f = brewEnvFiles();
+  const out = {};
+  for (const file of [f.system, f.prefix, f.user]) {
+    for (const line of readFile(file).split('\n')) {
+      const m = line.match(/^\s*(?:export\s+)?(HOMEBREW_[A-Z_]+)\s*=\s*["']?(.*?)["']?\s*$/);
+      if (m) out[m[1]] = m[2];
+    }
+  }
+  for (const [k, v] of Object.entries({ ...process.env, ...extraEnv }))
+    if (k.startsWith('HOMEBREW_') && v !== undefined) out[k] = v;
+  return out;
+}
+
+function brewAttestationsOn(settings) {
+  return Boolean(settings.HOMEBREW_VERIFY_ATTESTATIONS) && !settings.HOMEBREW_NO_VERIFY_ATTESTATIONS;
+}
+
 // ------------------------------------------------------------------ doctor
 
 function cmdDoctor() {
@@ -4220,6 +4294,20 @@ function cmdDoctor() {
   if (/^min-release-age\s*=\s*1/m.test(npmrc))
     ok('~/.npmrc min-release-age=1 (24h package quarantine)');
   else fail('~/.npmrc missing min-release-age=1');
+
+  if (sh('command -v brew', process.cwd()).ok) {
+    const bs = brewSettings();
+    const missing = BREW_REQUIRED.filter(([k, v]) =>
+      k === 'HOMEBREW_CASK_OPTS' ? !String(bs[k] || '').includes(v) : !bs[k],
+    ).map(([k]) => k);
+    if (bs.HOMEBREW_NO_VERIFY_ATTESTATIONS)
+      fail('HOMEBREW_NO_VERIFY_ATTESTATIONS is set, which turns off bottle attestation checks — remove it');
+    else if (missing.length)
+      fail(`Homebrew install safety missing from ${brewEnvFiles().user}: ${missing.join(', ')} — run: policy setup-machine`);
+    else ok('Homebrew verifies bottle attestations, refuses insecure redirects and requires cask checksums (brew.env)');
+    if (!sh('gh auth status', process.cwd()).ok)
+      fail('gh is not signed in — Homebrew uses it to verify bottle attestations, so brew installs will fail: gh auth login');
+  }
 
   const settings = readJSON(path.join(os.homedir(), '.claude', 'settings.json')) || {};
   const settingsStr = JSON.stringify(settings);
@@ -4340,6 +4428,21 @@ function cmdSetupMachine() {
     ok(`Installed public-mirror pre-push guard at ${dest}`);
   } else {
     warn(`Public mirror not found at ${PUBLIC_ROOT} — pre-push guard not installed`);
+  }
+
+  // 4b. Homebrew install safety — merge the required keys into the user
+  // brew.env, keeping anything already there.
+  if (sh('command -v brew', process.cwd()).ok) {
+    const file = brewEnvFiles().user;
+    const current = readFile(file);
+    const add = BREW_REQUIRED.filter(([k]) => !new RegExp(`^\\s*(export\\s+)?${k}\\s*=`, 'm').test(current)).map(
+      ([k, v, why]) => `# ${why}\n${k}=${v}`,
+    );
+    if (add.length) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, (current && !current.endsWith('\n') ? current + '\n' : current) + add.join('\n') + '\n');
+      ok(`Homebrew install safety written to ${file}`);
+    } else ok(`Homebrew install safety already in ${file}`);
   }
 
   // 5. Hooks — merge into settings.json, never clobber existing config
@@ -4892,6 +4995,17 @@ function cmdHookPretool() {
       }),
     );
     process.exit(0);
+  }
+  // Homebrew installs must verify bottle attestations. Read from brew.env and
+  // any HOMEBREW_* assignments on the command line itself.
+  if (input.tool_name === 'Bash' && /(?:^|[;&|(]|&&|\|\|)\s*(?:[A-Z_]+=\S*\s+)*brew\s+(?:install|upgrade|reinstall|bundle)\b/.test(cmd)) {
+    const inline = Object.fromEntries([...cmd.matchAll(/\b(HOMEBREW_[A-Z_]+)=(\S*)/g)].map((m) => [m[1], m[2] || '1']));
+    if (!brewAttestationsOn(brewSettings(inline)))
+      refuse(
+        `BUILD-POLICY: this brew command would install without verifying bottle attestations. Set it up once with ` +
+          `policy setup-machine (writes ${brewEnvFiles().user}), or for this command only: HOMEBREW_VERIFY_ATTESTATIONS=1 ${cmd.trim()}. ` +
+          `Never set HOMEBREW_NO_VERIFY_ATTESTATIONS (project-standards § Supply Chain Security).`,
+      );
   }
   // Installs must go through Socket, and the alias does not guarantee that.
   //

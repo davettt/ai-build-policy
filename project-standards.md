@@ -1,7 +1,7 @@
 # Project Standards
 
 The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
-**Version:** 2.49
+**Version:** 2.51
 **Last updated:** 2026-09-27
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
@@ -1100,6 +1100,16 @@ Because majors are manual, different sessions used to reason about the migration
 The enforcement: `auditMajorUpgrades` compares the working `package.json` against the committed one; any dependency whose **major** increased must have a matching decision record or `check`/`verify-ready` fail (pre-commit, same window as the CHANGELOG check). The record lives in `.claude/specs/deps/` — gitignored like all specs, carried between machines and sessions by file sync — and the check reads it from disk, so the next session inherits the grounded finding instead of re-deriving it.
 
 > **Anti-fabrication rule (applies to any session, any agent):** claims about a dependency's breaking changes or peer requirements must cite `npm view` output or the fetched upstream migration guide. A subagent that "researches" a migration from memory will hallucinate constraints — the same failure the verified-dates registry prevents for model IDs.
+
+### Homebrew installs
+
+Homebrew packages get the same treatment as npm. `~/.homebrew/brew.env`, which Homebrew reads on every run including non-interactive shells, sets:
+
+- `HOMEBREW_VERIFY_ATTESTATIONS=1`: each bottle's build provenance is verified with `gh attestation verify` before it is installed. It is silent when the check passes; a failure stops the install, and that failure is a finding to investigate, never something to work around. The variable is presence-based, so `=false` also turns it on; only `HOMEBREW_NO_VERIFY_ATTESTATIONS` turns it off, and that must never be set.
+- `HOMEBREW_NO_INSECURE_REDIRECT=1`: downloads may not be redirected from HTTPS to HTTP. A few source downloads hosted by SourceForge, GNU or GNOME can fail as a result.
+- `HOMEBREW_CASK_OPTS=--require-sha`: a cask without a checksum is refused, since attestations do not cover casks.
+
+Attestations also do not cover formulae built from source, or bottles already in the download cache (Homebrew skips the check for a cached download). `gh` must be signed in. `policy setup-machine` writes the file, keeping lines already in it; `policy doctor` FAILs when a setting is missing, when `HOMEBREW_NO_VERIFY_ATTESTATIONS` is set, or when `gh` is not signed in; and the PreToolUse hook refuses `brew install`, `upgrade`, `reinstall` and `bundle` while attestation checks are off, counting settings given on the command line.
 
 ### Never hand-edit package-lock.json
 
