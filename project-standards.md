@@ -1,6 +1,7 @@
 # Project Standards
 
-**Version:** 2.47
+The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
+**Version:** 2.48
 **Last updated:** 2026-09-27
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
@@ -226,6 +227,7 @@ Checklist of what "done" looks like.
   **The settings footer always states it, whether or not the banner was dismissed.** That is the persistent, quiet copy — `v1.5.6 · 1.5.9 available` linking to the same changelog page — so the user can always find out they are behind, and dismissal never buries the fact permanently.
 
   Style: minimal but obvious. One line with a single link and a close control. No modal, no colour that reads as an error, because being a version behind is not a fault.
+  **Settings also offers a manual "Check for updates" control beside the version line.** It calls the same check as launch, focus and the hourly timer, but bypasses the one-hour throttle because the user explicitly requested a fresh result. Show "Checking…", then a clear up-to-date, update-available or failed-check result. A failed or malformed response keeps the existing banner state. Keep this control in Settings rather than adding a second action to the banner. `check` verifies that a Settings control and result feedback exist; the release checklist exercises the behavior.
 **The banner must exist, and must actually be reachable.** Two failures that both shipped:
 
 One app went through several DMG releases, with a `version.json` published for it on the site, and no update check in the app at all. It passed every banner rule because every one of them was written as "if the app checks versions, then…". A rule conditional on a feature can never require that feature. `check` now FAILs an app that ships a DMG with no update check, detected on intent rather than one spelling, since the URL may come from an env var and never appear in source as a literal.

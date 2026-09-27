@@ -898,6 +898,8 @@ function auditElectronStandards(dir, proj) {
   // source file.
   let opensExternal = false;
   let versionCheck = null;
+  let rendererVersionCheck = null;
+  let manualUpdateControl = null;
   let changelogLink = false;
   const walk = (d) => {
     let entries;
@@ -918,6 +920,31 @@ function auditElectronStandards(dir, proj) {
       const src = readFile(full);
       if (/findFreePort/.test(src)) hasFindFreePort = true;
       const rel = path.relative(dir, full);
+      // Prefer the renderer fetch over a main-process check that may only send
+      // an IPC event nobody subscribes to. The banner state lives in the UI.
+      if (
+        !rendererVersionCheck &&
+        /^(src|renderer|app)\//.test(rel) &&
+        /fetch\s*\(/.test(src) &&
+        /version\.json|VERSION_CHECK_URL/.test(src)
+      ) {
+        rendererVersionCheck = rel;
+      }
+      // Static presence check; the release checklist verifies the actual
+      // request and UI feedback in the installed app.
+      if (
+        !manualUpdateControl &&
+        /settings/i.test(rel) &&
+        /Check for updates/i.test(src) &&
+        /onClick|addEventListener|onPress/.test(src) &&
+        // A status message, not the button's own label: "Check for updates"
+        // contains "check", so testing for it made this condition always true.
+        /up.to.date|is available|available:|could not|couldn't|failed|checking/i.test(
+          src.replace(/Check for updates/gi, ''),
+        )
+      ) {
+        manualUpdateControl = rel;
+      }
       for (const line of src.split('\n')) {
         const t = line.trim();
         if (t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')) continue;
@@ -939,6 +966,7 @@ function auditElectronStandards(dir, proj) {
     }
   };
   walk(dir);
+  if (rendererVersionCheck) versionCheck = rendererVersionCheck;
 
   if (licence) {
     findings.push(
@@ -1169,6 +1197,16 @@ function auditElectronStandards(dir, proj) {
   // and it must clear. A "newer than" test shows nothing in that state, so the
   // release checklist's banner step passes while exercising nothing.
   if (versionCheck) {
+    if (/^electron\//.test(versionCheck)) {
+      findings.push(
+        `${versionCheck}: the version check runs only in the Electron main process; run it in the renderer so the result directly updates and clears the banner (project-standards § Electron)`,
+      );
+    }
+    if (!manualUpdateControl) {
+      findings.push(
+        `no Settings Check for updates control with result feedback — users need a manual refresh that bypasses the hourly throttle (project-standards § Electron)`,
+      );
+    }
     // Searched in the file that does the update check, not project-wide, and
     // covering both ways an app names its running version. Getting this wrong
     // in each direction at once: a `typeof __APP_VERSION__ !== 'undefined'`
@@ -3173,7 +3211,8 @@ const RELEASE_CHECKLISTS = {
     'Installed new DMG over previous (dogfood): data migrated, settings intact, first-run + one core flow work',
     'Update banner VISIBLE in the new build (site version.json still lists the previous version)',
     'Uploaded new DMG to Gumroad, then updated site version.json + changelog + listing',
-    'Update banner CLEARED after site update (versions match; relaunch app to re-fetch)',
+    'Settings Check for updates refreshes immediately after the site update, reports up to date and clears the banner',
+    'Relaunched after the site update: the automatic check on launch also shows no banner (versions match)',
     'Release marketing drafts prepped in app-marketing',
   ],
   none: [
