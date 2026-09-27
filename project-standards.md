@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.38
-**Last updated:** 2026-09-24
+**Version:** 2.46
+**Last updated:** 2026-09-26
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -250,7 +250,7 @@ Note the site-wide CORS rule is dashboard configuration, outside version control
 - **These four are enforced, not advisory.** `check` FAILs an Electron project that carries a puppeteer dependency, calls the store licence API, uses `safeStorage`, or has no `findFreePort()`. Matching is on imports and calls, so discussing `safeStorage` in a comment (to record that a project moved off it) does not flag.
 - **Electron itself is audited, despite being a devDependency.** The `security` script is `--omit=dev` because the gate models shipped risk and dev dependencies do not ship. Electron is the exception: electron-builder bundles it into the DMG, so Chromium is in the shipped artifact while sitting in `devDependencies`. `gates` therefore audits the full tree for Electron projects and FAILs on an Electron high or critical advisory only, leaving dev-chain advisories out of the gate. It runs in `gates` rather than `check` because it is a network call and the session-start hook has a 10 second budget. When it fires, check whether the fix is inside the declared range: if so `policy deps-update` resolves it, otherwise it needs a major upgrade decision (`policy upgrade electron`).
 - **Scaffolding a new app: never copy an existing project wholesale.** `policy scaffold` writes `electron/main.js` (with `findFreePort()`, `contextIsolation`, no `titleBarStyle`) and `server/secret-storage.js` (AES-256-CBC, machine-derived key, `enc:` prefix, plaintext migration). A freshly scaffolded app passes the Electron checks with no edits, so there is nothing to copy from another project. Where a worked example helps beyond that, the reference is named here for the specific pattern — copying a project chosen for being nearby is how a one-off divergence becomes a convention.
-- **Version check:** fetch `yourdomain.com/<app>/version.json` on launch with a cache-busting param (`?t=${Date.now()}`) so CDN caching can't hide a release; show the update banner on a **simple version mismatch** (`site.version !== APP_VERSION`), not a semver "newer than" comparison. The mismatch check is deliberate (decided 2026-07-15): it needs no comparison function, and it makes banner verification self-testing at every release — install the new DMG while the site still lists the old version and the banner MUST appear (same code path a user's old app hits); update the site and it MUST clear. Cosmetic trade-off accepted: during the upload window the developer's own new build shows a banner naming the older site version — nobody else ever sees that state. The live banner is verified twice per release via the release checklist (`verify-ready --release`). Apps still on a semver comparison (e.g. a-reference-app): migrate to the mismatch check when next touched.
+- **Version check:** fetch `yourdomain.com/<app>/version.json` on launch, on window focus and hourly while open (throttled to once an hour, see § External State Must Be Subscribed), with a cache-busting param (`?t=${Date.now()}`) so CDN caching can't hide a release; show the update banner on a **simple version mismatch** (`site.version !== APP_VERSION`), not a semver "newer than" comparison. The mismatch check is deliberate (decided 2026-07-15): it needs no comparison function, and it makes banner verification self-testing at every release — install the new DMG while the site still lists the old version and the banner MUST appear (same code path a user's old app hits); update the site and it MUST clear. Cosmetic trade-off accepted: during the upload window the developer's own new build shows a banner naming the older site version — nobody else ever sees that state. The live banner is verified twice per release via the release checklist (`verify-ready --release`). Apps still on a semver comparison: migrate to the mismatch check when next touched.
 - **Data safety:** schema version + migration-on-load + pre-migration backups + downgrade guard are mandatory — see § Data Migration, Backups & Downgrade Guard.
 - **Diagnostics:** structured local logging + "Export diagnostics" — see § Diagnostics Logging.
 - **Privacy disclosure:** BYOK apps send user content to the configured AI provider — state this consistently in the app's settings UI, README/listing, and the site's terms page. No commercial release without the disclosure in place.
@@ -283,7 +283,48 @@ An app that sets a fixed class or `color-scheme` on `<html>` at startup and neve
 
 **Update banner (version check):**
 
-The version fetch should recheck periodically while the app is open, not only on mount. A `setInterval` of 30-60 minutes is enough. The CDN cache-buster (`?t=${Date.now()}`) handles caching, but the fetch has to actually run. Clear the interval on unmount.
+The version fetch must re-run while the app is open, not only on mount. Surveyed 2026-09-25: every Electron app fetched `version.json` once on mount and never again, so a customer who leaves the app in the dock (the normal way to use a Mac app) learned about a release only after quitting and relaunching, which could be days or weeks. The standard said "recheck periodically" in prose and nothing verified it, so nobody did.
+
+The pattern is **one throttled check with several triggers**, not separate mechanisms:
+
+- **Mount**, as now.
+- **Window focus and `visibilitychange`** (becoming visible), so returning to the app after a while picks up a release made in the meantime. This also covers waking from sleep, since the user has to bring the window forward to see the banner anyway.
+- **A 60-minute `setInterval`**, for a window left open in front.
+
+All three call the same function, and that function does nothing if the last check was less than `UPDATE_CHECK_INTERVAL` (60 minutes) ago. That throttle is what makes the triggers safe to overlap: switching windows a hundred times a day still makes at most one request an hour. Record the check time when the request *starts*, not when it succeeds, so a failing network cannot turn every focus event into a retry.
+
+```tsx
+const UPDATE_CHECK_INTERVAL = 60 * 60 * 1000;
+
+useEffect(() => {
+  let lastChecked = 0;
+  const check = () => {
+    if (Date.now() - lastChecked < UPDATE_CHECK_INTERVAL) return;
+    lastChecked = Date.now();
+    void fetch(`${VERSION_CHECK_URL}?t=${Date.now()}`, { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!data?.version) return; // bad response: keep whatever is showing
+        setUpdateAvailable(data.version !== APP_VERSION ? data : null);
+      })
+      .catch(() => {}); // offline: try again at the next trigger past the interval
+  };
+  const onVisible = () => document.visibilityState === 'visible' && check();
+  check();
+  window.addEventListener('focus', check);
+  document.addEventListener('visibilitychange', onVisible);
+  const timer = setInterval(check, UPDATE_CHECK_INTERVAL);
+  return () => {
+    window.removeEventListener('focus', check);
+    document.removeEventListener('visibilitychange', onVisible);
+    clearInterval(timer);
+  };
+}, []);
+```
+
+Do it in the renderer, where every app already does the check: the result lands straight in state, so there is no IPC channel to add and nothing to forget to subscribe to. If a user dismisses the banner, remember the dismissed version and hide it only for that version, so the hourly recheck does not re-show the same notice but a newer release still gets through.
+
+`check` FAILs an update check whose file has no `setInterval` or no focus/`visibilitychange` listener. Both are needed: the interval alone never fires usefully for an app the user keeps switching away from, and focus alone misses a window left open in front.
 
 **General principle:** for any value sourced from outside the React tree, ask: "if this changes while the app is open, will the UI reflect it?" If the answer is "only after a restart", add a listener or a recheck interval. This applies to:
 
@@ -381,7 +422,8 @@ Icon: `build/icon.png` (512x512 PNG). electron-builder converts to `.icns` autom
 - Prefer the fast tier (Haiku) for app AI features; use the smart tier only when the task requires it
 - Implement caching to reduce API costs
 - Rate limiting on expensive endpoints
-- **Model IDs — the source of truth is `build-policy/registry.json`.** Never invent IDs; copy from the registry. Each registry entry carries a `verified` date; `policy health`/`check` flag entries past their review window — when flagged, web-search the current models, update the registry and every shipping app consistently. Don't ship stale IDs.
+- **Model IDs — the source of truth is `build-policy/registry.json`.** Never invent tier IDs; copy from the registry into each app's active fast/smart routing and model picker. Each registry entry carries a `verified` date; `policy health`/`check` flag entries past their review window. On review, check current official pricing and model capabilities, update the registry, then propagate. There is no hand-kept list of apps to update: `check` scans each project's source and WARNs on any Anthropic or OpenAI model ID that is not a current registry value (a dated snapshot of a registry alias counts as current), so every app reports its own drift when opened. Migration maps that must name old IDs so saved selections keep working opt out with a `// policy:legacy-model-ids` comment, which exempts lines up to the block's closing `}` or `]`. Check request parameters and stored model selections during a family migration; a matching ID alone does not prove the API call works.
+- **Read Claude responses by content-block type, never `content[0].text`.** Sonnet 5, Opus 5/5.5, Fable and Mythos think by default when a request omits `thinking` (Sonnet 4.6 and Opus 4.8 did not), so the response opens with a `thinking` block and the first block has no text. Join every block whose `type === 'text'`; when none is present, report `stop_reason` (`max_tokens` means cut off, `refusal` means declined) rather than a generic format error. Quick text tasks (summaries, grammar, suggestions) should also send `thinking: {type: 'disabled'}` so thinking neither adds latency nor eats a small `max_tokens`; Haiku 4.5 accepts the same value. Two apps here broke this way on the move to `claude-sonnet-5`. `check` FAILs a first-block read in a project that names a thinking-by-default model, and WARNs on one anywhere else, since it breaks on the next smart-tier migration.
 - **Model entries review every 60 days, not the registry default of 90.** Model families now turn over faster than a quarter, and a stale entry costs more than an out-of-date name: Sonnet 5 superseded Sonnet 4.6 at a *lower* price ($2/$10 per MTok against $3/$15), so sitting on the old ID meant paying more for less. Each model entry records its price at verification, so a review can answer "is the newer one cheaper" without researching the model it replaced. Compare price as well as capability, and in both directions — a newer model is not automatically dearer.
 
 ---
@@ -757,17 +799,18 @@ For Electron apps serving on localhost, `helmet` still applies. The headers prot
 
 ### Network Exposure (Local Servers)
 
-A local app's Express server usually has no authentication, because its only client is meant to be the app's own window. So the server itself has to make sure that window is its only client. That takes three layers, and `check` FAILs each one separately:
+A local app's Express server usually has no authentication, because its only client is meant to be the app's own window. So the server itself has to make sure that window is its only client. That takes four layers, and `check` FAILs each one separately:
 
 1. **Bind to loopback: `app.listen(port, '127.0.0.1', ...)`.** Leaving out the host makes Node listen on every interface, which makes the API reachable from the local network, not just from this Mac. A mode switch such as `IS_ELECTRON ? '127.0.0.1' : undefined` counts as the same failure: it leaves the server reachable in exactly the mode that runs all the time. Bind unconditionally. `process.env.HOST || '127.0.0.1'` is acceptable. Port-0 probes (`findFreePort`) are exempt, and should bind `127.0.0.1` anyway. Use `127.0.0.1` in the Electron main, the test runner and the Vite proxy (`changeOrigin: true`), not `localhost`: Node can resolve `localhost` to `::1`, which a `127.0.0.1` listener refuses.
 2. **Check the Host header.** Loopback binding doesn't stop DNS rebinding. A website re-resolves its own domain to `127.0.0.1` and reads the API through the user's own browser, which is on the same machine. That request still carries the attacker's hostname, so reject any request whose `Host` isn't `127.0.0.1:<port>` or `localhost:<port>` with a 403, before any route runs.
 3. **Exact-origin CORS.** Allow only `http://127.0.0.1:<port>` and `http://localhost:<port>`. `cors()` with no options, `origin: '*'` and `origin: true` accept every website. A regex that matches `localhost` on any port accepts every other local dev server's page.
+4. **Refuse cross-site writes.** CORS only stops a website *reading* the response; the request itself still runs. A page the user visits can submit a form (`application/x-www-form-urlencoded`) or send a no-body `POST` to `http://127.0.0.1:<port>` with no preflight, which is enough to trigger any route that acts without reading a JSON body (create a backup, prune restore points, open a dialog). Before any route runs, reject `POST`/`PUT`/`PATCH`/`DELETE` whose `Origin` header is present and not one of the app's exact origins with a 403. A missing `Origin` (curl, the test runner) is allowed; the Host check still applies.
 
 Electron link handling belongs to the same boundary. The window's origin test must compare `new URL(url).origin === serverOrigin`, not `url.startsWith(serverOrigin)`, because a prefix test also accepts `http://127.0.0.1:<port>.evil.com`. `shell.openExternal` must only receive `https:`, `http:` and `mailto:` URLs, since it passes any other scheme (file:, smb:, custom handlers) to the OS. Many of these apps store URLs the user typed in, so that filter is the only one those URLs pass. Same-origin child windows get the same guards, via `did-create-window`, or are denied outright. `templates/electron-main.js` implements all of this, and `check` FAILs the prefix test and an unfiltered `openExternal`.
 
 The macOS firewall is not a substitute. It ships switched off, and when it's on, "Automatically allow downloaded signed software" is enabled by default, which covers every signed app. The app has to protect itself.
 
-**Tests.** Every server has an integration test that sends a foreign `Host` (a raw `http.request`, since `fetch` can't override `Host`) and asserts a 403. It also sends a request with `Origin: http://localhost:9999` and asserts there's no `Access-Control-Allow-Origin` header.
+**Tests.** Every server has an integration test that sends a foreign `Host` (a raw `http.request`, since `fetch` can't override `Host`) and asserts a 403. It also sends a request with `Origin: http://localhost:9999` and asserts there's no `Access-Control-Allow-Origin` header. It also posts with `Origin: https://evil.example` to a no-body route and to a `PUT` and asserts 403 for each, and checks the app's own origin still succeeds.
 
 
 ### Input Validation
@@ -839,6 +882,22 @@ These patterns apply to all local-first apps that store data as JSON files. They
 
 **Cascade deletes:**
 - When deleting a parent entity, always clean up child entities (e.g., deleting a job must also remove its tasks from `tasks.json`). Orphaned records waste space and appear in backups.
+
+**Backups (every app with user data):**
+
+Users lose data in three ways these apps can prevent: restoring the wrong file, a failed upgrade, and a new or lost Mac. Each needs its own layer.
+
+- **Safety copy before every restore.** A restore replaces all data, so write the current data to `backups/pre-restore/` before the restore writes anything (keep 5), and say where it went. Without it, importing an old or wrong file is unrecoverable.
+- **Automatic local backups** in `DATA_DIR/backups/daily/`: at most one per calendar day, only when data changed, keep 14; checked on startup and on a timer while the app runs. One per day is deliberate: keeping the last N frequent copies lets a busy few days push out every copy from before a mistake noticed a week later, while one per day always spans two weeks. The same `backups/` folder holds the pre-migration copies required by § Data Migration, Backups & Downgrade Guard.
+- **Manual restore points** in `backups/manual/`: a "Create restore point" button with an optional label, keep 10, separate from the automatic tier so automatic copies never push them out. Only these can be deleted by the user; automatic and pre-restore copies are managed by retention.
+- **External backup folder.** A user-chosen folder, typically iCloud Drive or Dropbox, which is what survives a new or lost Mac. Resolve it with `realpath` and require it inside the user's home directory; it must already exist. Automatic weekly plus a "Back up now" button, with the last backup time shown. **The app never deletes anything in the external folder**, not even its own old backups: it is the user's folder and pruning it is the user's decision (decided 2026-09-26). Electron apps use the native folder picker (an `electronDialogHandler` set from the main process); a browser/pm2 build falls back to a typed path.
+- **Skip when unchanged, by content.** Compare a fingerprint (hash) of the backup payload with the newest backup in that location and skip if identical. Don't use an in-memory dirty flag set route by route: it is lost on restart, and a new route that forgets to set it silently gets no backups.
+- **Restore accepts older backup versions** and migrates them forward, and refuses newer ones with a clear message. An exact version match rejects every backup made before a format change, which is precisely the backup a user brings to an upgraded app or a new Mac.
+- **One payload builder** shared by manual export, every automatic tier and the pre-restore copy, and one validator shared by restore and the create/update routes, so anything the app saves can be restored.
+- **Restore points are visible in the app.** List the automatic and pre-restore copies (newest first) with Download and Restore, behind a confirmation. A backup the user can't find is only useful to support; in a packaged app it sits in `~/Library/Application Support`. The tier and filename in the request are checked against fixed values (a known tier, the backup filename pattern) before any path is built.
+- **Onboarding offers "Restore from a backup"** so a new Mac is one step.
+
+Not yet enforced by `check`.
 
 **Commit the lockfile.** `check` FAILs a project whose `.gitignore` excludes `package-lock.json`. Without a committed lockfile `npm ci` cannot run at all, so CI resolves versions live on every push and a peer-dependency conflict that a pinned tree would have sailed past instead surfaces as a broken install. It also makes the integrity check pointless, since there is nothing in git to verify. The shared template has never ignored it; projects that do have drifted.
 
@@ -1046,6 +1105,8 @@ The lockfile is generated, not authored. Change it only by running npm (`npm ins
 Packages that ship native binaries (rolldown, lightningcss, `@tailwindcss/oxide`, esbuild, swc) declare every platform variant as an optional dependency, and npm records a resolution for all of them whatever machine generates the file. Removing the ones the current machine does not need leaves the declarations pointing at entries that no longer exist. That installs cleanly locally and fails on Linux, so the first symptom is a broken CI build with no apparent cause, often days later.
 
 `check` and `gates` FAIL when a lockfile declares platform binaries it has no resolutions for. The rule looks only at families of two or more platform-named siblings, so genuinely optional native modules such as `canvas` are unaffected.
+
+That rule matches one shape of breakage. The general check is npm's own: every `gates` run, fast and full, runs the validation `npm ci` performs before installing: it builds the dependency tree from `package.json` and fails if the lockfile lacks anything in it. The tree includes every platform's optional packages (filtering by platform happens later, at install), so the answer on a Mac is the answer on CI's Linux runner. It installs nothing and takes under a second. Passing tests against a local `node_modules` does not give that assurance. One app's lockfile lost electron-winstaller's optional `@electron/windows-sign` subtree three times in eleven days, each time when a dependency was added on this Mac, and each time the local gates passed and CI failed. The cause was Socket's npm wrapper, not npm or macOS: `socket npm install <pkg>` resolves with a vendored copy of npm's Arborist based on npm 11.0.0, which prunes optional subtrees from the lockfile and `node_modules`. When the sync check fails after adding a package, restore the pruned entries with a plain install and no package name, `socket raw-npm install --ignore-scripts`, which re-resolves from `package.json`; the Socket scan gate then covers what it restored. Keep adding packages through `socket npm install` so each one is scanned. Dependency manifests are gated like source: `verify-marker` blocks a commit of `package.json` or `package-lock.json` without a full-gates pass, and the Stop hook blocks presenting one.
 
 ### Keeping dependencies current
 

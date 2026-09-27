@@ -140,7 +140,9 @@ function assessDmg(dmgPath, cwd) {
  * can't inject commands.
  */
 function safeToken(value, label) {
-  if (!/^[\w@:.\/-]+$/.test(value)) {
+  // No leading '-': a token that git or npm would parse as an option (e.g. a
+  // tampered gates marker holding `--output=<path>`) is refused like any other.
+  if (!/^[\w@:.\/][\w@:.\/-]*$/.test(value)) {
     console.error(`${RED}Refusing to use unsafe ${label}: ${JSON.stringify(value)}${RESET}`);
     process.exit(1);
   }
@@ -320,6 +322,27 @@ function isSourceFile(f) {
   return SOURCE_PATTERNS.some((re) => re.test(f));
 }
 
+// What the gates must have passed on before a commit or a turn end. Source,
+// plus the dependency manifests: a lockfile-only commit changes what CI
+// installs as surely as a code change does, and treating it as "not source"
+// let a lockfile CI could not install be committed with no gates at all.
+const DEPENDENCY_FILE = /(^|\/)package(-lock)?\.json$/;
+function isGatedFile(f) {
+  return isSourceFile(f) || DEPENDENCY_FILE.test(f);
+}
+
+function currentHead(dir) {
+  const r = sh('git rev-parse HEAD', dir);
+  return r.ok ? r.out : null;
+}
+
+/** Files changed between two commits (null when git cannot say). */
+function filesBetween(dir, from, to = 'HEAD') {
+  const r = sh(`git diff --name-only ${safeToken(from, 'commit')} ${safeToken(to, 'commit')}`, dir);
+  if (!r.ok) return null;
+  return r.out.split('\n').filter(Boolean);
+}
+
 /**
  * Security-sensitive change detection.
  *
@@ -459,7 +482,18 @@ function contentHash(dir, files) {
  */
 function markerMatches(dir, marker) {
   if (!marker) return false;
-  if (marker.diffHash === diffHash(dir)) return true;
+
+  // Commits made since the pass must contain only gated files the gates saw.
+  // Without the recorded HEAD, a lockfile committed after a pass left the
+  // marker valid — its content was never in the marker, so nothing compared it
+  // — and a clean tree's empty diffHash matched every later clean tree.
+  const head = currentHead(dir);
+  if (marker.head && head && marker.head !== head) {
+    const since = filesBetween(dir, marker.head);
+    if (!since) return false;
+    const verified = new Set(marker.files || []);
+    if (since.filter(isGatedFile).some((f) => !verified.has(f))) return false;
+  } else if (marker.diffHash === diffHash(dir)) return true;
   if (!Array.isArray(marker.files) || typeof marker.contentHash !== 'string') return false;
 
   // Anything changed now that gates never saw invalidates the marker.
@@ -531,6 +565,23 @@ function auditPolicyDocVersions(root, label) {
       fail(
         `${label}: BUILD-POLICY.md version history is not newest-first — ${rows[misordered]} appears below ` +
           `${rows[misordered - 1]}; the top row must be the current version`,
+      );
+    }
+
+    // A change is not finished when its changelog entry is written. 2.41 was
+    // left with code, standards text and a "(policy 2.41)" entry but no header
+    // bump or history row, by a session opened in an app project that then
+    // ended; the header and history agreed with each other at 2.40, so the
+    // checks above passed. Every version the unreleased entries cite must have
+    // its history row.
+    const cl = readFile(path.join(root, 'CHANGELOG.md'));
+    const unreleased = (cl.match(/## \[Unreleased\]([\s\S]*?)(?=\n## \[|$)/) || [])[1] || '';
+    const cited = [...new Set([...unreleased.matchAll(/\bpolicy (\d+\.\d+)\b/gi)].map((m) => m[1]))];
+    const unrecorded = cited.filter((v) => !rows.includes(v));
+    if (unrecorded.length > 0) {
+      fail(
+        `${label}: CHANGELOG.md cites policy ${unrecorded.join(', ')} but BUILD-POLICY.md has no history row for it — ` +
+          `the change is half-finished: bump both doc headers and add the history row (and enforcement-table row) it describes`,
       );
     }
   }
@@ -1142,6 +1193,29 @@ function auditElectronStandards(dir, proj) {
           `exercising anything (project-standards § Electron)`,
       );
     }
+    // The check must re-run while the app is open. Every app surveyed on
+    // 2026-09-25 fetched version.json once on mount, so a customer who keeps
+    // the app in the dock learned about a release only after relaunching,
+    // days or weeks later. The standard had said "recheck periodically" in
+    // prose, and nothing checked it, so no app did. Both triggers are required:
+    // an interval alone does nothing useful for an app the user keeps switching
+    // away from, and focus alone misses a window left open in front. Searched in
+    // the same file as the fetch, since that is where the triggers belong.
+    const rawCheck = readFile(path.join(dir, versionCheck));
+    const rechecks = /setInterval\s*\(/.test(rawCheck);
+    const onFocus =
+      /addEventListener\(\s*['"](?:focus|visibilitychange)['"]/.test(rawCheck) ||
+      /['"]browser-window-focus['"]/.test(rawCheck);
+    if (!rechecks || !onFocus) {
+      const missing = [!rechecks && 'hourly setInterval', !onFocus && 'focus/visibilitychange listener']
+        .filter(Boolean)
+        .join(' and ');
+      findings.push(
+        `${versionCheck}: the update check runs only at launch (it has no ${missing}), so an app left open never ` +
+          `learns a release exists until it is restarted. Re-run the same check on focus and hourly, throttled ` +
+          `to once an hour (project-standards § External State Must Be Subscribed)`,
+      );
+    }
   }
 
   // An app that ships a DMG must HAVE an update check. Every other banner rule
@@ -1303,6 +1377,93 @@ function auditLockfileIntegrity(dir) {
 }
 
 /**
+ * Would `npm ci` accept this lockfile? Asked of npm itself, not a heuristic.
+ *
+ * CI's first step is `npm ci`, and the local gates never ran it: they worked
+ * against a node_modules that `npm install` had built, and `npm install`
+ * quietly repairs a lockfile that `npm ci` rejects. auditLockfileIntegrity
+ * above matches one shape of breakage (platform-binary siblings), so each new
+ * shape reached CI first — one app lost electron-winstaller's optional
+ * @electron/windows-sign subtree three times in eleven days, each time a
+ * dependency was added on this Mac, and each time the gates passed. The cause
+ * is Socket's npm wrapper (CLI 1.1.102): it replaces npm's Arborist with a
+ * vendored copy "based on npm/cli v11.0.0", which prunes optional subtrees
+ * that npm 11.19 keeps. Reproduced in a scratch copy: `socket npm install
+ * <pkg>` removed the five packages; a plain `npm install` restored them.
+ *
+ * This runs the check `npm ci` runs before it installs anything: build the
+ * ideal tree from package.json and compare it with the lockfile
+ * (lib/commands/ci.js → validate-lockfile.js), using the npm that ships with
+ * the pinned Node. The ideal tree includes every platform's optional packages
+ * — platform filtering happens later, at install — so the answer on this Mac
+ * is the answer on CI's Linux runner. Verified both ways: that app's broken
+ * commit reports the same five "Missing: … from lock file" lines CI failed
+ * on, its fixed commit passes, and a lockfile with its linux-x64 binaries
+ * removed is rejected. Installs nothing, so Socket is not involved; ~0.4s.
+ */
+const LOCKFILE_SYNC_SCRIPT = `
+const [npmDir, dir] = process.argv.slice(1);
+const Arborist = require(npmDir + '/node_modules/@npmcli/arborist');
+const validateLockfile = require(npmDir + '/lib/utils/validate-lockfile.js');
+(async () => {
+  const virt = new Arborist({ path: dir });
+  const inventory = new Map((await virt.loadVirtual()).inventory);
+  const arb = new Arborist({ path: dir });
+  await arb.buildIdealTree();
+  process.stdout.write(JSON.stringify(validateLockfile(inventory, arb.idealTree.inventory)));
+})().catch((e) => { process.stderr.write(String(e && e.message)); process.exit(2); });
+`;
+
+function npmInstallDir() {
+  const bundled = path.join(path.dirname(process.execPath), '..', 'lib', 'node_modules', 'npm');
+  if (exists(path.join(bundled, 'lib', 'utils', 'validate-lockfile.js'))) return bundled;
+  const r = sh('npm root -g', process.cwd());
+  const global = r.ok ? path.join(r.out.split('\n').pop(), 'npm') : null;
+  return global && exists(path.join(global, 'lib', 'utils', 'validate-lockfile.js')) ? global : null;
+}
+
+function auditLockfileSync(dir) {
+  if (!exists(path.join(dir, 'package-lock.json'))) return;
+  const npmDir = npmInstallDir();
+  if (!npmDir) {
+    fail(
+      `Cannot locate npm's lockfile validator (lib/utils/validate-lockfile.js) beside ${process.execPath} — ` +
+        `the check that 'npm ci' runs in CI cannot be run here. Reinstall Node via nvm, then re-run gates`,
+    );
+    return;
+  }
+  const r = require('child_process').spawnSync(process.execPath, ['-e', LOCKFILE_SYNC_SCRIPT, npmDir, dir], {
+    encoding: 'utf8',
+    timeout: 60000,
+  });
+  if (r.status !== 0) {
+    fail(
+      `Could not check package-lock.json against package.json the way 'npm ci' does: ` +
+        `${(r.stderr || r.error?.message || 'unknown error').trim().split('\n')[0]}. ` +
+        `If this is a network error, the registry was needed to resolve a dependency the lockfile lacks — re-run gates when online`,
+    );
+    return;
+  }
+  let errors = [];
+  try {
+    errors = JSON.parse(r.stdout || '[]');
+  } catch {
+    fail(`Lockfile sync check returned unreadable output: ${(r.stdout || '').slice(0, 200)}`);
+    return;
+  }
+  if (errors.length > 0) {
+    fail(
+      `package-lock.json is out of sync with package.json — 'npm ci' in CI will refuse to install: ` +
+        `${errors.slice(0, 6).join('; ')}${errors.length > 6 ? `; +${errors.length - 6} more` : ''}. ` +
+        `Usual cause: a package was added with socket npm install, whose wrapper swaps in its own older copy of npm's resolver ` +
+        `and prunes optional subtrees from the lockfile and node_modules. Restore them with a plain install, no package name: ` +
+        `socket raw-npm install --ignore-scripts — it re-resolves from package.json, and the Socket scan gate covers the ` +
+        `restored packages. Confirm with git diff package-lock.json, then re-run gates. Never hand-edit the lockfile`,
+    );
+  } else ok("Lockfile in sync with package.json (the check 'npm ci' runs in CI)");
+}
+
+/**
  * Security infrastructure that must be present in Express apps. The SAST scans
  * (Semgrep, ESLint security) catch known anti-patterns — what you did wrong.
  * This audit catches what you forgot to do: helmet missing, input validation
@@ -1423,6 +1584,7 @@ function auditNetworkExposure(dir) {
   const warnings = [];
   let listens = 0;
   let hostCheck = false;
+  let originCheck = false;
 
   for (const full of serverSourceFiles(dir)) {
     const rel = path.relative(dir, full);
@@ -1431,6 +1593,8 @@ function auditNetworkExposure(dir) {
 
     if (/req\.headers\.host\b|req\.headers\[['"]host['"]\]|req\.hostname\b|req\.get\(\s*['"]host['"]\s*\)/i.test(code))
       hostCheck = true;
+    if (/req\.headers\.origin\b|req\.headers\[['"]origin['"]\]|req\.get\(\s*['"]origin['"]\s*\)/i.test(code))
+      originCheck = true;
 
     // .listen(<port>[, <host>][, <callback>]) — capture the first two arguments.
     const re = /\.listen\(\s*([^,()]+?)\s*(?:,\s*([^,()]+?|\([^)]*\)\s*=>|async\s*\([^)]*\)\s*=>|function\b)\s*)?[,)]/g;
@@ -1503,10 +1667,196 @@ function auditNetworkExposure(dir) {
     );
   }
 
+  if (listens > 0 && !originCheck) {
+    findings.push(
+      `no Origin check on state-changing requests — CORS only stops a website reading responses, not sending them: a page the user visits can POST a form (or a no-body request) to this server and it runs. Refuse POST/PUT/PATCH/DELETE whose Origin header is present and not the app's own origin with a 403 (project-standards § Network Exposure)`,
+    );
+  }
+
   for (const f of findings) fail(f);
   for (const w of warnings) warn(w);
   if (findings.length === 0 && warnings.length === 0 && listens > 0)
-    ok('Local server bound to loopback, Host header checked, CORS exact-origin');
+    ok('Local server bound to loopback, Host header checked, CORS exact-origin, cross-site writes refused');
+}
+
+/**
+ * AI model IDs drift from the registry.
+ *
+ * The registry's verified date only proves the registry was reviewed; nothing
+ * checked that the apps followed. A hand-kept list of "files to update" in
+ * project-standards went stale as apps were added, and two apps it did not
+ * name were left on GPT-5.4 while the registry moved on. Each project now
+ * reports its own drift when `check` runs there, so a new app is covered the
+ * first time it is opened.
+ *
+ * Any quoted Anthropic or OpenAI model ID that is not a current registry value
+ * is flagged. A dated snapshot of a registry alias (claude-haiku-4-5-20251001
+ * for claude-haiku-4-5) counts as current. Migration code that must name old
+ * IDs so saved selections keep working opts out with a
+ * `policy:legacy-model-ids` comment: the exemption runs from the marker to the
+ * first closing `}` or `]` at the marker's indentation or less.
+ *
+ * WARN, not FAIL: the check landed while several apps were mid-migration, and
+ * a picker may deliberately offer a model outside the two tiers.
+ */
+const MODEL_ID_RE =
+  /['"`](claude-(?:opus|sonnet|haiku|instant|\d)[a-z0-9.-]*|gpt-\d[a-z0-9.-]*|o\d(?:-(?:mini|pro|preview))?(?:-\d{4}-\d{2}-\d{2})?)['"`]/g;
+const MODEL_SNAPSHOT_SUFFIX = /^-(\d{8}|\d{4}-\d{2}-\d{2})$/;
+
+function currentModelIds() {
+  const entries = loadRegistry().entries || {};
+  return Object.keys(entries)
+    .filter((k) => /^(anthropic|openai)-model-/.test(k))
+    .map((k) => entries[k].value);
+}
+
+function isCurrentModelId(id, current) {
+  return current.some(
+    (v) =>
+      id === v ||
+      (id.startsWith(v) && MODEL_SNAPSHOT_SUFFIX.test(id.slice(v.length))) ||
+      (v.startsWith(id) && MODEL_SNAPSHOT_SUFFIX.test(v.slice(id.length))),
+  );
+}
+
+function auditModelIds(dir) {
+  const current = currentModelIds();
+  if (current.length === 0) return;
+  const stale = [];
+  let seen = 0;
+
+  const walk = (d) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      if (
+        ['node_modules', 'dist', 'release', 'build', 'coverage', 'tests', 'test', '__tests__'].includes(
+          e.name,
+        )
+      )
+        continue;
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!/\.(js|jsx|ts|tsx|mjs|cjs)$/.test(e.name) || /\.(test|spec)\./.test(e.name)) continue;
+
+      const lines = readFile(full).split('\n');
+      let exemptIndent = -1;
+      lines.forEach((line, i) => {
+        const indent = line.length - line.trimStart().length;
+        if (exemptIndent >= 0) {
+          if (/^\s*[}\]]/.test(line) && indent <= exemptIndent) exemptIndent = -1;
+          return;
+        }
+        if (/policy:legacy-model-ids/.test(line)) {
+          exemptIndent = indent;
+          return;
+        }
+        if (/^\s*(\/\/|\*)/.test(line)) return;
+        for (const m of line.matchAll(MODEL_ID_RE)) {
+          seen++;
+          if (!isCurrentModelId(m[1], current))
+            stale.push(`${path.relative(dir, full)}:${i + 1} ${m[1]}`);
+        }
+      });
+    }
+  };
+  walk(dir);
+
+  if (stale.length > 0) {
+    const shown = stale.slice(0, 8).join('; ');
+    const more = stale.length > 8 ? `; +${stale.length - 8} more` : '';
+    warn(
+      `${stale.length} AI model ID(s) not in registry.json (current: ${current.join(', ')}): ${shown}${more}. ` +
+        `Update routing and pickers to the registry values; check request parameters and saved selections, ` +
+        `and mark migration maps with a policy:legacy-model-ids comment (project-standards § AI Integration)`,
+    );
+  } else if (seen > 0) {
+    ok('AI model IDs match registry.json');
+  }
+}
+
+/**
+ * Claude response parsing must not assume the first content block is text.
+ *
+ * Sonnet 5, Opus 5/5.5, Fable and Mythos run adaptive thinking when the request
+ * omits `thinking` (Sonnet 4.6 and Opus 4.8 did not), so the response opens with
+ * a `thinking` block and `content[0].text` is undefined. One app threw
+ * "Invalid Claude API response format" on every Smart-tier call and another
+ * shipped returning undefined, both on the registry move to claude-sonnet-5. The model-ID check above passed both: the ID was current, the
+ * parser was the part that broke.
+ *
+ * FAIL when a project names a thinking-by-default model and reads the first
+ * block. WARN on a first-block read alone: it works today and breaks the day the
+ * app moves to the registry's smart tier. Fix: join every `type === 'text'` block
+ * (and send `thinking: {type: 'disabled'}` where a quick text task should not
+ * think) — project-standards § AI Integration.
+ */
+const FIRST_BLOCK_TEXT_RE = /\bcontent\s*(?:\?\.)?\[\s*0\s*\]\s*(?:\?\.|\.)\s*text\b/;
+const THINKING_DEFAULT_MODEL_RE = /['"`](claude-(?:sonnet-5|opus-5|fable|mythos)[a-z0-9.-]*)['"`]/;
+
+function auditClaudeResponseParsing(dir) {
+  const reads = [];
+  let thinkingModel = null;
+
+  const walk = (d) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      if (
+        ['node_modules', 'dist', 'dist-electron', 'release', 'build', 'coverage', 'tests', 'test', '__tests__', 'venv'].includes(
+          e.name,
+        )
+      )
+        continue;
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!/\.(js|jsx|ts|tsx|mjs|cjs|py)$/.test(e.name) || /\.(test|spec)\./.test(e.name)) continue;
+
+      readFile(full)
+        .split('\n')
+        .forEach((line, i) => {
+          if (/^\s*(\/\/|\*|#)/.test(line)) return;
+          const rel = `${path.relative(dir, full)}:${i + 1}`;
+          if (FIRST_BLOCK_TEXT_RE.test(line)) reads.push(rel);
+          const m = !thinkingModel && line.match(THINKING_DEFAULT_MODEL_RE);
+          if (m) thinkingModel = `${m[1]} (${rel})`;
+        });
+    }
+  };
+  walk(dir);
+
+  if (reads.length === 0) return;
+  const shown = reads.slice(0, 5).join(', ') + (reads.length > 5 ? `, +${reads.length - 5} more` : '');
+  const fix =
+    `Join every block with type === 'text' instead of reading content[0].text, and send thinking: {type: 'disabled'} ` +
+    `for quick text tasks (project-standards § AI Integration)`;
+  if (thinkingModel) {
+    fail(
+      `Claude response read from the first content block (${shown}) while ${thinkingModel} thinks by default — ` +
+        `the first block is a thinking block, so the text is undefined. ${fix}`,
+    );
+  } else {
+    warn(
+      `Claude response read from the first content block (${shown}) — this breaks when the app moves to ` +
+        `claude-sonnet-5 (the registry smart tier), which returns a thinking block first. ${fix}`,
+    );
+  }
 }
 
 /**
@@ -1810,6 +2160,10 @@ function cmdCheck(dir, flags = []) {
   // Unconditional: servers also live outside server/ (monorepo apps/server,
   // src/server). Silent when no listen() exists.
   auditNetworkExposure(dir);
+  // Unconditional: model IDs appear in client-only apps as well as servers.
+  // Silent when a project names no model.
+  auditModelIds(dir);
+  auditClaudeResponseParsing(dir);
 
   // The lockfile must be committed. Without it `npm ci` cannot run at all, CI
   // resolves versions live on every push, and a peer-dependency conflict that a
@@ -2316,15 +2670,42 @@ function cmdGates(dir, flags) {
   // Keyed on source instead, an unchanged codebase is not re-reviewed however
   // many times the changelog, docs or config move.
   const sourceOnlyHash = () => {
-    const files = changedNow.filter(isSourceFile).sort();
+    const files = workFiles.filter(isSourceFile).sort();
     if (files.length === 0) return null;
     const h = crypto.createHash('sha256');
     h.update(files.join('\n'));
     for (const f of files) h.update('\0' + readFile(path.join(dir, f)));
     return h.digest('hex');
   };
-  const srcHash = sourceOnlyHash();
   const prevMarker = readJSON(path.join(dir, '.policy', 'gates.json'));
+
+  // A clean tree means the work is committed, not that there is nothing to
+  // gate. Gates used to judge only the uncommitted diff, so once anything the
+  // last pass had not seen was committed — a lockfile fix, say — no route to a
+  // pass remained: the review saw an empty diff and failed by design. Instead,
+  // gate what was committed since the last pass (the HEAD its marker records),
+  // or, for a marker from before HEAD was recorded, since the last release tag.
+  let workFiles = changedNow;
+  let reviewBase = null;
+  let nothingSincePass = false;
+  if (changedNow.length === 0 && proj.isGit) {
+    const head = currentHead(dir);
+    let base = null;
+    if (prevMarker && prevMarker.head && head) {
+      if (prevMarker.head === head) nothingSincePass = true;
+      else if (sh(`git merge-base --is-ancestor ${safeToken(prevMarker.head, 'commit')} HEAD`, dir).ok)
+        base = prevMarker.head;
+    } else if (head) {
+      const tag = sh('git describe --tags --abbrev=0 HEAD', dir);
+      if (tag.ok && sh(`git rev-list -n 1 ${safeToken(tag.out, 'tag')}`, dir).out !== head) base = tag.out;
+    }
+    const since = base ? filesBetween(dir, base) : null;
+    if (since) {
+      reviewBase = base;
+      workFiles = since.filter((f) => !f.startsWith('.policy/'));
+    }
+  }
+  const srcHash = sourceOnlyHash();
   // Only carries forward a review that actually happened: the previous marker
   // must record the gate AND the source must be byte-identical. Anything else
   // re-runs it, so this can shorten the path but never skip a first review.
@@ -2335,9 +2716,25 @@ function cmdGates(dir, flags) {
     prevMarker.reviewedSourceHash === srcHash &&
     Array.isArray(prevMarker.gates) &&
     prevMarker.gates.includes('CodeRabbit review');
+  // Committed since a reviewed pass with no source among it (a lockfile fix):
+  // the review still describes every line of source, so it carries forward.
+  // Without this the new marker would record no review and verify-ready
+  // --release would refuse the tree the review had already read.
+  const reviewCarried =
+    alreadyReviewed ||
+    (!withReview &&
+      prevMarker &&
+      Array.isArray(prevMarker.gates) &&
+      prevMarker.gates.includes('CodeRabbit review') &&
+      (nothingSincePass ||
+        (reviewBase !== null &&
+          reviewBase === prevMarker.head &&
+          workFiles.filter(isSourceFile).length === 0)));
   const skipReview =
     !withReview &&
-    ((changedNow.length > 0 && changedNow.filter(isSourceFile).length === 0) || alreadyReviewed);
+    ((workFiles.length > 0 && workFiles.filter(isSourceFile).length === 0) ||
+      reviewCarried ||
+      nothingSincePass);
   const willRunReview = !fast && !skipReview && gates.some((g) => g.script === 'review');
 
   section(`Quality gates (${fast ? 'fast/pre-commit' : 'full'}): ${path.resolve(dir)}`);
@@ -2364,6 +2761,14 @@ function cmdGates(dir, flags) {
     console.log(`  ${GREEN}✓${RESET} Compliance`);
   }
 
+
+  // CI's first step. Runs in the fast pre-commit subset too: a lockfile
+  // `npm ci` rejects must not be committable at all.
+  {
+    const before = results.fail;
+    auditLockfileSync(dir);
+    if (results.fail > before) return finish();
+  }
 
   // A filtered lockfile installs fine here and fails CI on Linux, so it must be
   // caught before the work is presented rather than by a red pipeline later.
@@ -2409,7 +2814,7 @@ function cmdGates(dir, flags) {
 
   // The dependency tree cannot have moved unless the lockfile did, so a scan of
   // an unchanged tree spends quota to re-learn what the last one already knew.
-  const depsChanged = changedFiles(dir).some((f) => /(^|\/)package(-lock)?\.json$/.test(f));
+  const depsChanged = workFiles.some((f) => DEPENDENCY_FILE.test(f));
 
   const report = [];
   for (const g of gates) {
@@ -2421,7 +2826,7 @@ function cmdGates(dir, flags) {
     }
     if (g.whenSourceChanges && skipReview) {
       console.log(
-        alreadyReviewed
+        reviewCarried
           ? `  ${DIM}skipped${RESET} ${g.name} ${DIM}(source unchanged since the last review — carried forward; force: gates --with-review)${RESET}`
           : `  ${DIM}skipped${RESET} ${g.name} ${DIM}(no source in this diff — review allowance saved for code changes; force: gates --with-review)${RESET}`,
       );
@@ -2429,7 +2834,11 @@ function cmdGates(dir, flags) {
     }
     const t0 = Date.now();
     process.stdout.write(`  ${DIM}running${RESET} ${g.name} (npm run ${g.script}) ... `);
-    const r = sh(`npm run ${safeToken(g.script, 'script name')}`, dir);
+    // Committed work is reviewed against the commit the last pass saw.
+    const extra =
+      g.script === 'review' && reviewBase ? ` -- --base-commit ${safeToken(reviewBase, 'commit')}` : '';
+    if (extra) process.stdout.write(`${DIM}(committed since ${reviewBase.slice(0, 12)})${RESET} `);
+    const r = sh(`npm run ${safeToken(g.script, 'script name')}${extra}`, dir);
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
     // A gate that ran but examined nothing is not a pass. CodeRabbit exits 0
     // with `"status":"review_skipped","message":"No changes detected"` whenever
@@ -2468,11 +2877,16 @@ function cmdGates(dir, flags) {
   }
 
   if (!fast) {
-    const verifiedFiles = changedFiles(dir)
+    // On a clean tree the verified files are the ones committed since the
+    // base, so markerMatches can tell them from anything committed later.
+    const verifiedFiles = (reviewBase ? workFiles : changedFiles(dir))
       .filter((f) => !f.startsWith('.policy/'))
       .sort();
     const marker = {
       diffHash: diffHash(dir),
+      // The commit this pass describes. Lets markerMatches reject later
+      // commits it never saw, and gives a clean-tree run its review base.
+      head: currentHead(dir),
       // Recorded so the marker survives the commit, which empties the
       // changed-file list without altering any verified content.
       files: verifiedFiles,
@@ -2481,7 +2895,7 @@ function cmdGates(dir, flags) {
       // A carried-forward review is recorded as a pass, because the code was
       // reviewed — verify-ready --release refuses to ship without this, and it
       // must not be tricked by the carry-forward or defeated by it.
-      gates: alreadyReviewed
+      gates: reviewCarried
         ? [...new Set([...report.map((r) => r.gate), 'CodeRabbit review'])]
         : report.map((r) => r.gate),
       // The source the review actually examined. Absent when the diff has no
@@ -2490,7 +2904,9 @@ function cmdGates(dir, flags) {
         srcHash !== null &&
         (alreadyReviewed || report.some((r) => r.gate === 'CodeRabbit review'))
           ? srcHash
-          : null,
+          : reviewCarried && srcHash === null
+            ? prevMarker.reviewedSourceHash || null
+            : null,
     };
     fs.mkdirSync(path.join(dir, '.policy'), { recursive: true });
     // Trailing newline keeps the marker prettier-clean in projects where
@@ -2541,9 +2957,10 @@ function cmdSecurityAck(dir) {
 // ----------------------------------------------------------- verify-marker
 
 /**
- * Pre-commit enforcement: source files changed => full gates must have passed
- * on this exact tree (.policy/gates.json diffHash matches). Doc-only commits
- * pass without a marker. Exits 1 to block the commit otherwise.
+ * Pre-commit enforcement: source or dependency files changed => full gates
+ * must have passed on this exact tree (.policy/gates.json). Doc-only commits
+ * pass without a marker; a lockfile-only commit does not, because it changes
+ * what CI installs. Exits 1 to block the commit otherwise.
  */
 function cmdVerifyMarker(dir) {
   guardLocalPath(dir);
@@ -2564,7 +2981,7 @@ function cmdVerifyMarker(dir) {
     return;
   }
 
-  const sourceChanged = changedFiles(dir).filter(isSourceFile);
+  const sourceChanged = changedFiles(dir).filter(isGatedFile);
   if (sourceChanged.length === 0) return;
   const marker = readJSON(path.join(dir, '.policy', 'gates.json'));
   if (markerMatches(dir, marker)) {
@@ -2574,8 +2991,8 @@ function cmdVerifyMarker(dir) {
   console.log(
     `\n${RED}${BOLD}BUILD-POLICY: commit blocked.${RESET} ` +
       (marker
-        ? `Source changed since full gates last passed (${marker.timestamp}).`
-        : 'Source changed but full quality gates have never passed on this tree.') +
+        ? `Source or dependencies changed since full gates last passed (${marker.timestamp}).`
+        : 'Source or dependencies changed but full quality gates have never passed on this tree.') +
       `\nRun full gates, then commit:\n  node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} gates\n`,
   );
   process.exit(1);
@@ -3626,9 +4043,19 @@ function cmdDoctor() {
 
   const settings = readJSON(path.join(os.homedir(), '.claude', 'settings.json')) || {};
   const settingsStr = JSON.stringify(settings);
-  if (settingsStr.includes('policy.js') || settingsStr.includes('session-start'))
-    ok('Claude Code hooks configured in ~/.claude/settings.json');
-  else warn('Claude Code hooks not wired — run: policy setup-machine');
+  const canonicalHooks = readJSON(path.join(POLICY_ROOT, 'machine', 'hooks.json')) || {};
+  const unwired = Object.entries(canonicalHooks)
+    .filter(([event]) => !event.startsWith('_'))
+    .flatMap(([event, entries]) =>
+      entries
+        .filter((entry) => !hookEntryWired(settings, event, entry))
+        .map((entry) => `${event}${entry.matcher ? ` (${entry.matcher})` : ''}`),
+    );
+  if (!settingsStr.includes('policy.js') && !settingsStr.includes('session-start'))
+    warn('Claude Code hooks not wired — run: policy setup-machine');
+  else if (unwired.length > 0)
+    fail(`Claude Code hooks missing from ~/.claude/settings.json: ${unwired.join(', ')} — run: policy setup-machine`);
+  else ok('Claude Code hooks configured in ~/.claude/settings.json (every canonical event and matcher)');
 
   const agentsDir = path.join(os.homedir(), '.claude', 'agents');
   const agents = exists(agentsDir)
@@ -3674,6 +4101,15 @@ function cmdDoctor() {
  * Idempotent — canonical files are (re)copied, hooks are merged only if the
  * event doesn't already reference the policy. Finish with `policy doctor`.
  */
+/** Is this canonical hook entry (same event, same matcher) already wired to the policy? */
+function hookEntryWired(settings, event, entry) {
+  return ((settings.hooks && settings.hooks[event]) || []).some(
+    (e) =>
+      (e.matcher || '') === (entry.matcher || '') &&
+      /policy\.js|session-start/.test(JSON.stringify(e.hooks || [])),
+  );
+}
+
 function cmdSetupMachine() {
   const MACHINE = path.join(POLICY_ROOT, 'machine');
   const claudeDir = path.join(os.homedir(), '.claude');
@@ -3732,15 +4168,18 @@ function cmdSetupMachine() {
   const canonical = readJSON(path.join(MACHINE, 'hooks.json')) || {};
   settings.hooks = settings.hooks || {};
   let merged = 0;
+  // Per matcher, not per event: an event already wired for Bash must still
+  // gain a new matcher (Edit|Write for the build-policy claim) added later.
   for (const [event, entries] of Object.entries(canonical)) {
     if (event.startsWith('_')) continue;
-    const existing = JSON.stringify(settings.hooks[event] || '');
-    if (existing.includes('policy.js') || existing.includes('session-start')) {
-      ok(`Hook ${event}: already wired, left as-is`);
-      continue;
+    for (const entry of entries) {
+      if (hookEntryWired(settings, event, entry)) {
+        ok(`Hook ${event}${entry.matcher ? ` (${entry.matcher})` : ''}: already wired, left as-is`);
+        continue;
+      }
+      settings.hooks[event] = [...(settings.hooks[event] || []), entry];
+      merged++;
     }
-    settings.hooks[event] = [...(settings.hooks[event] || []), ...entries];
-    merged++;
   }
   if (merged > 0) {
     fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
@@ -3906,6 +4345,27 @@ function fabricatedContentIds(transcriptPath, dir) {
 function cmdHookStop() {
   const input = readStdinJSON();
   if (input.stop_hook_active) process.exit(0); // never loop
+
+  // Whichever project this session was opened in: if it holds build-policy,
+  // the policy change must be complete before the turn ends. A later session
+  // has none of this one's context, so work left half-done here stays so.
+  const owner = readJSON(POLICY_OWNER);
+  if (owner && owner.session === input.session_id && policyTreeDirty()) {
+    const failures = complianceFailures(POLICY_ROOT);
+    if (failures.length > 0) {
+      console.log(
+        JSON.stringify({
+          decision: 'block',
+          reason:
+            `BUILD-POLICY: this session changed build-policy and the change is incomplete:\n` +
+            failures.map((f, i) => `${i + 1}. ${f}`).join('\n') +
+            `\nFinish it now. Once this session ends, no later session has the context to finish it.`,
+        }),
+      );
+      process.exit(0);
+    }
+  }
+
   const dir = process.cwd();
   const proj = detectProject(dir);
   if (!proj.hasPkg || !proj.isGit) process.exit(0);
@@ -3933,7 +4393,7 @@ function cmdHookStop() {
   }
 
   const changed = changedFiles(dir);
-  const sourceChanged = changed.filter(isSourceFile);
+  const sourceChanged = changed.filter(isGatedFile);
   if (sourceChanged.length === 0) process.exit(0);
 
   const reasons = [];
@@ -3984,8 +4444,8 @@ function cmdHookStop() {
         (marker
           ? ` (last pass: ${marker.timestamp}, tree has changed since)`
           : ' (no gates marker)') +
-        `. If you are presenting this work as ready or asking the developer to commit, run them now: ` +
-        `node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} gates — the pre-commit hook will reject the commit without this. ` +
+        `. Never present work for commit before this passes — a commit made without it strands the tree, and every build and release step after it is blocked. ` +
+        `Run them now: node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} gates — the pre-commit hook will reject the commit without this. ` +
         `If you are mid-iteration and not presenting yet, state that explicitly and continue.`,
     );
   }
@@ -3994,7 +4454,7 @@ function cmdHookStop() {
       JSON.stringify({
         decision: 'block',
         reason:
-          `Source files changed (${sourceChanged.slice(0, 5).join(', ')}${sourceChanged.length > 5 ? ', ...' : ''}). BUILD-POLICY:\n` +
+          `Source or dependency files changed (${sourceChanged.slice(0, 5).join(', ')}${sourceChanged.length > 5 ? ', ...' : ''}). BUILD-POLICY:\n` +
           reasons.map((r, i) => `${i + 1}. ${r}`).join('\n'),
       }),
     );
@@ -4004,9 +4464,122 @@ function cmdHookStop() {
 
 /** PreToolUse hook: block electron DMG builds while the working tree is dirty;
  *  redirect raw semgrep invocations to the policy-defined script. */
+/**
+ * One session at a time may hold uncommitted work in build-policy.
+ *
+ * App sessions are told to fix gaps in the shared standard, so sessions opened
+ * in app projects edit ../build-policy. Every completion
+ * check (Stop hook, gates, verify-marker) looks at the session's own project,
+ * so those edits had none, and nothing stopped two sessions editing the same
+ * files: 2.39, 2.40 and 2.41 were written by three sessions into one
+ * uncommitted tree, and 2.41's session ended with the change half-done. The
+ * first session to edit build-policy claims it in .policy/owner.json; until the
+ * developer commits, another session's edit is refused and told whose work is
+ * there. A clean tree releases the claim.
+ */
+const POLICY_OWNER = path.join(POLICY_ROOT, '.policy', 'owner.json');
+const POLICY_WRITE_OP =
+  /(^|[\s;&|(])(sed\s+-i|perl\s+-[a-z]*i|tee|cp|mv|rm|touch|patch|truncate)\s|(?<![0-9&])>>?\s*["']?(?!\/dev\/|\/tmp\/|\/private\/tmp\/)[^\s&|"']|open\([^)]*,\s*["'][wa]|writeFileSync|appendFileSync|\bgit\b[^|;&]*\s(checkout|restore|reset|stash|apply|revert|clean)\b/;
+
+function policyTreeDirty() {
+  return changedFiles(POLICY_ROOT).some((f) => !f.startsWith('.policy/'));
+}
+
+// A command names build-policy by its real path, a relative ../build-policy,
+// or a ~ path, not by the substring: other directories (a session scratchpad
+// named after the project) contain "build-policy/" too.
+function commandNamesPolicyRepo(cmd, cwd) {
+  const esc = POLICY_ROOT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return (
+    new RegExp(esc + '(/|\\b)').test(cmd) ||
+    /(^|[\s'"=:(])(\.\.\/)+build-policy(\/|\b)/.test(cmd) ||
+    /~\/[^\s'"]*\/build-policy(\/|\b)/.test(cmd) ||
+    isUnderPolicyRoot('.', cwd)
+  );
+}
+
+function isUnderPolicyRoot(p, cwd) {
+  if (!p) return false;
+  const abs = path.resolve(cwd || process.cwd(), p.replace(/^~(?=\/)/, os.homedir()));
+  return abs === POLICY_ROOT || abs.startsWith(POLICY_ROOT + path.sep);
+}
+
+/** Does this tool call write inside build-policy? Bash is matched by shape:
+ *  a write operation plus a build-policy path or a build-policy cwd. */
+function touchesPolicyRepo(input) {
+  const ti = input.tool_input || {};
+  const cwd = input.cwd || process.cwd();
+  if (['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(input.tool_name))
+    return isUnderPolicyRoot(ti.file_path || ti.notebook_path, cwd);
+  if (input.tool_name !== 'Bash') return false;
+  const cmd = ti.command || '';
+  return commandNamesPolicyRepo(cmd, cwd) && POLICY_WRITE_OP.test(cmd);
+}
+
+/** Claim build-policy for this session, or return why it may not edit. */
+function claimPolicyRepo(input) {
+  const owner = readJSON(POLICY_OWNER);
+  const session = input.session_id || 'unknown';
+  if (owner && owner.session === session) return null;
+  if (!owner || !policyTreeDirty()) {
+    fs.mkdirSync(path.dirname(POLICY_OWNER), { recursive: true });
+    fs.writeFileSync(
+      POLICY_OWNER,
+      JSON.stringify({ session, project: input.cwd || process.cwd(), since: new Date().toISOString() }, null, 2) + '\n',
+    );
+    return null;
+  }
+  return (
+    `BUILD-POLICY: build-policy holds uncommitted work claimed by another session (${owner.session}, opened in ` +
+    `${owner.project}, since ${owner.since}). Editing it now would mix two sessions' changes in one tree, where either can ` +
+    `overwrite or mis-cite the other. Do not edit build-policy. Tell the developer: the build-policy changes need ` +
+    `reviewing and committing first (a clean tree releases the claim). If the gap you found should be fixed there, ` +
+    `describe it in your final message so it can be done after that commit.`
+  );
+}
+
 function cmdHookPretool() {
   const input = readStdinJSON();
   const cmd = (input.tool_input && input.tool_input.command) || '';
+  // The claim file is the developer's to clear (by committing), never the AI's.
+  const ti = input.tool_input || {};
+  const claimFileWrite =
+    input.tool_name === 'Bash'
+      ? // The operation must act on the file; prose that mentions it is fine.
+        /(\b(rm|mv|cp|tee|truncate|touch|unlink)\b|>>?|\b(open|writeFileSync|appendFileSync|unlinkSync|rmSync|renameSync)\s*\()[^|;&\n]*\.policy\/owner\.json/.test(
+          cmd,
+        ) && commandNamesPolicyRepo(cmd, input.cwd)
+      : /owner\.json$/.test(ti.file_path || '') && isUnderPolicyRoot(ti.file_path, input.cwd);
+  if (claimFileWrite) {
+    console.log(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            'BUILD-POLICY: .policy/owner.json records which session holds uncommitted build-policy work. The AI must not edit or remove it; ' +
+            'the claim is released when the developer commits build-policy.',
+        },
+      }),
+    );
+    process.exit(0);
+  }
+  if (touchesPolicyRepo(input)) {
+    const refusal = claimPolicyRepo(input);
+    if (refusal) {
+      console.log(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: refusal,
+          },
+        }),
+      );
+      process.exit(0);
+    }
+  }
+  if (input.tool_name !== 'Bash') process.exit(0);
   // --ack-manual is the developer's signature that manual release checks
   // (dogfood install, banner, Gumroad upload) were personally performed. The
   // AI cannot know that — it must never record the ack itself.
