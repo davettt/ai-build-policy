@@ -1,7 +1,7 @@
 # Build & Development Policy
 
-**Version:** 2.46
-**Last updated:** 2026-09-26
+**Version:** 2.47
+**Last updated:** 2026-09-27
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
 
@@ -107,7 +107,7 @@ Root commit exception: CodeRabbit cannot review before HEAD exists, so the initi
 |---|---|
 | CHANGELOG.md entry for every code change, written as public-safe project history | Stop hook blocks the AI's turn-end if source changed without it; `verify-ready` fails without it |
 | Gates run before the AI presents work as ready — never left for the developer to remember to ask | Stop hook blocks turn-end if source or dependency files changed without a full-gates marker for the current tree (mid-iteration turns may state so and continue); `verify-marker` in pre-commit is the hard backstop |
-| One session at a time holds uncommitted build-policy work, and finishes it before it ends | PreToolUse (Bash and Edit/Write) claims build-policy for the first session to write to it and refuses other sessions' writes until the developer commits; the Stop hook blocks the owning session's turn-end while `check` fails on build-policy, from whichever project the session was opened in; `check` FAILs a changelog that cites a policy version with no history row |
+| One session at a time holds uncommitted build-policy work, finishes it, and hands it off; only a build-policy session reviews it, maintains the public mirror and prepares the commit | `.policy/owner.json` moves editing → handed-off → released (developer commit). PreToolUse (Bash, Edit/Write) lets only the owner write while editing, only build-policy sessions after handoff, and only build-policy sessions write `build-policy-public`; Bash writes are judged by their targets, following `cd`. The owner's Stop hook blocks while `check` fails and, for an app session, until `policy handoff`. `policy mirror-sync` does the mechanical sync; `policy mirror` FAILs incident detail in new public text |
 | A shipped version is frozen — new source work bumps the version and opens a new CHANGELOG section, never amends a shipped entry | A built DMG in `release/` marks its version shipped: Stop hook blocks turn-end, `check` fails, `verify-ready` fails while source changes sit on a shipped version |
 | README updated when setup/features/config change | Human judgment (delegate to `readme-updater` agent) |
 | Semver bump checked against last git tag | `verify-ready --release` fails if commits exist after the last tag without a bump (tag-at-HEAD = correctly tagged release) |
@@ -222,12 +222,15 @@ Context files (`CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.claude/`) are **lo
 
 The sanitised public copy lives in `build-policy-public/` → pushed to `THIS-REPO`, including `scripts/` and `templates/` so the enforcement is publicly verifiable. `policy mirror` checks version drift and scans for private details (blocklist in `mirror-blocklist.txt`, never mirrored). Run it before every public push.
 
+Only a session opened in build-policy edits the public copy. `policy mirror-sync` copies `scripts/` and `templates/` and bumps the headers; the public history rows and standards text are written by hand and state the rule and how it is enforced, never where it was found, which product, an endpoint or a plan. `policy mirror` FAILs new public text that does.
+
 ---
 
 ## Version history
 
 | Version | Date | Changes |
 |---|---|---|
+| 2.47 | 2026-09-27 | Build-policy changes are handed off, and only a build-policy session touches the public mirror. The claim has a lifecycle in `.policy/owner.json`: editing (only the owning session writes) → handed-off → released by the developer's commit. New `policy handoff` declares the change complete; it is refused unless `check` passes and unless run by the owning session, and an app session's Stop hook blocks until it has handed off. After handoff only sessions opened in build-policy may write, to review and fix it, and only they write the public mirror at any time. New `policy mirror-sync` copies `scripts/` and `templates/`, bumps the public headers and lists the history rows still to write by hand. `policy mirror` FAILs newly added public text that says where a rule was found, a product plan, an app identified by what it does, a data-loss incident, or an API path in a history row. Bash writes are judged by their targets, following `cd` between segments. |
 | 2.46 | 2026-09-27 | Local servers refuse cross-site writes. Loopback binding, the Host check and exact-origin CORS stop other sites reading a local API, but not sending to it: CORS blocks reading the response, not the request, so a page the user visits can still trigger a state-changing request. project-standards § Network Exposure adds a fourth layer: reject POST, PUT, PATCH and DELETE whose `Origin` header is present and is not the app's own origin (403), with smoke tests. `check` FAILs a server with no Origin check. |
 | 2.45 | 2026-09-27 | Delete confirmations offer the safer option and state what deleting affects. For records that other records refer to or that carry history, project-standards § Destructive Action Confirmations requires a non-destructive alternative (close or archive keeping the same id, or end from a date), offered as a button in the confirmation, alongside a plain-language statement of the consequences with counted references. Not enforced by `check`. |
 | 2.44 | 2026-09-26 | Backups standard for every app with user data. project-standards § Data Safety now requires: a safety copy before every restore (keep 5); automatic local backups (at most one a day when data changed, keep 14); manual labelled restore points (keep 10, the only tier the user can delete); an external backup folder the app never deletes from; skip-when-unchanged by content fingerprint; versioned restore with a downgrade refusal; one shared payload builder and validator, also used on create and update routes so saved data can always be restored; an in-app restore points list with download and restore; and a restore option in onboarding. Not enforced by `check` yet. |

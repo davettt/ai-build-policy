@@ -31,6 +31,10 @@
  *                         .claude/specs/deps/. check/verify-ready FAIL on an un-recorded major.
  *   scaffold [dir]      Create missing standard files/scripts (never overwrites)
  *   mirror              Check public mirror for drift and private-detail leaks
+ *   mirror-sync         Copy scripts/ + templates/ to the public mirror and bump its
+ *                         headers; public prose is still written by hand
+ *   handoff             The session holding the build-policy claim declares its change
+ *                         complete; review, mirror and commit move to a build-policy session
  *
  * Hook modes (called by Claude Code hooks, not humans):
  *   check --hook        Terse output for SessionStart injection; always exits 0
@@ -3898,7 +3902,7 @@ function cmdMirror() {
     );
     if (stale.length > 0) {
       fail(
-        `${sub}/ drift vs public mirror: ${stale.join(', ')} — sync: cp ${stale.map((f) => `${sub}/${f}`).join(' ')} ../build-policy-public/${sub}/`,
+        `${sub}/ drift vs public mirror: ${stale.join(', ')} — sync from a build-policy session: policy mirror-sync`,
       );
     } else ok(`${sub}/ matches public mirror (${names.length} files)`);
   }
@@ -3921,6 +3925,42 @@ function cmdMirror() {
   // Version history entries belong in both copies; the remediation actions
   // belong only in the private one.
   const internalProse = [/\b\d+\s+projects?\b/i, /\bAction:/];
+
+  // Incident detail. Names are blocklisted, so a sync that swaps a project's
+  // name for "a finance app" passes the term scan while still publishing a working
+  // attack (the endpoint, what repeating it destroyed) and an unreleased
+  // product plan. Checked on text added since the public repo's last commit,
+  // so rule text already published (generic examples such as /api/licenses)
+  // is not re-litigated; API paths only in history rows, where they describe
+  // a real app rather than illustrate a rule.
+  const added = sh(
+    'git diff HEAD --unified=0 -- BUILD-POLICY.md project-standards.md',
+    PUBLIC_ROOT,
+  )
+    .out.split('\n')
+    .filter((l) => l.startsWith('+') && !l.startsWith('+++'))
+    .map((l) => l.slice(1));
+  const incident = [
+    [/\b(found|raised|discovered|reported)\s+(in|while|by)\b/i, 'where it was found'],
+    [/\bwhile preparing\b|\bfor sale\b|\bplanned\s+(DMG|release|launch|build)\b/i, 'a product plan'],
+    [/\b(a|one|another)\s+(finance|budget|journal|photo|music|crypto|stock|mail|email|notes?|task|tracker)\w*\s+app\b/i, 'an app identified by what it does'],
+    [/\b(unrestorable|lost (their|all|user) data|pruned real)\b/i, 'a data-loss incident'],
+  ];
+  for (const line of added) {
+    for (const [re, what] of incident) {
+      const m = line.match(re);
+      if (m)
+        fail(
+          `Incident detail in the public mirror ("${m[0]}": ${what}) — public text states the rule and how it is enforced; ` +
+            `the story of what went wrong stays in the private copy`,
+        );
+    }
+    const api = /^\|\s*\d+\.\d+\s*\|/.test(line) && line.match(/(GET|POST|PUT|PATCH|DELETE)?\s*`?\/api\/[\w/-]+/);
+    if (api)
+      fail(
+        `API path in a public history row ("${api[0].trim()}") — a real app's endpoint is attack detail; describe the rule instead`,
+      );
+  }
   for (const doc of ['BUILD-POLICY.md', 'project-standards.md']) {
     const content = readFile(path.join(PUBLIC_ROOT, doc));
     for (const re of internalProse) {
@@ -3983,6 +4023,91 @@ function cmdMirror() {
   };
   walk(PUBLIC_ROOT);
   if (leaks === 0) ok('No blocklisted terms or private patterns found in public mirror');
+  return finish();
+}
+
+/**
+ * `policy handoff`: the owning session declares its build-policy change
+ * complete. Refused unless `check` passes on build-policy. After it, only
+ * sessions opened in build-policy may edit, for review, the public mirror and
+ * the commit; the developer's commit releases the claim.
+ */
+function cmdHandoff() {
+  section('Build-policy handoff');
+  const owner = readJSON(POLICY_OWNER);
+  if (!policyTreeDirty()) {
+    ok('build-policy has no uncommitted changes — nothing to hand off');
+    return finish();
+  }
+  if (!owner || owner.status !== 'editing') {
+    fail(
+      owner
+        ? `Already handed off at ${owner.handedOffAt} — review, sync the mirror and commit from a build-policy session`
+        : 'No session holds the build-policy claim — nothing to hand off',
+    );
+    return finish();
+  }
+  const failures = complianceFailures(POLICY_ROOT);
+  if (failures.length > 0) {
+    for (const f of failures) fail(f);
+    console.log(`\nFinish the change first: 'policy check' must pass on build-policy before handoff.`);
+    return finish();
+  }
+  fs.writeFileSync(
+    POLICY_OWNER,
+    JSON.stringify({ ...owner, status: 'handed-off', handedOffAt: new Date().toISOString() }, null, 2) + '\n',
+  );
+  ok(`Handed off. The change is waiting for review in a build-policy session.`);
+  console.log(
+    `\nNext, in a Claude session opened in build-policy: review the diff, run 'policy mirror-sync', write the public ` +
+      `history rows (rule and enforcement only), pass 'policy mirror', then commit both repos.`,
+  );
+  return finish();
+}
+
+/**
+ * `policy mirror-sync`: the mechanical half of a public-mirror sync. Copies
+ * scripts/ and templates/ verbatim and moves the public doc headers to the
+ * private version. It writes no prose: the public history rows and standards
+ * text are written by hand in the build-policy session, and `policy mirror`
+ * then checks them.
+ */
+function cmdMirrorSync() {
+  section('Public mirror sync (mechanical part)');
+  if (!exists(PUBLIC_ROOT)) {
+    fail(`Public mirror not found at ${PUBLIC_ROOT}`);
+    return finish();
+  }
+  for (const sub of ['scripts', 'templates']) {
+    const src = path.join(POLICY_ROOT, sub);
+    const dest = path.join(PUBLIC_ROOT, sub);
+    fs.mkdirSync(dest, { recursive: true });
+    const names = fs.readdirSync(src).filter((f) => !f.startsWith('.') && fs.statSync(path.join(src, f)).isFile());
+    const copied = names.filter((f) => readFile(path.join(src, f)) !== readFile(path.join(dest, f)));
+    for (const f of copied) fs.copyFileSync(path.join(src, f), path.join(dest, f));
+    ok(`${sub}/: ${copied.length ? `copied ${copied.join(', ')}` : 'already in sync'}`);
+  }
+  const verOf = (s) => (s.match(/\*\*Version:\*\*\s*([\d.]+)/) || [])[1];
+  const privVer = verOf(readFile(path.join(POLICY_ROOT, 'BUILD-POLICY.md')));
+  const today = new Date().toISOString().slice(0, 10);
+  for (const doc of ['BUILD-POLICY.md', 'project-standards.md']) {
+    const file = path.join(PUBLIC_ROOT, doc);
+    const text = readFile(file);
+    const next = text
+      .replace(/\*\*Version:\*\*\s*[\d.]+/, `**Version:** ${privVer}`)
+      .replace(/\*\*Last updated:\*\*\s*[\d-]+/, `**Last updated:** ${today}`);
+    if (next !== text) fs.writeFileSync(file, next);
+  }
+  ok(`Public doc headers at ${privVer}`);
+  const rowsOf = (s) => [...s.matchAll(/^\|\s*(\d+\.\d+)\s*\|\s*\d{4}-\d{2}-\d{2}\s*\|/gm)].map((m) => m[1]);
+  const pubRows = new Set(rowsOf(readFile(path.join(PUBLIC_ROOT, 'BUILD-POLICY.md'))));
+  const missing = rowsOf(readFile(path.join(POLICY_ROOT, 'BUILD-POLICY.md'))).filter((v) => !pubRows.has(v));
+  if (missing.length)
+    warn(
+      `Write public history rows for ${missing.join(', ')} by hand: the rule and how it is enforced, no incident, ` +
+        `product, endpoint or plan. Port new project-standards text the same way. Then run: policy mirror`,
+    );
+  else ok('Public history has a row for every private version');
   return finish();
 }
 
@@ -4350,8 +4475,9 @@ function cmdHookStop() {
   // the policy change must be complete before the turn ends. A later session
   // has none of this one's context, so work left half-done here stays so.
   const owner = readJSON(POLICY_OWNER);
-  if (owner && owner.session === input.session_id && policyTreeDirty()) {
+  if (owner && owner.session === input.session_id && owner.status !== 'handed-off' && policyTreeDirty()) {
     const failures = complianceFailures(POLICY_ROOT);
+    const policyCli = path.join(POLICY_ROOT, 'scripts', 'policy.js');
     if (failures.length > 0) {
       console.log(
         JSON.stringify({
@@ -4360,6 +4486,21 @@ function cmdHookStop() {
             `BUILD-POLICY: this session changed build-policy and the change is incomplete:\n` +
             failures.map((f, i) => `${i + 1}. ${f}`).join('\n') +
             `\nFinish it now. Once this session ends, no later session has the context to finish it.`,
+        }),
+      );
+      process.exit(0);
+    }
+    // An app session's part ends at a complete private change. Review, the
+    // public mirror and the commit belong to a build-policy session.
+    if (!isUnderPolicyRoot(input.cwd || process.cwd())) {
+      console.log(
+        JSON.stringify({
+          decision: 'block',
+          reason:
+            `BUILD-POLICY: this session's build-policy change passes check. Hand it off now: node ${policyCli} handoff — ` +
+            `then tell the developer it is ready for review in a build-policy session, which syncs the public mirror and ` +
+            `prepares the commit. Do not edit build-policy-public from this session. If you are mid-change and not finished, ` +
+            `say so and continue.`,
         }),
       );
       process.exit(0);
@@ -4465,17 +4606,28 @@ function cmdHookStop() {
 /** PreToolUse hook: block electron DMG builds while the working tree is dirty;
  *  redirect raw semgrep invocations to the policy-defined script. */
 /**
- * One session at a time may hold uncommitted work in build-policy.
+ * One session at a time may hold uncommitted work in build-policy, and the
+ * public mirror is maintained only from a session opened in build-policy.
  *
  * App sessions are told to fix gaps in the shared standard, so sessions opened
- * in app projects edit ../build-policy. Every completion
- * check (Stop hook, gates, verify-marker) looks at the session's own project,
- * so those edits had none, and nothing stopped two sessions editing the same
- * files: 2.39, 2.40 and 2.41 were written by three sessions into one
- * uncommitted tree, and 2.41's session ended with the change half-done. The
- * first session to edit build-policy claims it in .policy/owner.json; until the
- * developer commits, another session's edit is refused and told whose work is
- * there. A clean tree releases the claim.
+ * in app projects edit ../build-policy. Every completion check (Stop hook,
+ * gates, verify-marker) looks at the session's own project, so those edits had
+ * none, and nothing stopped two sessions editing the same files: 2.39, 2.40
+ * and 2.41 were written by three sessions into one uncommitted tree, and
+ * 2.41's session ended with the change half-done. Then an app session synced
+ * the public mirror and published an exploitable endpoint and an unreleased
+ * product plan under a neutral name the blocklist could not see.
+ *
+ * The lifecycle, in .policy/owner.json:
+ *   editing     the first session to write to build-policy claims it; only
+ *               that session may write until it hands off. Its Stop hook
+ *               blocks while `check` fails and, for an app session, until it
+ *               runs `policy handoff`.
+ *   handed-off  the change is complete and waiting for review. Only sessions
+ *               opened in build-policy may write: they review, sync the
+ *               public mirror and prepare the commit.
+ *   (released)  the developer commits; a clean tree frees the next claim.
+ * App sessions are refused throughout and told to describe their gap instead.
  */
 const POLICY_OWNER = path.join(POLICY_ROOT, '.policy', 'owner.json');
 const POLICY_WRITE_OP =
@@ -4485,56 +4637,142 @@ function policyTreeDirty() {
   return changedFiles(POLICY_ROOT).some((f) => !f.startsWith('.policy/'));
 }
 
-// A command names build-policy by its real path, a relative ../build-policy,
-// or a ~ path, not by the substring: other directories (a session scratchpad
-// named after the project) contain "build-policy/" too.
-function commandNamesPolicyRepo(cmd, cwd) {
-  const esc = POLICY_ROOT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function isUnderRoot(p, cwd, root) {
+  if (!p) return false;
+  const abs = path.resolve(cwd || process.cwd(), String(p).replace(/^~(?=\/)/, os.homedir()));
+  return abs === root || abs.startsWith(root + path.sep);
+}
+function isUnderPolicyRoot(p, cwd) {
+  return isUnderRoot(p, cwd, POLICY_ROOT);
+}
+
+// A command names a repo by its real path, a relative ../<name>, or a ~ path,
+// not by the substring: other directories (a session scratchpad named after
+// the project) contain "build-policy/" too, and build-policy-public contains
+// "build-policy".
+function commandNamesRoot(cmd, root) {
+  const esc = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const name = path.basename(root).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return (
-    new RegExp(esc + '(/|\\b)').test(cmd) ||
-    /(^|[\s'"=:(])(\.\.\/)+build-policy(\/|\b)/.test(cmd) ||
-    /~\/[^\s'"]*\/build-policy(\/|\b)/.test(cmd) ||
-    isUnderPolicyRoot('.', cwd)
+    new RegExp(esc + '(?![\\w-])').test(cmd) ||
+    new RegExp(`(^|[\\s'"=:(])(\\.\\.\\/)+${name}(?![\\w-])`).test(cmd) ||
+    new RegExp(`~\\/[^\\s'"]*\\/${name}(?![\\w-])`).test(cmd)
   );
 }
 
-function isUnderPolicyRoot(p, cwd) {
-  if (!p) return false;
-  const abs = path.resolve(cwd || process.cwd(), p.replace(/^~(?=\/)/, os.homedir()));
-  return abs === POLICY_ROOT || abs.startsWith(POLICY_ROOT + path.sep);
+const INTERPRETER = /^(python3?|node|ruby|perl|bash|sh|zsh|deno|bun|npx|osascript)$/;
+
+/**
+ * Where does a shell command write? Returns the target paths it can name, and
+ * `unknown` when a segment hands control to an interpreter or a heredoc, whose
+ * writes cannot be read from the command line. Follows `cd` between segments,
+ * so `cd elsewhere && echo x >> file` is judged by where it writes rather than
+ * the directory the session started in.
+ */
+function bashWriteTargets(cmd, startCwd) {
+  let cwd = startCwd;
+  const targets = [];
+  let unknown = /<</.test(cmd);
+  const abs = (t) => path.resolve(cwd, t.replace(/^['"]|['"]$/g, '').replace(/^~(?=\/)/, os.homedir()));
+  for (const seg of cmd.split(/&&|\|\||;|\n|\|/)) {
+    for (const m of seg.matchAll(/(?<![0-9&<])>>?\s*("[^"]*"|'[^']*'|[^\s;&|<>]+)/g)) {
+      if (!/^['"]?\/dev\//.test(m[1])) targets.push(abs(m[1]));
+    }
+    const words = (seg.replace(/(?<![0-9&<])>>?\s*("[^"]*"|'[^']*'|[^\s;&|<>]+)/g, '').match(/"[^"]*"|'[^']*'|\S+/g) || [])
+      .map((w) => w.replace(/^['"]|['"]$/g, ''));
+    while (words.length && /^\w+=/.test(words[0])) words.shift();
+    if (words[0] === 'sudo' || words[0] === 'command' || words[0] === 'exec') words.shift();
+    const cmd0 = words[0];
+    if (!cmd0) continue;
+    const args = words.slice(1).filter((w) => !w.startsWith('-'));
+    if (cmd0 === 'cd') {
+      if (args[0]) cwd = abs(args[0]);
+    } else if (['cp', 'mv', 'install', 'rsync', 'ln'].includes(cmd0)) {
+      if (args.length) targets.push(abs(args[args.length - 1]));
+    } else if (['rm', 'rmdir', 'touch', 'truncate', 'mkdir', 'tee', 'chmod', 'unlink'].includes(cmd0)) {
+      for (const a of args) targets.push(abs(a));
+    } else if ((cmd0 === 'sed' || cmd0 === 'perl') && words.some((w) => /^-[a-z]*i/.test(w))) {
+      for (const a of args.slice(1)) targets.push(abs(a));
+    } else if (cmd0 === 'git' && /\s(checkout|restore|reset|stash|apply|revert|clean|am|merge|pull|rebase)\b/.test(seg)) {
+      const c = seg.match(/\s-C\s+(\S+)/);
+      targets.push(c ? abs(c[1]) : cwd);
+    } else if (cmd0 === 'patch') {
+      targets.push(cwd);
+    } else if (INTERPRETER.test(path.basename(cmd0))) {
+      // Our own CLI: mirror-sync writes the public mirror and nothing else;
+      // every other policy.js command leaves the policy repo's files alone.
+      if (/policy\.js["']?\s+mirror-sync\b/.test(seg)) targets.push(PUBLIC_ROOT);
+      else if (!/policy\.js\b/.test(seg)) unknown = true;
+    }
+  }
+  return { targets, unknown, cwd };
 }
 
-/** Does this tool call write inside build-policy? Bash is matched by shape:
- *  a write operation plus a build-policy path or a build-policy cwd. */
-function touchesPolicyRepo(input) {
+/** Does this tool call write inside `root`? */
+function writesUnder(input, root) {
   const ti = input.tool_input || {};
   const cwd = input.cwd || process.cwd();
   if (['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(input.tool_name))
-    return isUnderPolicyRoot(ti.file_path || ti.notebook_path, cwd);
+    return isUnderRoot(ti.file_path || ti.notebook_path, cwd, root);
   if (input.tool_name !== 'Bash') return false;
   const cmd = ti.command || '';
-  return commandNamesPolicyRepo(cmd, cwd) && POLICY_WRITE_OP.test(cmd);
+  const w = bashWriteTargets(cmd, cwd);
+  if (w.targets.some((t) => isUnderRoot(t, '/', root))) return true;
+  // An interpreter or heredoc may write anywhere: judge it by shape, a write
+  // operation in the text plus the repo named or the command running in it.
+  return (
+    w.unknown &&
+    POLICY_WRITE_OP.test(cmd) &&
+    (commandNamesRoot(cmd, root) || isUnderRoot(w.cwd, '/', root))
+  );
 }
 
-/** Claim build-policy for this session, or return why it may not edit. */
+function refuse(reason) {
+  console.log(
+    JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason },
+    }),
+  );
+  process.exit(0);
+}
+
+const APP_SESSION_REFUSAL =
+  `Do not edit build-policy from this session. If the gap you found should be fixed there, describe it in your final ` +
+  `message; the developer takes it to a build-policy session once the current change is committed.`;
+
+/** May this session write to build-policy? Claims it when free. Returns a refusal or null. */
 function claimPolicyRepo(input) {
   const owner = readJSON(POLICY_OWNER);
   const session = input.session_id || 'unknown';
-  if (owner && owner.session === session) return null;
+  const inPolicySession = isUnderPolicyRoot(input.cwd || process.cwd());
   if (!owner || !policyTreeDirty()) {
     fs.mkdirSync(path.dirname(POLICY_OWNER), { recursive: true });
     fs.writeFileSync(
       POLICY_OWNER,
-      JSON.stringify({ session, project: input.cwd || process.cwd(), since: new Date().toISOString() }, null, 2) + '\n',
+      JSON.stringify(
+        { session, project: input.cwd || process.cwd(), since: new Date().toISOString(), status: 'editing' },
+        null,
+        2,
+      ) + '\n',
     );
     return null;
   }
+  if (owner.status === 'handed-off') {
+    if (inPolicySession) return null;
+    return (
+      `BUILD-POLICY: build-policy holds a finished change waiting for review and commit (written by the session opened in ` +
+      `${owner.project}, handed off ${owner.handedOffAt}). Only a session opened in build-policy may edit it now. ` +
+      APP_SESSION_REFUSAL
+    );
+  }
+  if (owner.session === session) return null;
   return (
     `BUILD-POLICY: build-policy holds uncommitted work claimed by another session (${owner.session}, opened in ` +
-    `${owner.project}, since ${owner.since}). Editing it now would mix two sessions' changes in one tree, where either can ` +
-    `overwrite or mis-cite the other. Do not edit build-policy. Tell the developer: the build-policy changes need ` +
-    `reviewing and committing first (a clean tree releases the claim). If the gap you found should be fixed there, ` +
-    `describe it in your final message so it can be done after that commit.`
+    `${owner.project}, since ${owner.since}). Editing it now would mix two sessions' changes in one tree, where either ` +
+    `can overwrite or mis-cite the other. ` +
+    (inPolicySession
+      ? `Wait for that session to finish and run 'policy handoff'; the change can be reviewed and synced here after that.`
+      : APP_SESSION_REFUSAL)
   );
 }
 
@@ -4548,36 +4786,32 @@ function cmdHookPretool() {
       ? // The operation must act on the file; prose that mentions it is fine.
         /(\b(rm|mv|cp|tee|truncate|touch|unlink)\b|>>?|\b(open|writeFileSync|appendFileSync|unlinkSync|rmSync|renameSync)\s*\()[^|;&\n]*\.policy\/owner\.json/.test(
           cmd,
-        ) && commandNamesPolicyRepo(cmd, input.cwd)
+        ) && (commandNamesRoot(cmd, POLICY_ROOT) || isUnderPolicyRoot(input.cwd || process.cwd()))
       : /owner\.json$/.test(ti.file_path || '') && isUnderPolicyRoot(ti.file_path, input.cwd);
-  if (claimFileWrite) {
-    console.log(
-      JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: 'PreToolUse',
-          permissionDecision: 'deny',
-          permissionDecisionReason:
-            'BUILD-POLICY: .policy/owner.json records which session holds uncommitted build-policy work. The AI must not edit or remove it; ' +
-            'the claim is released when the developer commits build-policy.',
-        },
-      }),
+  if (claimFileWrite)
+    refuse(
+      'BUILD-POLICY: .policy/owner.json records which session holds uncommitted build-policy work. The AI must not edit or remove it; ' +
+        "the claim moves on through 'policy handoff' and is released when the developer commits build-policy.",
     );
-    process.exit(0);
-  }
-  if (touchesPolicyRepo(input)) {
-    const refusal = claimPolicyRepo(input);
-    if (refusal) {
-      console.log(
-        JSON.stringify({
-          hookSpecificOutput: {
-            hookEventName: 'PreToolUse',
-            permissionDecision: 'deny',
-            permissionDecisionReason: refusal,
-          },
-        }),
+  // Handing off is the owning session's act: another session cannot declare
+  // someone else's change finished.
+  if (input.tool_name === 'Bash' && /policy\.js["']?\s+handoff\b/.test(cmd)) {
+    const owner = readJSON(POLICY_OWNER);
+    if (owner && owner.status === 'editing' && owner.session !== input.session_id)
+      refuse(
+        `BUILD-POLICY: only the session that holds the build-policy claim can hand it off (${owner.session}, opened in ${owner.project}).`,
       );
-      process.exit(0);
-    }
+  }
+  // The public mirror is published. Only a build-policy session maintains it,
+  // because an app session sanitises by swapping names and keeps the incident.
+  if (writesUnder(input, PUBLIC_ROOT) && !isUnderPolicyRoot(input.cwd || process.cwd()))
+    refuse(
+      `BUILD-POLICY: the public mirror (build-policy-public) is maintained only from a session opened in build-policy, ` +
+        `which reviews what is about to be published. Do not edit it from this session.`,
+    );
+  if (writesUnder(input, POLICY_ROOT)) {
+    const refusal = claimPolicyRepo(input);
+    if (refusal) refuse(refusal);
   }
   if (input.tool_name !== 'Bash') process.exit(0);
   // --ack-manual is the developer's signature that manual release checks
@@ -4965,6 +5199,10 @@ function main() {
       return cmdUpgrade(dir, rest);
     case 'scaffold':
       return cmdScaffold(dir);
+    case 'handoff':
+      return cmdHandoff();
+    case 'mirror-sync':
+      return cmdMirrorSync();
     case 'mirror':
       return cmdMirror();
     case 'leak-scan':
