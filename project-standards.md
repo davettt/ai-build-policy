@@ -1,7 +1,7 @@
 # Project Standards
 
 The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
-**Version:** 2.48
+**Version:** 2.49
 **Last updated:** 2026-09-27
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
@@ -196,6 +196,7 @@ Checklist of what "done" looks like.
   Revisit if the stored value ever becomes something other than a user's own API key.
 
 - **Native modules** (e.g. better-sqlite3): add `"postinstall": "npx @electron/rebuild -f -w <module>"` and `"asarUnpack": ["**/*.node"]` in electron-builder config.
+- **The window shows the app's own icon and name.** The main UI carries the app icon (the same artwork as `build/icon.png`, served from the renderer, e.g. `public/icon.svg`) beside the product name, in the header or sidebar, on every screen. Once the window is in front the Dock icon is out of sight, so the window itself should say which app this is, and it's what screenshots, the help centre and the product page show. Placement follows the layout: top of the sidebar or a slim row above the page title for bottom-nav apps. About 24px, rounded, `alt=""` since the name beside it is the label; check light and dark mode. `check` FAILs an Electron app whose renderer has no icon/logo `<img>` and no `*Logo`/`*AppIcon`/`*BrandMark` component.
 - **The running version is visible without an update being available.** A user filing a bug report needs to answer "which version are you on?". If the only place the version appears is the update banner, it shows solely on a mismatch. macOS does expose it through About and Finder's Get Info, but that is a per-app menu a project can replace, and "click the app name in the menu bar" is a poor instruction to give the same way across every app.
 
   **Required:** the settings surface carries a footer line naming the app and version — `<App Name> v2.0.2`. Settings is the mandate because every app has one, it has room for the full string, and one consistent instruction ("open Settings, scroll to the bottom") then works everywhere, which is the whole point for support.

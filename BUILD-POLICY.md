@@ -1,6 +1,6 @@
 # Build & Development Policy
 
-**Version:** 2.48
+**Version:** 2.49
 **Last updated:** 2026-09-27
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
@@ -231,6 +231,7 @@ Only a session opened in build-policy edits the public copy. `policy mirror-sync
 
 | Version | Date | Changes |
 |---|---|---|
+| 2.49 | 2026-09-27 | Desktop apps show their own icon and name in the window. project-standards § Electron Desktop Apps requires the app icon (the same artwork as `build/icon.png`) beside the product name, in the header or sidebar, on every screen, since once the window is in front the Dock icon is out of sight. `check` FAILs an Electron app whose renderer has no icon or logo image and no logo component. |
 | 2.48 | 2026-09-27 | Desktop apps with an update banner offer a manual Check for updates control beside the version line in Settings. It calls the same check as launch, focus and the hourly timer, bypasses the one-hour throttle, and reports up to date, update available or a failed check, keeping the last known state on failure. `check` FAILs an Electron app without the control and a status message, and flags a version check that runs only in the main process. The release checklist exercises the manual check after the site version changes, and a relaunch still confirms the automatic check. |
 | 2.47 | 2026-09-27 | Build-policy changes are handed off, and only a build-policy session touches the public mirror. The claim has a lifecycle in `.policy/owner.json`: editing (only the owning session writes) → handed-off → released by the developer's commit. New `policy handoff` declares the change complete; it is refused unless `check` passes and unless run by the owning session, and an app session's Stop hook blocks until it has handed off. After handoff only sessions opened in build-policy may write, to review and fix it, and only they write the public mirror at any time. New `policy mirror-sync` copies `scripts/` and `templates/`, bumps the public headers and lists the history rows still to write by hand. `policy mirror` FAILs newly added public text that says where a rule was found, a product plan, an app identified by what it does, a data-loss incident, or an API path in a history row. Bash writes are judged by their targets, following `cd` between segments. |
 | 2.46 | 2026-09-27 | Local servers refuse cross-site writes. Loopback binding, the Host check and exact-origin CORS stop other sites reading a local API, but not sending to it: CORS blocks reading the response, not the request, so a page the user visits can still trigger a state-changing request. project-standards § Network Exposure adds a fourth layer: reject POST, PUT, PATCH and DELETE whose `Origin` header is present and is not the app's own origin (403), with smoke tests. `check` FAILs a server with no Origin check. |

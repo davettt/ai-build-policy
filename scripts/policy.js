@@ -900,6 +900,12 @@ function auditElectronStandards(dir, proj) {
   let versionCheck = null;
   let rendererVersionCheck = null;
   let manualUpdateControl = null;
+  // The window shows the app's own icon and name (policy 2.49): an <img> of the
+  // icon/logo/favicon, or a *Logo / *AppIcon / *BrandMark component. A nav icon
+  // image with "icon" in its path would also pass; the intent is a brand mark,
+  // and a false pass is cheaper than failing apps that do show one.
+  let brandMark = null;
+  const BRAND_MARK = /<img\b[^>]*\bsrc=[^>]*(?:icon|logo|favicon)[^>]*>|<[A-Z]\w*(?:Logo|AppIcon|BrandMark)\b/;
   let changelogLink = false;
   const walk = (d) => {
     let entries;
@@ -915,6 +921,11 @@ function auditElectronStandards(dir, proj) {
       if (e.isDirectory()) {
         walk(full);
         continue;
+      }
+      if (!brandMark && /\.(tsx|jsx|html)$/.test(e.name)) {
+        const relPath = path.relative(dir, full);
+        if (/^(src|renderer|app|public)\//.test(relPath) && BRAND_MARK.test(readFile(full)))
+          brandMark = relPath;
       }
       if (!/\.(ts|tsx|js|jsx|mjs)$/.test(e.name)) continue;
       const src = readFile(full);
@@ -1196,6 +1207,11 @@ function auditElectronStandards(dir, proj) {
   // which is the same code path a customer's stale copy hits; update the site
   // and it must clear. A "newer than" test shows nothing in that state, so the
   // release checklist's banner step passes while exercising nothing.
+  if (!brandMark) {
+    findings.push(
+      `the window never shows the app's icon and name — add the app icon (same artwork as build/icon.png) beside the product name in the header or sidebar, on every screen (project-standards § Electron)`,
+    );
+  }
   if (versionCheck) {
     if (/^electron\//.test(versionCheck)) {
       findings.push(
