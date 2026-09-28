@@ -905,7 +905,7 @@ function auditElectronStandards(dir, proj) {
   // image with "icon" in its path would also pass; the intent is a brand mark,
   // and a false pass is cheaper than failing apps that do show one.
   let brandMark = null;
-  const BRAND_MARK = /<img\b[^>]*\bsrc=[^>]*(?:icon|logo|favicon)[^>]*>|<[A-Z]\w*(?:Logo|AppIcon|BrandMark)\b/;
+  const BRAND_MARK = /<img\b[^>]*\bsrc=[^>]*(?:icon|logo|favicon)[^>]*>|<(?:[A-Z]\w*)?(?:Logo|AppIcon|BrandMark)\b/;
   let changelogLink = false;
   const walk = (d) => {
     let entries;
@@ -1709,11 +1709,13 @@ function auditNetworkExposure(dir) {
       findings.push(
         `${rel}: cors() with no options allows every origin — pass the app's exact origin(s) (project-standards § Network Exposure)`,
       );
-    if (/origin\s*:\s*(?:['"]\*['"]|true\b)/.test(code))
+    if (/\borigin\s*:\s*(?:['"]\*['"]|true\b)/.test(code))
       findings.push(
         `${rel}: CORS origin is a wildcard — any website can read the API. Pass the app's exact origin(s) (project-standards § Network Exposure)`,
       );
-    if (/origin\s*:\s*\/[^/\n]*localhost[^/\n]*\(\s*:\\d\+\s*\)\??/.test(code))
+    // Reads past escaped slashes: the usual form, /^https?:\/\/localhost(:\d+)?$/,
+    // has "\/\/" before localhost, which a plain [^/] stopped at.
+    if (/\borigin\s*:\s*\[?\s*\/(?:\\\/|[^/\n])*localhost(?:\\\/|[^/\n])*\(\s*:\\d\+\s*\)\??/.test(code))
       findings.push(
         `${rel}: CORS accepts localhost on any port — a page from any other local dev server can read this API. Use the exact origin, e.g. \`http://127.0.0.1:\${port}\` (project-standards § Network Exposure)`,
       );
@@ -2647,6 +2649,13 @@ const GATE_ORDER = [
   { name: 'Unit tests', script: 'test:unit' },
   { name: 'Smoke tests', script: 'test:smoke' },
   { name: 'Integration tests', script: 'test:integration' },
+  // End-to-end flows through the built app (Playwright). Help-centre pages and
+  // screenshots are captured from these flows, so a change that breaks a
+  // documented screen fails the app's own gates instead of surfacing later as
+  // a stale help page. Full gates only: a browser run is too slow for the
+  // pre-commit subset. The script rebuilds before running, which repeats the
+  // Build gate's work; accepted, it costs seconds.
+  { name: 'Flow tests', script: 'test:flows' },
 ];
 
 /**
@@ -3418,7 +3427,15 @@ function verifyRelease(dir, proj, flags) {
   // version was cut from. Enforced at sign-off rather than earlier, because the
   // developer creates the tag, and only once the release is real.
   const profile = releaseProfile(proj);
-  const checklist = RELEASE_CHECKLISTS[profile];
+  // Apps with help-centre pages capture their screenshots from the flow tests
+  // (docs:capture). A release is when a documented screen can change, so the
+  // capture and the help centre's drift check are part of signing it off.
+  const checklist = [
+    ...RELEASE_CHECKLISTS[profile],
+    ...(proj.pkg && proj.pkg.scripts && proj.pkg.scripts['docs:capture']
+      ? ["Ran npm run docs:capture, then rechecked the help pages the help centre's drift check flags (npm run drift in help-centre)"]
+      : []),
+  ];
   // Only the DMG-producing profiles have an artifact to stage the checklist on.
   const buildsArtifact = profile === 'gumroad' || profile === 'none';
 

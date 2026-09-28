@@ -1,7 +1,7 @@
 # Build & Development Policy
 
-**Version:** 2.51
-**Last updated:** 2026-09-27
+**Version:** 2.52
+**Last updated:** 2026-09-28
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
 
@@ -82,7 +82,7 @@ Each step names its enforcement. **Human judgment** steps are deliberately human
 
 | Step | Enforced by |
 |---|---|
-| Full gate sequence: type-check → lint → HTML/CSS → format → secrets → allowlist → SAST → audit → licenses → CodeRabbit → build → smoke → integration | `policy gates` runs them in order, stops at first failure, writes diff-hashed marker. Two gates are conditional: Socket runs only when the lockfile moved, CodeRabbit only when the diff contains source (or the tree is clean, or `--with-review`) |
+| Full gate sequence: type-check → lint → HTML/CSS → format → secrets → allowlist → SAST → audit → licenses → CodeRabbit → build → smoke → integration → flows (where defined) | `policy gates` runs them in order, stops at first failure, writes diff-hashed marker. Two gates are conditional: Socket runs only when the lockfile moved, CodeRabbit only when the diff contains source (or the tree is clean, or `--with-review`) |
 | Fast subset on every commit (type-check, lint, HTML/CSS, format, secrets, allowlist) | Husky pre-commit runs `policy gates --fast` — **commit is impossible if it fails** |
 | Gates re-run on GitHub: static checks, SAST, audit, licenses, **build, and every test tier** (+ gitleaks-action). `deps:check`, CodeRabbit and Socket stay local: `deps:check` resolves a sibling repo absent from a CI checkout, CodeRabbit is covered by its own GitHub app on PRs, and Socket runs at install time via the wrapper plus a pre-merge scan of Dependabot branches (project-standards § Supply Chain Security) | GitHub Actions CI on every push/PR — **the durable evidence record** |
 | Gates match the *current* diff (no edit-after-gates) | `verify-ready` compares marker hash to working tree |
@@ -207,7 +207,7 @@ Tool call output persists in the conversation context and is resent on every sub
 
 - **Performance has no gate.** Where it matters for an app, add a smoke-test assertion (e.g. response under N ms) in that project.
 - **The machinery guarantees tests run, not that tests are good.** Coverage quality is judgment; the route-coverage check in `verify-ready` catches untested endpoints, not weak tests.
-- **E2E (Playwright) is future tier** — adopt per-app for commercial apps with complex UI flows.
+- **E2E (Playwright) is per-app** — where a project defines `test:flows`, full gates run it; adopt it for commercial apps with complex UI flows or help-centre pages.
 - **Crash telemetry is a deliberate product decision, not an omission** — apps ship with local diagnostics logging + user-initiated export instead (privacy-first).
 
 ## Machine setup (one-time)
@@ -232,6 +232,7 @@ Only a session opened in build-policy edits the public copy. `policy mirror-sync
 
 | Version | Date | Changes |
 |---|---|---|
+| 2.52 | 2026-09-28 | Flow tests (`test:flows`, end-to-end through the built app) run as a full gate wherever a project defines them. The release checklist gains a step for apps that capture help-page screenshots (`docs:capture`): run the capture, then recheck the pages the help centre's drift check flags. The CORS checks anchor `origin`, so `crossorigin: true` no longer matches, and the any-port localhost check now reads past escaped slashes and inside an array, so `/^https?:\/\/localhost(:\d+)?$/` is caught. The window-icon check (2.49) now also accepts a component named exactly `Logo`, `AppIcon` or `BrandMark`; it previously required a prefix. |
 | 2.51 | 2026-09-27 | Homebrew installs are verified, like npm's. `~/.homebrew/brew.env`, which Homebrew reads on every run including non-interactive shells, now sets `HOMEBREW_VERIFY_ATTESTATIONS=1` (bottle build provenance verified with `gh attestation verify`), `HOMEBREW_NO_INSECURE_REDIRECT=1` and `HOMEBREW_CASK_OPTS=--require-sha`. The attestation variable is presence-based, so `=false` also turns it on; only `HOMEBREW_NO_VERIFY_ATTESTATIONS` turns it off. Attestations cover bottles from homebrew/core and supported taps, not source builds, casks or bottles already cached. `setup-machine` merges the settings into brew.env; `doctor` FAILs when one is missing, when the off switch is set, or when `gh` is signed out; the PreToolUse hook refuses brew install, upgrade, reinstall and bundle while attestation checks are off, counting settings given on the command line. |
 | 2.50 | 2026-09-27 | Public commit messages are checked before push. `policy mirror`, which the public repo's pre-push guard runs, reads the messages of commits not yet pushed and FAILs a blocklisted name, a portfolio count, a remediation action, or incident and plan wording. |
 | 2.49 | 2026-09-27 | Desktop apps show their own icon and name in the window. project-standards § Electron Desktop Apps requires the app icon (the same artwork as `build/icon.png`) beside the product name, in the header or sidebar, on every screen, since once the window is in front the Dock icon is out of sight. `check` FAILs an Electron app whose renderer has no icon or logo image and no logo component. |
