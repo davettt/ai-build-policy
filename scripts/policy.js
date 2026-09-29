@@ -699,6 +699,20 @@ function auditSite(dir) {
 function auditPolicyRepo(root) {
   auditPolicyDocVersions(root, 'policy docs');
 
+  // A change to the enforcement code is a policy change: it needs a changelog
+  // entry like any other. An app session handed off a policy.js fix with none,
+  // and `check` passed, because the doc-version rule only looks at versions the
+  // changelog already cites.
+  if (path.basename(root) === 'build-policy') {
+    const changed = changedFiles(root);
+    const code = changed.filter((f) => /^(scripts|templates|machine)\//.test(f));
+    if (code.length > 0 && !changed.includes('CHANGELOG.md'))
+      fail(
+        `policy docs: ${code.join(', ')} changed with no CHANGELOG.md entry — describe the change ` +
+          `(and bump the version with a history row if it changes what a check enforces)`,
+      );
+  }
+
   const hasPublicMirrorSibling =
     path.basename(root) !== 'build-policy-public' &&
     exists(path.join(path.dirname(root), 'build-policy-public'));
@@ -924,7 +938,8 @@ function auditElectronStandards(dir, proj) {
       }
       if (!brandMark && /\.(tsx|jsx|html)$/.test(e.name)) {
         const relPath = path.relative(dir, full);
-        if (/^(src|renderer|app|public)\//.test(relPath) && BRAND_MARK.test(readFile(full)))
+        // Root-level pages cover flat vanilla-JS apps (index.html beside server.js)
+        if (/^(src|renderer|app|public)\/|^[^/]+\.html$/.test(relPath) && BRAND_MARK.test(readFile(full)))
           brandMark = relPath;
       }
       if (!/\.(ts|tsx|js|jsx|mjs)$/.test(e.name)) continue;
@@ -943,15 +958,19 @@ function auditElectronStandards(dir, proj) {
       }
       // Static presence check; the release checklist verifies the actual
       // request and UI feedback in the installed app.
+      // Comments stripped so "// Check for updates hourly" does not count as the
+      // control. Flat vanilla-JS apps keep Settings wiring in one app.js, so a
+      // file that refers to settings in code qualifies as well as a settings path.
+      const updCode = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
       if (
         !manualUpdateControl &&
-        /settings/i.test(rel) &&
-        /Check for updates/i.test(src) &&
-        /onClick|addEventListener|onPress/.test(src) &&
+        (/settings/i.test(rel) || /settings/i.test(updCode)) &&
+        /Check for updates/i.test(updCode) &&
+        /onClick|addEventListener|onPress/.test(updCode) &&
         // A status message, not the button's own label: "Check for updates"
         // contains "check", so testing for it made this condition always true.
         /up.to.date|is available|available:|could not|couldn't|failed|checking/i.test(
-          src.replace(/Check for updates/gi, ''),
+          updCode.replace(/Check for updates/gi, ''),
         )
       ) {
         manualUpdateControl = rel;
