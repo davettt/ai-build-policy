@@ -1550,8 +1550,48 @@ function auditLockfileSync(dir) {
  * a lighter threat model (single user, localhost) but the same patterns prevent
  * bugs regardless of who is making the request.
  */
+/** Folders beside the root that hold a server's own package.json. */
+function serverPackageDirs(dir) {
+  const out = [];
+  for (const d of ['server', 'backend', 'api']) if (exists(path.join(dir, d, 'package.json'))) out.push(d);
+  for (const parent of ['apps', 'packages']) {
+    let names = [];
+    try {
+      names = fs.readdirSync(path.join(dir, parent));
+    } catch {
+      /* no such folder */
+    }
+    for (const n of names) if (exists(path.join(dir, parent, n, 'package.json'))) out.push(path.join(parent, n));
+  }
+  return out;
+}
+
+/**
+ * origin/HEAD records the remote's default branch. Git creates it only on
+ * clone, so a repository made on this Mac and then pushed never has it, and
+ * Claude Code's /security-review, which diffs against origin/HEAD, cannot run
+ * there. Returns the branch to point it at when it is missing and the remote
+ * branch is known locally, '' when missing with nothing to point at, and null
+ * when it is set or there is no origin remote.
+ */
+function missingOriginHead(dir) {
+  if (!sh('git remote', dir).out.split('\n').includes('origin')) return null;
+  if (sh('git symbolic-ref -q refs/remotes/origin/HEAD', dir).ok) return null;
+  const branch = sh('git rev-parse --abbrev-ref HEAD', dir).out.trim();
+  for (const b of [branch, 'main', 'master'])
+    if (b && sh(`git rev-parse --verify --quiet refs/remotes/origin/${safeToken(b, 'branch')}`, dir).ok) return b;
+  return '';
+}
+
 function auditSecurityInfrastructure(dir, proj) {
+  // An app may keep its server packages in their own package.json (a server/
+  // folder, or a monorepo package) rather than the root one. Reading only the
+  // root reported helmet missing in an app where it was installed.
   const deps = { ...(proj.pkg.dependencies || {}), ...(proj.pkg.devDependencies || {}) };
+  for (const sub of serverPackageDirs(dir)) {
+    const pkg = readJSON(path.join(dir, sub, 'package.json'));
+    if (pkg) Object.assign(deps, pkg.dependencies || {}, pkg.devDependencies || {});
+  }
   const findings = [];
 
   // helmet — sets X-Content-Type-Options, X-Frame-Options, HSTS and other
@@ -2478,6 +2518,15 @@ function cmdCheck(dir, flags = []) {
       );
     else ok(`.nvmrc matches the pinned Node (${have})`);
   }
+
+  // WARN, not FAIL: only /security-review needs it, and the Stop hook repeats
+  // the fix at the moment a security review is required. scaffold sets it.
+  const originHead = proj.isGit ? missingOriginHead(dir) : null;
+  if (originHead !== null)
+    warn(
+      `git has no origin/HEAD (created only by a clone), so /security-review cannot run here. Fix: ` +
+        (originHead ? `policy scaffold, or git remote set-head origin ${originHead}` : `git fetch origin, then policy scaffold`),
+    );
 
   const ciPath = path.join(dir, '.github/workflows/ci.yml');
   if (exists(ciPath)) {
@@ -3789,6 +3838,15 @@ function cmdScaffold(dir) {
   const created = [];
   const skipped = [];
 
+  // origin/HEAD: a local ref, so setting it touches nothing on GitHub.
+  if (proj.isGit) {
+    const branch = missingOriginHead(dir);
+    if (branch) {
+      const r = sh(`git remote set-head origin ${safeToken(branch, 'branch')}`, dir);
+      if (r.ok) created.push(`origin/HEAD -> origin/${branch}`);
+    }
+  }
+
   /**
    * Copy a reference implementation only when the project does not already
    * have the capability, wherever it lives.
@@ -4765,6 +4823,10 @@ function cmdHookStop() {
       reasons.push(
         `Security-sensitive files changed without a recorded review: ${sensitive.join(', ')}. ` +
           `These touch auth, secrets, crypto, CORS, payment or data deletion, where a missed bug is not a bug report — it is an incident. ` +
+          (proj.isGit && missingOriginHead(dir) !== null
+            ? `First make /security-review runnable (this repo has no origin/HEAD, which git creates only on clone): ` +
+              `${missingOriginHead(dir) ? `git remote set-head origin ${missingOriginHead(dir)}` : 'git fetch origin, then policy scaffold'}. `
+            : '') +
           `Run /security-review over these changes, fix what it finds, then record it: ` +
           `node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} security-ack` +
           (rec ? ` (a review is recorded, but for different content — it no longer applies).` : '.') +

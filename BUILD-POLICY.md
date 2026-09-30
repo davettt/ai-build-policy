@@ -1,7 +1,7 @@
 # Build & Development Policy
 
-**Version:** 2.53
-**Last updated:** 2026-09-29
+**Version:** 2.54
+**Last updated:** 2026-09-30
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
 
@@ -232,6 +232,7 @@ Only a session opened in build-policy edits the public copy. `policy mirror-sync
 
 | Version | Date | Changes |
 |---|---|---|
+| 2.54 | 2026-10-01 | The CI template's secret scan handles a new repository's first push, where the first pushed commit has no parent: a step detects it and runs gitleaks itself over the full history, with the download checked against the release's SHA-256. The helmet check reads a server's own `package.json` (`server/`, `backend/`, `api/`, `apps/*`, `packages/*`) as well as the root one. `/security-review` needs `origin/HEAD`, which git creates only on clone: `check` warns when it is missing, `scaffold` sets it locally, and the security-review reminder gives the command. |
 | 2.53 | 2026-09-29 | The window-icon check also reads root-level `.html` pages, and the Settings Check-for-updates check ignores comments and accepts a file that wires Settings in code, so apps without a component framework are read correctly. `check` on the policy repo FAILs a change to its scripts, templates or machine wiring with no changelog entry. |
 | 2.52 | 2026-09-28 | Flow tests (`test:flows`, end-to-end through the built app) run as a full gate wherever a project defines them. The release checklist gains a step for apps that capture help-page screenshots (`docs:capture`): run the capture, then recheck the pages the help centre's drift check flags. The CORS checks anchor `origin`, so `crossorigin: true` no longer matches, and the any-port localhost check now reads past escaped slashes and inside an array, so `/^https?:\/\/localhost(:\d+)?$/` is caught. The window-icon check (2.49) now also accepts a component named exactly `Logo`, `AppIcon` or `BrandMark`; it previously required a prefix. |
 | 2.51 | 2026-09-27 | Homebrew installs are verified, like npm's. `~/.homebrew/brew.env`, which Homebrew reads on every run including non-interactive shells, now sets `HOMEBREW_VERIFY_ATTESTATIONS=1` (bottle build provenance verified with `gh attestation verify`), `HOMEBREW_NO_INSECURE_REDIRECT=1` and `HOMEBREW_CASK_OPTS=--require-sha`. The attestation variable is presence-based, so `=false` also turns it on; only `HOMEBREW_NO_VERIFY_ATTESTATIONS` turns it off. Attestations cover bottles from homebrew/core and supported taps, not source builds, casks or bottles already cached. `setup-machine` merges the settings into brew.env; `doctor` FAILs when one is missing, when the off switch is set, or when `gh` is signed out; the PreToolUse hook refuses brew install, upgrade, reinstall and bundle while attestation checks are off, counting settings given on the command line. |
