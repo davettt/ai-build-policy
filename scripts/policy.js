@@ -886,13 +886,13 @@ function auditShippedElectron(dir) {
  * check. Matching is on imports and calls, not on the word appearing.
  */
 function auditElectronStandards(dir, proj) {
-  const deps = { ...(proj.pkg.dependencies || {}), ...(proj.pkg.devDependencies || {}) };
+  const deps = declaredDeps(dir, proj);
   const findings = [];
 
   const puppeteer = Object.keys(deps).filter((d) => /puppeteer/.test(d));
   if (puppeteer.length > 0) {
     findings.push(
-      `${puppeteer.join(', ')} in dependencies — Electron already is Chromium; use pdfmake for PDF export (project-standards § Electron)`,
+      `${puppeteer.join(', ')} in dependencies — PDF export will fail on customers' Macs: Puppeteer launches a Chromium it downloaded to ~/.cache/puppeteer during npm install, which exists on the build Mac and is not in the DMG. Use pdfmake (project-standards § Electron)`,
     );
   }
 
@@ -1550,10 +1550,12 @@ function auditLockfileSync(dir) {
  * a lighter threat model (single user, localhost) but the same patterns prevent
  * bugs regardless of who is making the request.
  */
-/** Folders beside the root that hold a server's own package.json. */
+/** Folders beside the root that hold their own package.json: a server's
+ *  packages, electron-builder's two-package layout, or monorepo packages. */
 function serverPackageDirs(dir) {
   const out = [];
-  for (const d of ['server', 'backend', 'api']) if (exists(path.join(dir, d, 'package.json'))) out.push(d);
+  for (const d of ['server', 'backend', 'api', 'app', 'electron'])
+    if (exists(path.join(dir, d, 'package.json'))) out.push(d);
   for (const parent of ['apps', 'packages']) {
     let names = [];
     try {
@@ -1583,15 +1585,23 @@ function missingOriginHead(dir) {
   return '';
 }
 
-function auditSecurityInfrastructure(dir, proj) {
-  // An app may keep its server packages in their own package.json (a server/
-  // folder, or a monorepo package) rather than the root one. Reading only the
-  // root reported helmet missing in an app where it was installed.
+/**
+ * Every dependency the project declares, in the root package.json and in any
+ * nested one (serverPackageDirs). A rule about what an app depends on must read
+ * all of them: helmet and puppeteer were each reported wrongly because a check
+ * read only the root while the server kept its own package.json.
+ */
+function declaredDeps(dir, proj) {
   const deps = { ...(proj.pkg.dependencies || {}), ...(proj.pkg.devDependencies || {}) };
   for (const sub of serverPackageDirs(dir)) {
     const pkg = readJSON(path.join(dir, sub, 'package.json'));
     if (pkg) Object.assign(deps, pkg.dependencies || {}, pkg.devDependencies || {});
   }
+  return deps;
+}
+
+function auditSecurityInfrastructure(dir, proj) {
+  const deps = declaredDeps(dir, proj);
   const findings = [];
 
   // helmet — sets X-Content-Type-Options, X-Frame-Options, HSTS and other

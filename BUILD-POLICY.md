@@ -1,7 +1,7 @@
 # Build & Development Policy
 
-**Version:** 2.54
-**Last updated:** 2026-09-30
+**Version:** 2.55
+**Last updated:** 2026-10-01
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
 
@@ -232,6 +232,7 @@ Only a session opened in build-policy edits the public copy. `policy mirror-sync
 
 | Version | Date | Changes |
 |---|---|---|
+| 2.55 | 2026-10-02 | The Puppeteer check reads every `package.json` in a project, including a server's own, as the helmet check does (`server/`, `backend/`, `api/`, `app/`, `electron/`, `apps/*`, `packages/*`). The standard now gives the reason that matters: `puppeteer.launch()` runs a Chromium that `npm install` downloaded to `~/.cache/puppeteer`, which is on the build Mac and not in the app bundle, so PDF export fails on customers' Macs. |
 | 2.54 | 2026-10-01 | The CI template's secret scan handles a new repository's first push, where the first pushed commit has no parent: a step detects it and runs gitleaks itself over the full history, with the download checked against the release's SHA-256. The helmet check reads a server's own `package.json` (`server/`, `backend/`, `api/`, `apps/*`, `packages/*`) as well as the root one. `/security-review` needs `origin/HEAD`, which git creates only on clone: `check` warns when it is missing, `scaffold` sets it locally, and the security-review reminder gives the command. |
 | 2.53 | 2026-09-29 | The window-icon check also reads root-level `.html` pages, and the Settings Check-for-updates check ignores comments and accepts a file that wires Settings in code, so apps without a component framework are read correctly. `check` on the policy repo FAILs a change to its scripts, templates or machine wiring with no changelog entry. |
 | 2.52 | 2026-09-28 | Flow tests (`test:flows`, end-to-end through the built app) run as a full gate wherever a project defines them. The release checklist gains a step for apps that capture help-page screenshots (`docs:capture`): run the capture, then recheck the pages the help centre's drift check flags. The CORS checks anchor `origin`, so `crossorigin: true` no longer matches, and the any-port localhost check now reads past escaped slashes and inside an array, so `/^https?:\/\/localhost(:\d+)?$/` is caught. The window-icon check (2.49) now also accepts a component named exactly `Logo`, `AppIcon` or `BrandMark`; it previously required a prefix. |

@@ -1,8 +1,8 @@
 # Project Standards
 
 The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
-**Version:** 2.54
-**Last updated:** 2026-09-30
+**Version:** 2.55
+**Last updated:** 2026-10-01
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -185,7 +185,7 @@ Checklist of what "done" looks like.
 - **Dynamic port (mandatory):** The Electron main process MUST use `findFreePort()` (bind to port 0, read the assigned port, close, then pass it to Express). NEVER hardcode a port — it will collide with the PM2 dev instance or any other local server, silently connecting to the wrong process and potentially corrupting data. Reference: `a-reference-app/electron/main.js`.
 - Zustand for state management
 - `contextIsolation: true`, `nodeIntegration: false`
-- **PDF export:** use **pdfmake** (pure JS, no Chromium dependency). Do NOT use Puppeteer — it bundles a ~150MB Chromium binary unnecessarily since Electron already IS Chromium.
+- **PDF export:** use **pdfmake** (pure JS, no browser needed). Do NOT use Puppeteer: PDFs fail on customers' Macs. `puppeteer.launch()` runs a Chromium that `npm install` downloaded to `~/.cache/puppeteer`, which exists on the Mac that built the app and is not inside the DMG, so export works in development and in your own installed copy, and fails for buyers. `check` reads every `package.json` in the project, including a server's own, for it.
 - **Secret storage:** AES-256-CBC with a machine-derived key (`SHA256(appname:hostname:username)`). Do NOT use Electron `safeStorage` — its encrypted values go stale across app re-signs/updates (see a-reference-app `server/ai.js` `isStaleSafeStorageKey` for the migration that moved off it).
 - **Secret storage — what it defends against, and what it does not.** The property being bought is that a config file copied to another machine does not decrypt, because the key is derived from that machine. It is not protection against code running as the user on the same machine: `hostname` and `username` are readable, so the key is derivable, and the value at risk is the user's own BYOK API key rather than user data or payment details. Stated because the scheme reads like strong encryption and is not; it is machine-binding.
 
