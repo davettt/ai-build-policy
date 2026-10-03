@@ -2,7 +2,8 @@
 
 /**
  * Verify an npm package before adding it to the allowlist.
- * Queries npm registry and Socket CLI for metadata, flags risks.
+ * Queries the npm registry for metadata and Socket for one package score,
+ * flags risks, and prints the allowlist entry with the score recorded.
  * Includes maintenance lifecycle assessment.
  *
  * Usage: node verify-package.js <package-name>
@@ -239,20 +240,74 @@ async function main() {
   );
   console.log(`  ${DIM}Assessment: ${maintenance}${RESET}`);
 
-  // Socket CLI check
-  console.log();
+  // Socket risk assessment: one score for this package and its dependencies.
+  // Installs no longer go through the Socket wrapper (policy 2.58); a new
+  // package is the moment that warrants a closer look, so its score is taken
+  // here and recorded in the allowlist entry, which deps:check requires.
+  console.log(`\n  ${BOLD}Socket risk assessment:${RESET}`);
+  let socket = { checked: null, status: 'unavailable' };
   try {
-    const socketOutput = execFileSync('socket', ['npm', 'info', pkg], {
+    const out = execFileSync('socket', ['package', 'score', 'npm', `${pkg}@${latest}`, '--json'], {
       encoding: 'utf8',
-      timeout: 15000,
+      timeout: 60000,
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const socketLines = socketOutput.split('\n').filter((l) => l.trim());
-    console.log(`  ${BOLD}Socket CLI output:${RESET}`);
-    for (const line of socketLines.slice(0, 20)) {
-      console.log(`  ${line}`);
+    const parsed = JSON.parse(out.slice(out.indexOf('{')));
+    if (parsed.ok === false) throw Object.assign(new Error(JSON.stringify(parsed)), { stdout: out });
+    const data = parsed.data || {};
+    const self = (data.self && data.self.score) || {};
+    const deep = (data.transitively && data.transitively.score) || {};
+    const alerts = [...((data.self && data.self.alerts) || []), ...((data.transitively && data.transitively.alerts) || [])];
+    const serious = alerts.filter((a) => /critical|high/i.test(String(a.severity || a.severityName || '')));
+    socket = {
+      checked: new Date().toISOString().split('T')[0],
+      status: 'scored',
+      supplyChain: self.supplyChain,
+      vulnerability: self.vulnerability,
+      deepSupplyChain: deep.supplyChain,
+      deepVulnerability: deep.vulnerability,
+      // Type plus whatever identifies it (CVE/GHSA id or title, affected package)
+      alerts: serious
+        .map((a) => {
+          const pr = a.props || {};
+          return [a.type || a.name || 'alert', pr.cveId || pr.ghsaId || pr.title, a.purl || a.package || pr.purl]
+            .filter(Boolean)
+            .join(' ');
+        })
+        .slice(0, 10),
+    };
+    // Judge the package's own scores and specific alerts. The with-dependencies
+    // score is an aggregate over everything it pulls in: anything built on
+    // React and a build tool lands around 50-70, so flagging it fired on every
+    // ordinary framework and taught sessions to argue past the flag. It is
+    // recorded, so a later re-score shows whether it dropped.
+    const low = (v) => typeof v === 'number' && v < 90;
+    const before = flags;
+    // flag() only prints; this script counts flags itself.
+    if (low(self.supplyChain)) {
+      flag(`Socket supply-chain score ${self.supplyChain} for the package itself — below 90`);
+      flags++;
     }
-  } catch {
-    warn('Socket CLI not available or query failed — manual review required');
+    else pass(`Socket supply-chain score ${self.supplyChain} for the package itself`);
+    if (low(self.vulnerability)) {
+      flag(`Socket vulnerability score ${self.vulnerability} for the package itself — below 90`);
+      flags++;
+    } else pass(`Socket vulnerability score ${self.vulnerability} for the package itself`);
+    if (serious.length) {
+      flag(`Socket critical/high alerts in the package or its dependencies: ${socket.alerts.join(', ')}`);
+      flags++;
+    }
+    console.log(
+      `  ${DIM}With dependencies (recorded, not judged): supply chain ${deep.supplyChain}, vulnerability ${deep.vulnerability}${RESET}`,
+    );
+    socket.flagged = flags > before;
+  } catch (err) {
+    const msg = `${(err && err.stdout) || ''} ${(err && err.stderr) || ''} ${(err && err.message) || ''}`;
+    flag(
+      `No Socket score (${/429/.test(msg) ? 'rate limited — check socket organization quota and retry' : 'socket CLI unavailable or failed'}). ` +
+        `The package is not approvable until a score is recorded, or the developer records a waiver in the allowlist entry.`,
+    );
+    flags++;
   }
 
   // Summary
@@ -287,11 +342,17 @@ async function main() {
     repoArchived: repoArchived !== null ? repoArchived : false,
     maintenance,
     successor: deprecated || null,
+    socket,
     notes: '',
   };
   console.log(JSON.stringify({ [pkg]: entry }, null, 2));
   console.log();
 
+  if (socket.flagged)
+    console.log(
+      `${YELLOW}Socket raised a flag. If the package is accepted anyway, record why in the entry, or deps:check refuses it:\n` +
+        `  "socket": { ..., "decision": { "verdict": "accepted", "reason": "<why>", "date": "${new Date().toISOString().split('T')[0]}" } }${RESET}\n`,
+    );
   if (flags > 0) process.exit(1);
 }
 

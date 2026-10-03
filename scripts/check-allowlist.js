@@ -39,6 +39,43 @@ const allDeps = [...Object.keys(pkg.dependencies || {}), ...Object.keys(pkg.devD
 const allowedNames = new Set(Object.keys(allowlist));
 const unapproved = allDeps.filter((dep) => !allowedNames.has(dep));
 
+// Entries approved from policy 2.58 on carry a Socket score taken when the
+// package was verified (verify-package.js), or a waiver the developer wrote.
+// Earlier entries were approved under the install-time wrapper and keep that.
+const SCORE_REQUIRED_FROM = '2026-10-03';
+const unscored = allDeps.filter((dep) => {
+  const e = allowlist[dep];
+  if (!e || !e.verified || e.verified < SCORE_REQUIRED_FROM) return false;
+  const sc = e.socket || {};
+  return !(sc.status === 'scored' && sc.checked) && !sc.waived;
+});
+// A score that raised a flag needs the decision recorded with it, so the next
+// session reads why the package was accepted instead of re-arguing it.
+const undecided = allDeps.filter((dep) => {
+  const sc = (allowlist[dep] && allowlist[dep].socket) || {};
+  if (!sc.flagged) return false;
+  const d = sc.decision || {};
+  return !(d.verdict === 'accepted' && d.reason && String(d.reason).trim() && d.date);
+});
+if (undecided.length > 0) {
+  console.error(`${RED}${BOLD}${undecided.length} package(s) with a Socket flag and no recorded decision:${RESET}\n`);
+  for (const dep of undecided) console.error(`  ${RED}✗${RESET} ${dep}`);
+  console.error(
+    `\nRecord why each was accepted: "socket": { ..., "decision": { "verdict": "accepted", "reason": "<why>", "date": "YYYY-MM-DD" } }, ` +
+      `or remove the package.\n`,
+  );
+  process.exit(1);
+}
+if (unscored.length > 0) {
+  console.error(`${RED}${BOLD}${unscored.length} package(s) approved without a Socket score:${RESET}\n`);
+  for (const dep of unscored) console.error(`  ${RED}✗${RESET} ${dep}`);
+  console.error(
+    `\nRe-run node build-policy/scripts/verify-package.js <package> once Socket answers, and copy its "socket" field into ` +
+      `allowed-packages.json. If Socket cannot score it, the developer may record "socket": { "waived": "<reason>" } by hand.\n`,
+  );
+  process.exit(1);
+}
+
 if (unapproved.length === 0) {
   console.log(`${GREEN}${BOLD}All ${allDeps.length} dependencies are on the allowlist.${RESET}`);
   process.exit(0);

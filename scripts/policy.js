@@ -531,7 +531,6 @@ const BASE_SCRIPTS = [
   'licenses',
   'deps:check',
   'review',
-  'socket:scan',
 ];
 
 // The policy docs state their version in a header line, and BUILD-POLICY.md
@@ -563,6 +562,15 @@ function auditPolicyDocVersions(root, label) {
           `bump the header (a new history row without a header bump makes every citation of the version wrong)`,
       );
     } else ok(`${label}: BUILD-POLICY.md header matches version history (${bpVer})`);
+
+    // Two sessions numbering their changes from the same committed version
+    // both wrote a 2.56 row; the header and ordering checks below pass on that.
+    const dupes = [...new Set(rows.filter((v, i) => rows.indexOf(v) !== i))];
+    if (dupes.length > 0)
+      fail(
+        `${label}: BUILD-POLICY.md version history has more than one row for ${dupes.join(', ')} — ` +
+          `two changes were numbered from the same release; renumber the later one`,
+      );
 
     const misordered = rows.findIndex((v, i) => i > 0 && cmpSemver(v, rows[i - 1]) > 0);
     if (misordered > 0) {
@@ -1532,10 +1540,9 @@ function auditLockfileSync(dir) {
     fail(
       `package-lock.json is out of sync with package.json — 'npm ci' in CI will refuse to install: ` +
         `${errors.slice(0, 6).join('; ')}${errors.length > 6 ? `; +${errors.length - 6} more` : ''}. ` +
-        `Usual cause: a package was added with socket npm install, whose wrapper swaps in its own older copy of npm's resolver ` +
-        `and prunes optional subtrees from the lockfile and node_modules. Restore them with a plain install, no package name: ` +
-        `socket raw-npm install --ignore-scripts — it re-resolves from package.json, and the Socket scan gate covers the ` +
-        `restored packages. Confirm with git diff package-lock.json, then re-run gates. Never hand-edit the lockfile`,
+        `Re-resolve with a plain install and no package name: npm install. Confirm with git diff package-lock.json that ` +
+        `the entries return, then re-run gates. (The usual past cause was the retired Socket npm wrapper, whose older ` +
+        `resolver pruned optional subtrees.) Never hand-edit the lockfile`,
     );
   } else ok("Lockfile in sync with package.json (the check 'npm ci' runs in CI)");
 }
@@ -1598,6 +1605,110 @@ function declaredDeps(dir, proj) {
     if (pkg) Object.assign(deps, pkg.dependencies || {}, pkg.devDependencies || {});
   }
   return deps;
+}
+
+/** Installed packages that declare preinstall, install or postinstall scripts. */
+function installScriptPackages(dir) {
+  const r = sh(`npm query ':attr(scripts, [preinstall]), :attr(scripts, [install]), :attr(scripts, [postinstall])'`, dir);
+  if (!r.ok) return null;
+  try {
+    return [...new Set(JSON.parse(r.out.slice(r.out.indexOf('['))).map((x) => x.name))].sort();
+  } catch {
+    return null;
+  }
+}
+
+function auditInstallScripts(dir) {
+  const allowPath = path.join(dir, 'allowed-packages.json');
+  if (!exists(path.join(dir, 'node_modules')) || !exists(allowPath)) return;
+  const found = installScriptPackages(dir);
+  if (found === null) return warn('Could not list install-script packages (npm query failed)');
+  const recorded = (readJSON(allowPath) || {})._installScripts;
+  if (!recorded) {
+    fail(
+      `allowed-packages.json has no _installScripts record. These run code at install: ${found.join(', ') || '(none)'}. ` +
+        `Run policy scaffold to record the current set as the baseline, then gates`,
+    );
+    return;
+  }
+  const unrecorded = found.filter((n) => !(n in recorded));
+  if (unrecorded.length > 0)
+    fail(
+      `New package(s) that run code at install time: ${unrecorded.join(', ')}. Find which dependency brought each in ` +
+        `(npm ls <name>), check what its script does, and if it is acceptable add it to allowed-packages.json ` +
+        `_installScripts with the reason, e.g. "esbuild": "native binary for the Vite build" (project-standards § Supply Chain Security)`,
+    );
+  else ok(`Install-time scripts all recorded (${found.length}: ${found.join(', ') || 'none'})`);
+}
+
+/**
+ * Advisory exceptions: a developer's dated decision to carry a known high or
+ * critical advisory that has no fix, recorded in the project's committed
+ * audit-exceptions.json (policy 2.58). First case: GHSA-ch52-4w7c-c8xp in
+ * http-cache-semantics, reached through astro, no patched release; the flaw
+ * needs a shared cache serving several users, which a static build lacks.
+ *
+ *   { "GHSA-xxxx": { "package": "...", "via": "...", "reason": "...",
+ *                    "decided": "YYYY-MM-DD", "expires": "YYYY-MM-DD" } }
+ *
+ * An exception covers that advisory in that package only, expires at most 90
+ * days after it was decided, and lapses when a fix ships (health asks GitHub).
+ * Accepting a known high vulnerability is a security exclusion, so the AI may
+ * draft an entry but not write the file.
+ */
+const AUDIT_EXCEPTIONS = 'audit-exceptions.json';
+const AUDIT_EXCEPTION_MAX_DAYS = 90;
+
+function loadAuditExceptions(dir) {
+  return readJSON(path.join(dir, AUDIT_EXCEPTIONS)) || {};
+}
+
+/** Problems with the exception file itself: missing fields, too long, expired. */
+function auditExceptionProblems(exceptions, today = new Date().toISOString().slice(0, 10)) {
+  const problems = [];
+  for (const [id, e] of Object.entries(exceptions)) {
+    if (!/^GHSA-[\w-]+$/.test(id)) problems.push(`${id}: key must be a GHSA advisory id`);
+    if (!e || !e.package || !e.reason || !e.decided || !e.expires) {
+      problems.push(`${id}: needs package, reason, decided and expires`);
+      continue;
+    }
+    const span = (new Date(e.expires) - new Date(e.decided)) / 86400000;
+    if (!(span > 0) || span > AUDIT_EXCEPTION_MAX_DAYS)
+      problems.push(`${id}: expires ${e.expires} is more than ${AUDIT_EXCEPTION_MAX_DAYS} days after ${e.decided}`);
+    if (e.expires < today) problems.push(`${id}: expired on ${e.expires} — re-decide or remove it`);
+  }
+  return problems;
+}
+
+/**
+ * The audit gate, honouring exceptions. Fails on every high or critical
+ * advisory (the source behind a finding, not the parents that inherit it)
+ * that no valid exception covers for that package.
+ */
+function auditWithExceptions(dir) {
+  const exceptions = loadAuditExceptions(dir);
+  const problems = auditExceptionProblems(exceptions);
+  if (problems.length) return { ok: false, out: `audit-exceptions.json: ${problems.join('; ')}` };
+  const r = sh('npm audit --json --omit=dev', dir);
+  let report;
+  try {
+    report = JSON.parse(r.out.slice(r.out.indexOf('{')));
+  } catch {
+    return { ok: false, out: `could not read npm audit output: ${r.out.slice(0, 300)}` };
+  }
+  const advisories = [];
+  for (const [name, v] of Object.entries(report.vulnerabilities || {}))
+    for (const via of v.via || [])
+      if (via && typeof via === 'object' && /high|critical/.test(via.severity || ''))
+        advisories.push({ id: String(via.url || '').split('/').pop(), pkg: via.name || name, title: via.title });
+  const open = advisories.filter((a) => !(exceptions[a.id] && exceptions[a.id].package === a.pkg));
+  const covered = advisories.length - open.length;
+  if (open.length)
+    return {
+      ok: false,
+      out: open.map((a) => `${a.id} in ${a.pkg}: ${a.title}`).join('\n'),
+    };
+  return { ok: true, out: covered ? `${covered} advisory finding(s) covered by audit-exceptions.json` : 'no high or critical advisories' };
 }
 
 function auditSecurityInfrastructure(dir, proj) {
@@ -1848,9 +1959,36 @@ function isCurrentModelId(id, current) {
   );
 }
 
+/**
+ * A project's recorded model exception (registry.json `modelExceptions`, keyed by the
+ * package.json name): IDs the developer chose on purpose for that app, with the reason and date.
+ */
+function modelExceptionFor(dir) {
+  const exceptions = loadRegistry().modelExceptions || {};
+  let name = '';
+  try {
+    name = JSON.parse(readFile(path.join(dir, 'package.json'))).name || '';
+  } catch {
+    return null;
+  }
+  const entry = exceptions[name];
+  return entry && Array.isArray(entry.ids) ? { name, ...entry } : null;
+}
+
 function auditModelIds(dir) {
-  const current = currentModelIds();
+  const exception = modelExceptionFor(dir);
+  const current = [...currentModelIds(), ...(exception ? exception.ids : [])];
   if (current.length === 0) return;
+  if (exception) {
+    const age = (Date.now() - new Date(exception.decided).getTime()) / 86_400_000;
+    const window = exception.reviewEveryDays || 60;
+    if (!Number.isFinite(age) || age > window) {
+      warn(
+        `registry.json modelExceptions.${exception.name} (decided ${exception.decided}) is past its ${window}-day review: ` +
+          `confirm ${exception.ids.join(', ')} are still the right models for this app, then update the date`,
+      );
+    }
+  }
   const stale = [];
   let seen = 0;
 
@@ -1908,7 +2046,11 @@ function auditModelIds(dir) {
         `and mark migration maps with a policy:legacy-model-ids comment (project-standards § AI Integration)`,
     );
   } else if (seen > 0) {
-    ok('AI model IDs match registry.json');
+    ok(
+      exception
+        ? `AI model IDs match registry.json (with this app's recorded exception: ${exception.ids.join(', ')})`
+        : 'AI model IDs match registry.json',
+    );
   }
 }
 
@@ -2538,12 +2680,18 @@ function cmdCheck(dir, flags = []) {
         (originHead ? `policy scaffold, or git remote set-head origin ${originHead}` : `git fetch origin, then policy scaffold`),
     );
 
+  if (exists(path.join(dir, AUDIT_EXCEPTIONS))) {
+    const problems = auditExceptionProblems(loadAuditExceptions(dir));
+    if (problems.length) fail(`audit-exceptions.json: ${problems.join('; ')}`);
+    else ok(`audit-exceptions.json valid (${Object.keys(loadAuditExceptions(dir)).length} exception(s))`);
+  }
+
   const ciPath = path.join(dir, '.github/workflows/ci.yml');
   if (exists(ciPath)) {
     const norm = (s) => s.replace(/\s+/g, ' ').trim();
-    if (norm(readFile(ciPath)) !== norm(readFile(path.join(TEMPLATES, 'ci.yml')))) {
+    if (norm(canonicalPolicyPath(readFile(ciPath), dir)) !== norm(readFile(path.join(TEMPLATES, 'ci.yml')))) {
       fail(
-        'ci.yml differs from the shared template — sync it: cp ../build-policy/templates/ci.yml .github/workflows/ci.yml (deviations belong in the template, not the project)',
+        `ci.yml differs from the shared template — sync it: cp ${policyRel(dir)}/templates/ci.yml .github/workflows/ci.yml (deviations belong in the template, not the project)`,
       );
     } else ok('CI workflow matches shared template');
   }
@@ -2552,9 +2700,9 @@ function cmdCheck(dir, flags = []) {
   const pcPath = path.join(dir, '.husky/pre-commit');
   if (exists(pcPath)) {
     const norm = (s) => s.replace(/\s+/g, ' ').trim();
-    if (norm(readFile(pcPath)) !== norm(readFile(path.join(TEMPLATES, 'pre-commit')))) {
+    if (norm(canonicalPolicyPath(readFile(pcPath), dir)) !== norm(readFile(path.join(TEMPLATES, 'pre-commit')))) {
       fail(
-        '.husky/pre-commit differs from the shared template — THIS PROJECT IS UNENFORCED (no verify-marker). Sync: cp ../build-policy/templates/pre-commit .husky/pre-commit',
+        `.husky/pre-commit differs from the shared template — THIS PROJECT IS UNENFORCED (no verify-marker). Sync: delete .husky/pre-commit, then policy scaffold (writes this project's path to build-policy, ${policyRel(dir)})`,
       );
     } else ok('Pre-commit hook matches shared template');
   }
@@ -2564,9 +2712,9 @@ function cmdCheck(dir, flags = []) {
   const dbPath = path.join(dir, '.github/dependabot.yml');
   if (exists(dbPath)) {
     const norm = (s) => s.replace(/['"]/g, '').replace(/\s+/g, ' ').trim();
-    if (norm(readFile(dbPath)) !== norm(readFile(path.join(TEMPLATES, 'dependabot.yml')))) {
+    if (norm(canonicalPolicyPath(readFile(dbPath), dir)) !== norm(readFile(path.join(TEMPLATES, 'dependabot.yml')))) {
       fail(
-        'dependabot.yml differs from the shared template — sync: cp ../build-policy/templates/dependabot.yml .github/dependabot.yml (deviations belong in the template)',
+        `dependabot.yml differs from the shared template — sync: cp ${policyRel(dir)}/templates/dependabot.yml .github/dependabot.yml (deviations belong in the template)`,
       );
     } else ok('Dependabot config matches shared template');
   }
@@ -2575,9 +2723,9 @@ function cmdCheck(dir, flags = []) {
   const agPath = path.join(dir, 'AGENTS.md');
   if (exists(agPath)) {
     const norm = (s) => s.replace(/\s+/g, ' ').trim();
-    if (norm(readFile(agPath)) !== norm(readFile(path.join(TEMPLATES, 'AGENTS.md')))) {
+    if (norm(canonicalPolicyPath(readFile(agPath), dir)) !== norm(readFile(path.join(TEMPLATES, 'AGENTS.md')))) {
       fail(
-        'AGENTS.md differs from the shared template — sync: cp ../build-policy/templates/AGENTS.md AGENTS.md',
+        `AGENTS.md differs from the shared template — sync: delete AGENTS.md, then policy scaffold (writes this project's path to build-policy, ${policyRel(dir)})`,
       );
     } else ok('AGENTS.md matches shared template');
   }
@@ -2707,11 +2855,6 @@ const GATE_ORDER = [
   { name: 'Dependency allowlist', script: 'deps:check', fast: true },
   { name: 'SAST (Semgrep)', script: 'sast' },
   { name: 'Dependency audit', script: 'security' },
-  // Quota-bounded: the free tier is 1,000 scans/month across all projects, and
-  // the dependency tree can only have moved if the lockfile did. CI scans every
-  // push regardless — this gate exists to catch a hostile package before it is
-  // committed, not to re-scan an unchanged tree several times a day.
-  { name: 'Socket supply-chain scan', script: 'socket:scan', whenDepsChange: true },
   { name: 'License compliance', script: 'licenses' },
   // Quota-bounded, same argument as the Socket scan above: the CLI allowance is
   // a few reviews per rolling window, and a diff with no source in it gives a
@@ -2915,6 +3058,32 @@ function cmdGates(dir, flags) {
     if (results.fail > before) return finish();
   }
 
+  // Packages that run code at install time (preinstall, install, postinstall)
+  // are the most concrete risk in a dependency tree: their code runs on this
+  // Mac the moment npm installs them. Read locally with `npm query`, no lookup.
+  // Each must be recorded with a reason in allowed-packages.json
+  // `_installScripts`; a new one stops the gates until someone looks at it.
+  if (!fast) {
+    const before = results.fail;
+    auditInstallScripts(dir);
+    if (results.fail > before) return finish();
+  }
+
+  // Registry signatures and provenance for every installed package, from
+  // npm itself: no account, no quota (policy 2.58). Full gates only, since it
+  // asks the registry about each package.
+  if (!fast && exists(path.join(dir, 'package-lock.json')) && exists(path.join(dir, 'node_modules'))) {
+    const sig = sh('npm audit signatures', dir);
+    if (sig.ok) ok('Registry signatures verified (npm audit signatures)');
+    else {
+      fail(
+        `npm audit signatures failed — a package's registry signature or provenance does not verify, which is how a ` +
+          `tampered or substituted package shows up. Investigate before anything else:\n${sig.out.split('\n').slice(-12).join('\n')}`,
+      );
+      return finish();
+    }
+  }
+
   // A filtered lockfile installs fine here and fails CI on Linux, so it must be
   // caught before the work is presented rather than by a red pipeline later.
   // Pure JSON read, no network.
@@ -2983,7 +3152,10 @@ function cmdGates(dir, flags) {
     const extra =
       g.script === 'review' && reviewBase ? ` -- --base-commit ${safeToken(reviewBase, 'commit')}` : '';
     if (extra) process.stdout.write(`${DIM}(committed since ${reviewBase.slice(0, 12)})${RESET} `);
-    const r = sh(`npm run ${safeToken(g.script, 'script name')}${extra}`, dir);
+    const r =
+      g.script === 'security' && exists(path.join(dir, AUDIT_EXCEPTIONS))
+        ? auditWithExceptions(dir)
+        : sh(`npm run ${safeToken(g.script, 'script name')}${extra}`, dir);
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
     // A gate that ran but examined nothing is not a pass. CodeRabbit exits 0
     // with `"status":"review_skipped","message":"No changes detected"` whenever
@@ -3629,7 +3801,7 @@ function outdatedSplit(dir) {
  * Safe by construction rather than by care: `npm update` does not rewrite the
  * semver ranges in package.json (npm's own docs), and with save-prefix `^` that
  * confines it to minor and patch. Majors still require `policy upgrade <pkg>`
- * and its decision record. The lockfile changing makes `gates` run the Socket
+ * and its decision record. The lockfile changing makes `gates` verify registry
  * supply-chain scan, and `min-release-age=1` quarantines anything published in
  * the last 24 hours.
  */
@@ -3695,7 +3867,7 @@ function cmdDepsUpdate(dir) {
   if (inRange.length > 0) {
     console.log(
       `\n  ${BOLD}Lockfile changed. Next:${RESET}\n` +
-        `    node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} gates   ${DIM}(the Socket scan runs because dependencies moved)${RESET}\n` +
+        `    node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} gates   ${DIM}(registry signatures are verified because dependencies moved)${RESET}\n` +
         `    CHANGELOG entry, then the developer commits\n`,
     );
   }
@@ -3751,8 +3923,9 @@ function cmdHealth(dir, flags) {
     ok('No package.json — dependency checks skipped');
   }
 
-  checkStaleness(dir, reg);
-
+  // The recorded verdict is checked after it is recomputed below, not before:
+  // checking first printed the previous run's list, so the first health run
+  // after deps-update still reported the updates it had just applied.
   const state = loadState(dir);
   // Record WHICH updates have been available too long, not just that health
   // ran. The network work belongs here — release dates need `npm view <pkg>
@@ -3790,14 +3963,66 @@ function cmdHealth(dir, flags) {
       `${stale.length} minor/patch update(s) available for more than ${graceDays} days: ${stale.slice(0, 5).join('; ')}${stale.length > 5 ? ', …' : ''} — run: policy deps-update`,
     );
   } else ok(`No minor/patch update older than ${graceDays} days`);
+  // An advisory exception lapses the moment a fixed version exists: carrying
+  // it past that point is choosing not to update. Asked of GitHub's advisory
+  // database through gh, one call per exception.
+  for (const [id, e] of Object.entries(loadAuditExceptions(dir))) {
+    const r = sh(`gh api /advisories/${safeToken(id, 'advisory id')} -q '[.vulnerabilities[] | select(.package.name == "${safeToken(e.package || '', 'package')}") | .first_patched_version] | map(select(. != null)) | .[0] // ""'`, dir);
+    if (!r.ok) warn(`Could not check ${id} on GitHub (gh unavailable?) — confirm by hand that it still has no fix`);
+    else if (r.out.trim())
+      fail(`${id} now has a fixed release of ${e.package} (${r.out.trim()}) — update to it and remove the exception from audit-exceptions.json`);
+    else ok(`${id}: still no fixed release of ${e.package}; exception stands until ${e.expires}`);
+  }
+
+  // Existing packages that carry a risk signal get a Socket score too, not
+  // only new ones (policy 2.58): read from the allowlist entry, no network.
+  const allow = readJSON(path.join(dir, 'allowed-packages.json')) || {};
+  const risky = Object.entries(allow).filter(([name, e]) => {
+    if (name.startsWith('_') || !e || typeof e !== 'object') return false;
+    const flagged =
+      ['dormant', 'deprecated', 'superseded'].includes(e.maintenance) ||
+      e.repoArchived === true ||
+      // 0 means the count was never fetched (some July entries), not unpopular.
+      (typeof e.weeklyDownloads === 'number' && e.weeklyDownloads > 0 && e.weeklyDownloads < 1000);
+    const scoredAt = e.socket && e.socket.status === 'scored' && e.socket.checked;
+    const fresh = scoredAt && (Date.now() - new Date(scoredAt)) / 86400000 < 180;
+    return flagged && !fresh;
+  });
+  if (risky.length > 0)
+    warn(
+      `${risky.length} allowlisted package(s) with a risk signal (dormant, deprecated, archived or under 1,000 weekly downloads) ` +
+        `and no Socket score in 180 days: ${risky.slice(0, 6).map(([n]) => n).join(', ')}${risky.length > 6 ? ', …' : ''} — ` +
+        `score each: node ${path.join(POLICY_ROOT, 'scripts', 'verify-package.js')} <package>`,
+    );
+
   state.staleDeps = stale;
   state.lastHealthRun = new Date().toISOString();
   saveState(dir, state);
+  checkStaleness(dir, reg);
   console.log(`\n${DIM}Recorded health run in .policy/state.json${RESET}`);
   return finish();
 }
 
 // ---------------------------------------------------------------- scaffold
+
+/**
+ * The path from a project to build-policy. Templates and standard scripts say
+ * "../build-policy", which is right for a project beside it; one kept deeper
+ * (ADMIN_OTHER/dev-work/<app>) needs "../../CLAUDE/build-policy", and with the
+ * template's path its pre-commit hook failed every commit. scaffold writes the
+ * project's real path, and the drift checks read it back as the template's.
+ */
+function policyRel(dir) {
+  return path.relative(path.resolve(dir), POLICY_ROOT) || '.';
+}
+function localizePolicyPath(text, dir) {
+  const rel = policyRel(dir);
+  return rel === '../build-policy' ? text : text.split('../build-policy/').join(`${rel}/`);
+}
+function canonicalPolicyPath(text, dir) {
+  const rel = policyRel(dir);
+  return rel === '../build-policy' ? text : text.split(`${rel}/`).join('../build-policy/');
+}
 
 const STANDARD_SCRIPTS = {
   lint: 'eslint . --max-warnings 0',
@@ -3832,12 +4057,6 @@ const STANDARD_SCRIPTS = {
   // ones it skipped. Verified: an untracked file is reviewed with this flag
   // (reviewType "all", reviewedFiles ["app.js"]) and ignored without it.
   review: 'coderabbit review --agent --include-untracked',
-  // `socket ci` = `socket scan create --report`, exits non-zero when the scan
-  // fails the org's security policy. Uses the API token's default org, so no
-  // org argument to drift. This is the only gate that covers a malicious
-  // maintainer or typosquat — npm audit sees published CVEs, the allowlist sees
-  // names, neither sees a package that turned hostile in its latest release.
-  'socket:scan': 'socket ci',
   prepare: 'husky',
 };
 
@@ -3847,6 +4066,23 @@ function cmdScaffold(dir) {
   section(`Scaffold: ${path.resolve(dir)}`);
   const created = [];
   const skipped = [];
+
+  // Install-script baseline: record what already runs code at install, so
+  // the gate stops only on packages that arrive after tracking began.
+  {
+    const allowPath = path.join(dir, 'allowed-packages.json');
+    const allow = readJSON(allowPath);
+    if (allow && !allow._installScripts && exists(path.join(dir, 'node_modules'))) {
+      const found = installScriptPackages(dir);
+      if (found) {
+        allow._installScripts = Object.fromEntries(
+          found.map((n) => [n, `present when install-script tracking began (${new Date().toISOString().split('T')[0]})`]),
+        );
+        fs.writeFileSync(allowPath, JSON.stringify(allow, null, 2) + '\n');
+        created.push(`allowed-packages.json _installScripts (${found.length})`);
+      }
+    }
+  }
 
   // origin/HEAD: a local ref, so setting it touches nothing on GitHub.
   if (proj.isGit) {
@@ -3895,7 +4131,12 @@ function cmdScaffold(dir) {
       return;
     }
     fs.mkdirSync(path.dirname(destPath), { recursive: true });
-    fs.copyFileSync(path.join(TEMPLATES, tpl), destPath);
+    fs.writeFileSync(destPath, localizePolicyPath(readFile(path.join(TEMPLATES, tpl)), dir));
+    try {
+      fs.chmodSync(destPath, fs.statSync(path.join(TEMPLATES, tpl)).mode);
+    } catch {
+      /* mode is cosmetic for non-executables */
+    }
     created.push(dest);
   };
 
@@ -3959,7 +4200,9 @@ function cmdScaffold(dir) {
     const pkgPath = path.join(dir, 'package.json');
     const pkg = readJSON(pkgPath);
     pkg.scripts = pkg.scripts || {};
-    const add = { ...STANDARD_SCRIPTS };
+    const add = Object.fromEntries(
+      Object.entries(STANDARD_SCRIPTS).map(([k, v]) => [k, localizePolicyPath(v, dir)]),
+    );
     if (proj.isTS) add['type-check'] = 'tsc --noEmit';
     if (proj.hasHTML) add['lint:html'] = 'html-validate *.html';
     if (proj.hasCSS) add['lint:css'] = 'stylelint "styles/*.css"';
@@ -4395,9 +4638,18 @@ function cmdDoctor() {
   }
 
   const npmrc = readFile(path.join(os.homedir(), '.npmrc'));
-  if (/^min-release-age\s*=\s*1/m.test(npmrc))
-    ok('~/.npmrc min-release-age=1 (24h package quarantine)');
-  else fail('~/.npmrc missing min-release-age=1');
+  const releaseAge = Number((npmrc.match(/^min-release-age\s*=\s*(\d+)/m) || [])[1] || 0);
+  if (releaseAge >= 2) ok(`~/.npmrc min-release-age=${releaseAge} (packages under ${releaseAge} days old are refused)`);
+  else fail(`~/.npmrc min-release-age is ${releaseAge || 'unset'} — policy 2.58 needs 2 or more. Run: policy setup-machine`);
+
+  // The Socket npm wrapper is retired (policy 2.58): an `npm` alias to it
+  // would keep routing installs through its quota and its older resolver.
+  const shellRc = ['.zshrc', '.bashrc', '.zprofile', '.bash_profile']
+    .map((f) => readFile(path.join(os.homedir(), f)))
+    .join('\n');
+  if (/^\s*alias\s+npm=["']?socket\b/m.test(shellRc) || /socket wrapper/.test(shellRc))
+    fail('The Socket npm wrapper is still on in your shell profile — run: socket wrapper off (then open a new terminal)');
+  else ok('Socket npm wrapper is off (installs use npm directly)');
 
   if (sh('command -v brew', process.cwd()).ok) {
     const bs = brewSettings();
@@ -4549,6 +4801,18 @@ function cmdSetupMachine() {
     } else ok(`Homebrew install safety already in ${file}`);
   }
 
+  // 4c. npm release-age quarantine: at least 2 days (policy 2.58).
+  {
+    const file = path.join(os.homedir(), '.npmrc');
+    const cur = readFile(file);
+    const m = cur.match(/^min-release-age\s*=\s*(\d+)\s*$/m);
+    if (!m || Number(m[1]) < 2) {
+      const next = m ? cur.replace(m[0], 'min-release-age=2') : `${cur}${cur && !cur.endsWith('\n') ? '\n' : ''}min-release-age=2\n`;
+      fs.writeFileSync(file, next);
+      ok(`~/.npmrc min-release-age set to 2`);
+    } else ok(`~/.npmrc min-release-age already ${m[1]}`);
+  }
+
   // 5. Hooks — merge into settings.json, never clobber existing config
   const settingsPath = path.join(claudeDir, 'settings.json');
   const settings = readJSON(settingsPath) || {};
@@ -4576,8 +4840,7 @@ function cmdSetupMachine() {
   console.log(
     `\nRemaining manual steps (doctor checks all of these):\n` +
       `  brew install semgrep betterleaks\n` +
-      `  npm install -g pm2 @socketsecurity/cli && socket wrapper on && socket login\n` +
-      `  echo 'min-release-age=1' >> ~/.npmrc  (if not present)\n` +
+      `  npm install -g pm2 @socketsecurity/cli && socket login   (Socket scores new packages; keep its npm wrapper off)\n` +
       `  xcrun notarytool store-credentials <profile> --apple-id <id> --team-id <team> --password <app-specific>\n` +
       `\nNow run: node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} doctor\n`,
   );
@@ -4916,14 +5179,18 @@ function isUnderPolicyRoot(p, cwd) {
 // not by the substring: other directories (a session scratchpad named after
 // the project) contain "build-policy/" too, and build-policy-public contains
 // "build-policy".
-function commandNamesRoot(cmd, root) {
+function commandNamesRoot(cmd, root, cwd = process.cwd()) {
   const esc = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const name = path.basename(root).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return (
-    new RegExp(esc + '(?![\\w-])').test(cmd) ||
-    new RegExp(`(^|[\\s'"=:(])(\\.\\.\\/)+${name}(?![\\w-])`).test(cmd) ||
-    new RegExp(`~\\/[^\\s'"]*\\/${name}(?![\\w-])`).test(cmd)
-  );
+  if (new RegExp(esc + '(?![\\w-])').test(cmd)) return true;
+  // Relative and ~ forms count only if they resolve to the repo from where the
+  // command runs: from ADMIN_OTHER/dev-work/<app>, "../build-policy" is some
+  // other folder, and the text alone refused a session that never touched it.
+  const forms = [
+    ...cmd.matchAll(new RegExp(`(?:^|[\\s'"=:(])((?:\\.\\.\\/)+(?:[\\w.-]+\\/)*${name})(?![\\w-])`, 'g')),
+    ...cmd.matchAll(new RegExp(`(~\\/[^\\s'"]*\\/${name})(?![\\w-])`, 'g')),
+  ].map((m) => m[1]);
+  return forms.some((f) => isUnderRoot(f, cwd, root));
 }
 
 const INTERPRETER = /^(python3?|node|ruby|perl|bash|sh|zsh|deno|bun|npx|osascript)$/;
@@ -4938,7 +5205,12 @@ const INTERPRETER = /^(python3?|node|ruby|perl|bash|sh|zsh|deno|bun|npx|osascrip
 function bashWriteTargets(cmd, startCwd) {
   let cwd = startCwd;
   const targets = [];
+  // A heredoc's body is not a command line; with one present the whole
+  // command is judged by shape. Otherwise only the segments that hand control
+  // to an interpreter are, so `ls`, `diff` or `cp` beside an unrelated
+  // `npx prettier` stay readable.
   let unknown = /<</.test(cmd);
+  const unknownSegments = unknown ? [{ text: cmd, cwd }] : [];
   const abs = (t) => path.resolve(cwd, t.replace(/^['"]|['"]$/g, '').replace(/^~(?=\/)/, os.homedir()));
   for (const seg of cmd.split(/&&|\|\||;|\n|\|/)) {
     for (const m of seg.matchAll(/(?<![0-9&<])>>?\s*("[^"]*"|'[^']*'|[^\s;&|<>]+)/g)) {
@@ -4968,10 +5240,13 @@ function bashWriteTargets(cmd, startCwd) {
       // Our own CLI: mirror-sync writes the public mirror and nothing else;
       // every other policy.js command leaves the policy repo's files alone.
       if (/policy\.js["']?\s+mirror-sync\b/.test(seg)) targets.push(PUBLIC_ROOT);
-      else if (!/policy\.js\b/.test(seg)) unknown = true;
+      else if (!/policy\.js\b/.test(seg)) {
+        unknown = true;
+        unknownSegments.push({ text: seg, cwd });
+      }
     }
   }
-  return { targets, unknown, cwd };
+  return { targets, unknown, unknownSegments, cwd };
 }
 
 /** Does this tool call write inside `root`? */
@@ -4984,12 +5259,13 @@ function writesUnder(input, root) {
   const cmd = ti.command || '';
   const w = bashWriteTargets(cmd, cwd);
   if (w.targets.some((t) => isUnderRoot(t, '/', root))) return true;
-  // An interpreter or heredoc may write anywhere: judge it by shape, a write
-  // operation in the text plus the repo named or the command running in it.
-  return (
-    w.unknown &&
-    POLICY_WRITE_OP.test(cmd) &&
-    (commandNamesRoot(cmd, root) || isUnderRoot(w.cwd, '/', root))
+  // An interpreter or heredoc may write anywhere: judge that segment by shape,
+  // a write operation in it plus the repo named in it or the segment running
+  // inside the repo. Other segments were already judged by their targets.
+  return w.unknownSegments.some(
+    (u) =>
+      POLICY_WRITE_OP.test(u.text) &&
+      (commandNamesRoot(u.text, root, u.cwd) || isUnderRoot(u.cwd, '/', root)),
   );
 }
 
@@ -5038,7 +5314,9 @@ function claimPolicyRepo(input) {
     `can overwrite or mis-cite the other. ` +
     (inPolicySession
       ? `Wait for that session to finish and run 'policy handoff'; the change can be reviewed and synced here after that.`
-      : APP_SESSION_REFUSAL)
+      : APP_SESSION_REFUSAL) +
+    ` Reads are never refused: if this command does not write to build-policy, it was judged by shape because an ` +
+    `interpreter or heredoc in it names build-policy beside a write. Split that part into its own command.`
   );
 }
 
@@ -5079,6 +5357,50 @@ function cmdHookPretool() {
     const refusal = claimPolicyRepo(input);
     if (refusal) refuse(refusal);
   }
+  // audit-exceptions.json accepts a known high vulnerability, and a release-age
+  // override installs a version younger than the quarantine. Both are the
+  // developer's decisions (policy 2.58): the AI drafts, the developer runs.
+  {
+    const ti3 = input.tool_input || {};
+    const writesExceptions =
+      (['Edit', 'Write', 'MultiEdit'].includes(input.tool_name) && /audit-exceptions\.json$/.test(ti3.file_path || '')) ||
+      (input.tool_name === 'Bash' &&
+        // The write must target the file; prose that names it is fine.
+        (bashWriteTargets(cmd, input.cwd || process.cwd()).targets.some((t) => /audit-exceptions\.json$/.test(t)) ||
+          /(\b(tee|cp|mv|truncate)\b|>>?|\b(open|writeFileSync|appendFileSync|renameSync)\s*\()[^|;&\n]*audit-exceptions\.json/.test(
+            cmd,
+          )));
+    if (writesExceptions)
+      refuse(
+        'BUILD-POLICY: audit-exceptions.json accepts a known high or critical vulnerability, a security exclusion the developer ' +
+          'decides. Draft the entry (advisory id, package, via, reason, decided, expires at most 90 days later) and ask the ' +
+          'developer to add it.',
+      );
+    if (input.tool_name === 'Bash' && /--min-release-age(=|\s+)\d/.test(cmd))
+      refuse(
+        'BUILD-POLICY: overriding min-release-age installs a version younger than the quarantine. For an urgent security fix ' +
+          'that is the developer\'s call: score the exact version first (verify-package.js), then give the developer the command ' +
+          'to run themselves, e.g. ! npm install <pkg>@<version> --min-release-age=0',
+      );
+  }
+
+  // A Socket waiver in allowed-packages.json approves a package that has no
+  // score (policy 2.58). It is the developer's decision, like --ack-manual, so
+  // the AI may not write one. Installs themselves are plain npm: the Socket
+  // wrapper is no longer required (quota 429s, and its vendored resolver
+  // pruned optional dependencies from lockfiles).
+  {
+    const ti2 = input.tool_input || {};
+    const text = `${cmd} ${ti2.new_string || ''} ${ti2.content || ''} ${(ti2.edits || []).map((e) => e.new_string).join(' ')}`;
+    const target = `${ti2.file_path || ''} ${cmd}`;
+    if (/allowed-packages\.json/.test(target) && /["']?waived["']?\s*:/.test(text))
+      refuse(
+        'BUILD-POLICY: a Socket waiver in allowed-packages.json approves a package nobody scored. That is the developer\'s ' +
+          'decision: ask them to add "socket": { "waived": "<reason>" } to the entry by hand, or retry verify-package.js ' +
+          'when Socket answers.',
+      );
+  }
+
   if (input.tool_name !== 'Bash') process.exit(0);
   // --ack-manual is the developer's signature that manual release checks
   // (dogfood install, banner, Gumroad upload) were personally performed. The
@@ -5115,49 +5437,6 @@ function cmdHookPretool() {
           `Never set HOMEBREW_NO_VERIFY_ATTESTATIONS (project-standards § Supply Chain Security).`,
       );
   }
-  // Installs must go through Socket, and the alias does not guarantee that.
-  //
-  // `npm` is an alias for `socket npm`, which exists ONLY in an interactive
-  // shell. Measured: `bash -c 'type npm'` and `zsh -c 'type npm'` both resolve
-  // straight to the nvm binary, as does `command npm`. So every scripted
-  // install — a package.json script, anything inside a subshell, a hook —
-  // bypasses Socket completely. The wrapper protects npm typed by hand, not npm
-  // run by tooling, which is the larger share of installs.
-  //
-  // The documented rules forbid `socket wrapper --disable`, the nvm binary and
-  // unsetting the alias, but not alias evasion, because they were written about
-  // the wrapper rather than about how a shell resolves a name.
-  //
-  // Only mutating commands are gated. Read-only npm (ls, view, outdated, run)
-  // installs nothing and is left alone.
-  if (input.tool_name === 'Bash') {
-    const MUTATES = /\b(?:install|i|add|update|up|upgrade|ci|dedupe)\b/;
-    const evasion = /\bcommand\s+npm\b|\\npm\b|\/\.nvm\/[^\s]*\/bin\/npm\b/.test(cmd);
-    const bareNpm = /(?:^|[;&|(]|&&|\|\|)\s*npm\s+([a-z-]+)/.exec(cmd);
-    const scripted = /\b(?:bash|sh|zsh)\s+-c\b[^\n]*\bnpm\s/.test(cmd);
-    const mutating =
-      (bareNpm && MUTATES.test(bareNpm[1])) || (evasion && MUTATES.test(cmd)) || (scripted && MUTATES.test(cmd));
-    const alreadySocket = /\bsocket\s+(?:npm|raw-npm)\b/.test(cmd);
-    if (mutating && !alreadySocket) {
-      console.log(
-        JSON.stringify({
-          hookSpecificOutput: {
-            hookEventName: 'PreToolUse',
-            permissionDecision: 'deny',
-            permissionDecisionReason:
-              'BUILD-POLICY: this installs or updates packages without Socket. The `npm` -> `socket npm` alias exists only in an ' +
-              'interactive shell, so `command npm`, a subshell, or anything scripted resolves straight to the raw binary and is never scanned. ' +
-              'Run it explicitly: `socket npm <cmd>`. ' +
-              'If Socket is returning 429, do NOT bypass silently — check `socket organization quota`, score the exact target with ' +
-              '`socket package score npm <pkg>@<version> --markdown`, then use `socket raw-npm <cmd>` and run `socket scan create --report --no-interactive` ' +
-              'immediately after (project-standards § Supply Chain Security).',
-          },
-        }),
-      );
-      process.exit(0);
-    }
-  }
-
   // `npm audit fix --force` proposes major version changes that bypass the
   // upgrade decision record. Unforced `npm audit fix` stays within declared
   // ranges and is permitted.

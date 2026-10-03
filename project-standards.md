@@ -1,8 +1,8 @@
 # Project Standards
 
 The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
-**Version:** 2.55
-**Last updated:** 2026-10-01
+**Version:** 2.58
+**Last updated:** 2026-10-03
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -426,6 +426,7 @@ Icon: `build/icon.png` (512x512 PNG). electron-builder converts to `.icns` autom
 - Implement caching to reduce API costs
 - Rate limiting on expensive endpoints
 - **Model IDs — the source of truth is `build-policy/registry.json`.** Never invent tier IDs; copy from the registry into each app's active fast/smart routing and model picker. Each registry entry carries a `verified` date; `policy health`/`check` flag entries past their review window. On review, check current official pricing and model capabilities, update the registry, then propagate. There is no hand-kept list of apps to update: `check` scans each project's source and WARNs on any Anthropic or OpenAI model ID that is not a current registry value (a dated snapshot of a registry alias counts as current), so every app reports its own drift when opened. Migration maps that must name old IDs so saved selections keep working opt out with a `// policy:legacy-model-ids` comment, which exempts lines up to the block's closing `}` or `]`. Check request parameters and stored model selections during a family migration; a matching ID alone does not prove the API call works.
+- **Deliberate per-app model choices are recorded, not left as drift.** When an app needs different models from the tiers, add its IDs to `registry.json` `modelExceptions` under the app's package.json name, with the reason and the date decided. `check` then accepts those IDs for that app only, and WARNs when the exception passes its review window so it is re-confirmed. An ID that is not a tier value or a recorded exception is still flagged.
 - **Read Claude responses by content-block type, never `content[0].text`.** Sonnet 5, Opus 5/5.5, Fable and Mythos think by default when a request omits `thinking` (Sonnet 4.6 and Opus 4.8 did not), so the response opens with a `thinking` block and the first block has no text. Join every block whose `type === 'text'`; when none is present, report `stop_reason` (`max_tokens` means cut off, `refusal` means declined) rather than a generic format error. Quick text tasks (summaries, grammar, suggestions) should also send `thinking: {type: 'disabled'}` so thinking neither adds latency nor eats a small `max_tokens`; Haiku 4.5 accepts the same value. Two apps here broke this way on the move to `claude-sonnet-5`. `check` FAILs a first-block read in a project that names a thinking-by-default model, and WARNs on one anywhere else, since it breaks on the next smart-tier migration.
 - **Model entries review every 60 days, not the registry default of 90.** Model families now turn over faster than a quarter, and a stale entry costs more than an out-of-date name: Sonnet 5 superseded Sonnet 4.6 at a *lower* price ($2/$10 per MTok against $3/$15), so sitting on the old ID meant paying more for less. Each model entry records its price at verification, so a review can answer "is the newer one cheaper" without researching the model it replaced. Compare price as well as capability, and in both directions — a newer model is not automatically dearer.
 
@@ -1004,31 +1005,25 @@ Log call sites are where leaks actually enter. One app drops provider error text
 
 - `verify-ready --release` fails for Electron apps without it.
 
-### Supply Chain Security (Socket)
+### Supply Chain Security
 
-Socket CLI (`@socketsecurity/cli`) is installed globally with the npm wrapper enabled. Every `npm install` is automatically scanned for malicious packages, typosquatting, and supply chain risks.
+Installs use npm directly. Three checks cover every install, need no account and have no quota:
 
-**Socket is also an enforced gate — locally, not in CI.**
+- **Release-age quarantine.** `min-release-age=2` in `~/.npmrc`: npm refuses any version published in the last two days. Most malicious releases are found and pulled within that window. `policy setup-machine` sets it; `doctor` FAILs below 2.
+- **Known advisories.** `npm audit` (the `security` gate) reads GitHub's advisory database, which also carries malware advisories, so a package published as malicious fails the gates.
+- **Registry signatures.** Full `gates` runs `npm audit signatures`, which verifies every installed package's registry signature and, where published, its build provenance. A failure stops the gates: it is how a tampered or substituted package shows up.
 
-- `socket:scan` (`socket ci`) is a required npm script. In local full gates it runs **only when `package-lock.json` or `package.json` changed** — the dependency tree cannot have moved otherwise, and the free tier is 1,000 scans/month across all projects.
-- Dependabot branches are scanned locally before merge (the `dependabot-reviewer` agent runs `socket:scan` per branch).
-- **CI does not run Socket.** Those two controls already cover every path a package takes into the lockfile: the wrapper at install time, and the pre-merge scan for Dependabot. A CI step would re-scan a lockfile cleared before the commit existed, costing an API quota unit per run and requiring `SOCKET_SECURITY_API_KEY` in every repo. Add a CI step only for a project with contributors who do not install through the wrapper, or where Dependabot branches merge without local review.
+**Socket scores packages; it does not wrap installs.** The `socket npm` wrapper was retired in 2.58. It looked up the whole tree on every install against a 500-an-hour quota, so a new project's first install failed with HTTP 429, and it resolved with a vendored copy of npm's Arborist based on npm 11.0.0 that pruned optional subtrees from lockfiles. Socket is now used where a closer look is worth one lookup:
 
-This is the only gate covering a compromised maintainer or a typosquat. `npm audit` reports published CVEs and the allowlist checks package names; neither detects a package whose latest release has become malicious.
+- **A package new to a project.** `node ../build-policy/scripts/verify-package.js <pkg>` checks maintenance, popularity, repository and publisher, then takes one Socket score (supply-chain, vulnerability and alerts, for the package and its dependencies) and prints an allowlist entry with the score in a `socket` field. `deps:check` FAILs an entry verified on or after 2026-10-03 that has no score. If Socket cannot score it (rate limit, outage), the package waits; the only alternative is a waiver the developer writes by hand, `"socket": { "waived": "<reason>" }`, and the PreToolUse hook refuses an AI writing one.
+- **An existing package with a risk signal.** `health` WARNs on allowlisted packages that are dormant, deprecated, superseded or archived, or have under 1,000 weekly downloads, and have no Socket score in the last 180 days; score each with `verify-package.js`.
+- **Dependabot branches.** The `dependabot-reviewer` agent runs `npm audit signatures`, and scores any direct package new to the tree.
+- **What a score is judged on.** The package's own supply-chain and vulnerability scores (below 90 is a flag) and any critical or high alert in the package or its dependencies. The with-dependencies score is recorded but not judged: it aggregates everything a package pulls in, and anything built on React and a build tool sits around 50 to 70 (astro, scored 2026-10-03: 97 and 100 on its own, 65 and 84 with dependencies). A flagged package can still be accepted, but the entry must record the decision, `"decision": { "verdict": "accepted", "reason": "...", "date": "YYYY-MM-DD" }`, and `deps:check` FAILs a flagged entry without one, so the next session reads why instead of re-arguing it.
+- **Packages that run code at install.** A preinstall, install or postinstall script runs on this Mac the moment npm installs the package, which makes it the most concrete risk in a tree. Full `gates` lists them locally with `npm query` and FAILs on any not recorded, with a reason, in `allowed-packages.json` `_installScripts`. `policy scaffold` records the set present when tracking began as the baseline; a later arrival stops the gates until someone checks what its script does and records why it is acceptable.
+- **An advisory with no fix.** When `npm audit` reports a high or critical advisory that has no patched release, and the vulnerable code cannot be reached the way the project uses it, the developer can record a dated exception in the project's committed `audit-exceptions.json`: the GHSA id as the key, with `package`, `via`, `reason`, `decided` and `expires` (at most 90 days after `decided`). The `security` gate, locally and in CI, then fails only on advisories no valid exception covers, for that package; `check` FAILs a malformed or expired file; `health` asks GitHub's advisory database whether a fixed release now exists and FAILs once one does, so the exception lapses into an update. Accepting a known vulnerability is a security exclusion: a session drafts the entry and the developer adds it; the hook refuses an AI writing the file.
+- **An urgent fix younger than the quarantine.** `min-release-age=2` also holds back a security fix published today. Normally waiting two days is right, with an advisory exception covering the gap if the gates are blocked. If the fix is urgent, score that exact version (`verify-package.js <pkg>`) and the developer installs it with a one-off override, `npm install <pkg>@<version> --min-release-age=0`; registry signatures are then checked by the next full gates run. The override is the developer's to run; the hook refuses it from an AI.
 
-**Required API token scopes.** `socket ci` and `socket scan create --report` fetch the org security policy, so a token without `security-policy:read` produces a partial failure: the scan succeeds and the report request returns 403. Minimum set: `security-policy:read`, `alert-resolution list/create/read`, `alerts list`, `alerts trend`, `threat-campaigns list`.
-
-**Starting a new project: bypass the wrapper, not Socket scanning.** The wrapper scans package by package as they install, so a first install of a normal stack costs several hundred scans against a 1,000/month allowance and fails partway when the allowance runs low. Scanning the finished tree instead costs one scan and covers the same packages. This is the sanctioned path for a first install, and it is an explicit exception to precondition 1 below, which would otherwise forbid the only remedy available:
-
-```bash
-socket raw-npm install --ignore-scripts   # tree lands; no package runs any code
-socket scan create --report               # one scan, whole resolved tree
-npm rebuild                               # only after the scan is clean
-```
-
-`--ignore-scripts` is what makes this equivalent rather than weaker. The wrapper's value is stopping a malicious package before its install scripts execute; here nothing executes until the tree has been scanned and passed. `npm rebuild` then runs the lifecycle scripts of packages that declare them, which is what native modules such as better-sqlite3 need. If the scan flags something, remove it before running `npm rebuild`.
-
-Electron 42 and later declare no `postinstall`: `index.js` checks for the binary and fetches it on first use, so `npm rebuild` correctly does nothing for it and an absent `dist/` after install is expected. Electron 41 and earlier do declare one, and `npm rebuild` runs it.
+The Socket wrapper must stay off (`socket wrapper off`); `doctor` FAILs while a shell profile still routes `npm` through it. The Socket CLI stays installed and signed in for scoring. Whether Socket's free plan covers scoring for closed-source commercial work was not confirmed when this changed (its terms page could not be read); if it does not, the same flow works without the score, on the maintenance and popularity signals alone.
 
 **Dependency staleness is measured by `health` and enforced by `check`.** Being behind is not a defect in itself, so version drift stays a warning. Being behind on a *patch or minor* for a long time is different, because security fixes ride in those, and `min-release-age` plus Socket protect the moment of install while doing nothing about a dependency never updated.
 
@@ -1038,23 +1033,6 @@ A grace period rather than a count of reports. Counting ties enforcement to how 
 
 **An unrun `health` is a failure, not a warning**, and a project that has *never* run one fails hardest: staleness there has not merely gone unfixed, it has never been measured. Treating that as the mild case would exempt exactly the projects that need it most.
 
-**The alias is not the control; the hook is.** `npm` is aliased to `socket npm`, and that alias exists only in an interactive shell. Measured: `bash -c 'type npm'`, `zsh -c 'type npm'` and `command npm` all resolve straight to the nvm binary. So every scripted install bypasses Socket — package.json scripts, subshells, hooks, CI steps — which is the larger share of installs, and the share a person never sees. The documented bypass rules forbade `socket wrapper --disable`, the nvm binary path and unsetting the alias, but not alias evasion, because they were written about the wrapper rather than about how a shell resolves a name.
-
-A PreToolUse hook now denies any Bash command that installs or updates packages without going through Socket, including `command npm`, a subshell invocation, and the nvm binary by absolute path. Read-only npm (`ls`, `view`, `outdated`, `run`) is untouched, since it installs nothing. The 429 path is unchanged and still permitted: score the exact version with `socket package score`, then `socket raw-npm`, then a full scan.
-
-**A 429 may be quota, not rate.** Check with `socket organization quota` before retrying. A rate limit clears by waiting; a depleted quota does not, and each retry consumes what is left rather than waiting it out.
-
-**When the wrapper rate-limits (HTTP 429).** The wrapper's install path can return `429 Too Many Requests` while Socket's read API remains available. A 429 indicates the package has not been scanned. It is not a security verdict and must not be treated as a pass.
-
-`socket raw-npm <cmd>` is the supported bypass. It is permitted only when all four conditions hold:
-
-1. **The change is known and bounded** — a specific advisory, an identified package, a target version. Never a blanket install of arbitrary new dependencies, with one exception: a new project's first install, which is blanket by nature and follows the tree-scan procedure above.
-2. **The target version is scored clean first**, via the read API that stays up during a 429: `socket package score npm <pkg>@<version> --markdown`. Check `supplyChain` and `vulnerability`. Anything below ~0.9 on supply chain, or any new `malware` / `installScripts` / `obfuscatedFile` alert, stops the bypass.
-3. **A full scan runs immediately afterwards**: `socket scan create --report --no-interactive` — confirming the resulting tree still passes policy.
-4. **The lockfile diff is inspected** — `git diff package-lock.json` shows only the expected bump and its transitive closure, nothing unrelated.
-
-**Not permitted as a 429 workaround:** `socket wrapper --disable`, invoking the nvm binary directly (`~/.nvm/.../bin/npm`), or unsetting the alias. Each disables scanning without recording that it was skipped, and the first two persist beyond the current command.
-
 **Package verification — before every install:**
 Before installing any npm package, verify it is the genuine upstream package:
 - Check the publisher/org on npmjs.com matches the real project maintainers
@@ -1062,7 +1040,7 @@ Before installing any npm package, verify it is the genuine upstream package:
 - Check download count and version history — a single v1.0.0 with no updates is a red flag
 - Check the package description and README match the tool's actual purpose
 - If a tool is primarily distributed outside npm (Homebrew, GitHub releases, Go binary), do not assume an npm package with the same name is an official wrapper — verify explicitly
-- Socket's automatic scanning catches malicious packages but does not catch name-squatted packages that are merely useless or misleading
+- A Socket score catches known-malicious packages but not name-squats that are merely useless or misleading; that is what the checks above are for
 
 **When to be extra cautious:**
 - Starting a new project (`npm install` pulls many packages at once)

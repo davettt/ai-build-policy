@@ -1,7 +1,7 @@
 # Build & Development Policy
 
-**Version:** 2.55
-**Last updated:** 2026-10-01
+**Version:** 2.58
+**Last updated:** 2026-10-03
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
 
@@ -82,9 +82,9 @@ Each step names its enforcement. **Human judgment** steps are deliberately human
 
 | Step | Enforced by |
 |---|---|
-| Full gate sequence: type-check → lint → HTML/CSS → format → secrets → allowlist → SAST → audit → licenses → CodeRabbit → build → smoke → integration → flows (where defined) | `policy gates` runs them in order, stops at first failure, writes diff-hashed marker. Two gates are conditional: Socket runs only when the lockfile moved, CodeRabbit only when the diff contains source (or the tree is clean, or `--with-review`) |
+| Full gate sequence: type-check → lint → HTML/CSS → format → secrets → allowlist → SAST → audit → licenses → CodeRabbit → build → smoke → integration → flows (where defined) | `policy gates` runs them in order, stops at first failure, writes diff-hashed marker. Registry signatures (`npm audit signatures`) are verified on every full run. One gate is conditional: CodeRabbit only when the diff contains source (or the tree is clean, or `--with-review`) |
 | Fast subset on every commit (type-check, lint, HTML/CSS, format, secrets, allowlist) | Husky pre-commit runs `policy gates --fast` — **commit is impossible if it fails** |
-| Gates re-run on GitHub: static checks, SAST, audit, licenses, **build, and every test tier** (+ gitleaks-action). `deps:check`, CodeRabbit and Socket stay local: `deps:check` resolves a sibling repo absent from a CI checkout, CodeRabbit is covered by its own GitHub app on PRs, and Socket runs at install time via the wrapper plus a pre-merge scan of Dependabot branches (project-standards § Supply Chain Security) | GitHub Actions CI on every push/PR — **the durable evidence record** |
+| Gates re-run on GitHub: static checks, SAST, audit, licenses, **build, and every test tier** (+ gitleaks-action). `deps:check`, CodeRabbit and Socket stay local: `deps:check` resolves a sibling repo absent from a CI checkout, CodeRabbit is covered by its own GitHub app on PRs, and registry signatures plus a Socket score for each new package are checked locally before a dependency is approved (project-standards § Supply Chain Security) | GitHub Actions CI on every push/PR — **the durable evidence record** |
 | Gates match the *current* diff (no edit-after-gates) | `verify-ready` compares marker hash to working tree |
 | Full gates passed on the *exact tree being committed* — "ready to commit" cannot silently skip them | Husky pre-commit runs `policy verify-marker` — **commit is impossible if source or `package.json`/`package-lock.json` changed without a matching full-gates marker** |
 | The lockfile installs in CI — a lockfile CI rejects never reaches a commit | Every `gates` run (fast pre-commit subset included) runs the lockfile-vs-`package.json` validation CI's install step performs, via npm's own validator; platform-independent, so a Mac answers for the Linux runner |
@@ -139,11 +139,11 @@ Root commit exception: CodeRabbit cannot review before HEAD exists, so the initi
 
 | Step | Enforced by |
 |---|---|
-| Dependency health: outdated, audit, Socket scan (`--socket`) | `policy health`; `check` flags every session once >30 days overdue |
+| Dependency health: outdated, audit, a Socket score due for risk-flagged packages (dormant, deprecated, archived, under 1,000 weekly downloads) | `policy health`; `check` flags every session once >30 days overdue |
 | Homebrew installs verify bottle attestations, refuse insecure redirects and require cask checksums | `~/.homebrew/brew.env` written by `setup-machine`; `doctor` FAILs a missing setting, `HOMEBREW_NO_VERIFY_ATTESTATIONS`, or a signed-out `gh`; PreToolUse refuses `brew install`/`upgrade`/`reinstall`/`bundle` while attestation checks are off |
 | Tooling currency: model IDs, action versions, tool choices re-verified on schedule | `registry.json` verified-dates; `check`/`health` flag stale entries — then web-search, update, propagate; `check` WARNs per project on AI model IDs that drift from the registry |
 | Claude responses read by content-block type, so a thinking-by-default model cannot break parsing | `check` FAILs `content[0].text` in a project that names a thinking-by-default model (Sonnet 5, Opus 5/5.5, Fable, Mythos) and WARNs on it anywhere else |
-| Dependabot PRs: minor/patch only, Socket-scanned before merge | `dependabot-reviewer` agent per branch; allowlist gate passes version-only bumps |
+| Dependabot PRs: minor/patch only, signatures verified and any new direct package Socket-scored before merge | `dependabot-reviewer` agent per branch; allowlist gate passes version-only bumps |
 | GitHub issues triage; Cloudflare PRs/alerts for cloud apps | Human judgment + AI assistance |
 | **Improvement loop:** when anything escapes — a user-reported bug, a regression, you catching yourself re-prompting — ask *"which check should have caught this?"* and add it to `policy.js`, a test, or a hook | Human judgment; the policy repo's git history is the record of the control system learning |
 | Cross-project learning: one project's fix becomes the shared template/standard | Template drift detection — every project self-reports divergence at session start |
@@ -178,9 +178,9 @@ Never modified by AI without explicit developer review and sign-off, regardless 
 
 ## Data safety (details in project-standards)
 
-Atomic writes; field whitelisting; read-all-then-write-all for multi-file ops; cascade deletes; **schema-version + migration-on-load + pre-migration backups + downgrade guard** for all user data; supply-chain protection (Socket wrapper, `min-release-age=1`, dependency allowlist with dual review).
+Atomic writes; field whitelisting; read-all-then-write-all for multi-file ops; cascade deletes; **schema-version + migration-on-load + pre-migration backups + downgrade guard** for all user data; supply-chain protection (`min-release-age=2`, `npm audit` and `npm audit signatures` in the gates, a Socket score for every new or risk-flagged package, dependency allowlist with dual review).
 
-**Socket install fallback.** Socket is the default supply-chain control. Do not disable or bypass scanning. If the wrapper cannot complete a first install because the dependency tree is too large or quota/rate-limited, bypass only the wrapper's package-by-package install path: `socket raw-npm install --ignore-scripts`, then `socket scan create --report` over the resolved tree, then `npm rebuild` only after the scan is clean. For bounded upgrades during a 429, follow project-standards § Supply Chain Security: score the target version first, run the raw npm command, scan the resulting tree, and inspect the lockfile diff.
+**New packages are scored, installs are not wrapped.** Installs use npm directly. A package new to a project is verified with `verify-package.js`, which takes one Socket score and records it in the allowlist entry; `deps:check` refuses an entry approved from 2.58 on without that score or a waiver the developer wrote by hand. If Socket is unavailable the package waits.
 
 ## Model strategy
 
@@ -214,7 +214,7 @@ Tool call output persists in the conversation context and is resent on every sub
 
 Run `policy setup-machine` — it installs the per-machine wiring from the canonical copies in `machine/` (session-start script, Claude Code hooks merged into `~/.claude/settings.json`, haiku agents) and prints the remaining manual steps. Then `policy doctor` verifies everything:
 
-Node LTS (nvm) · PM2 · git · Semgrep (brew) · Betterleaks (brew) · Socket CLI (`socket wrapper on`) · `~/.npmrc` `min-release-age=1` · Claude Code hooks · haiku agents · notary keychain profile (`xcrun notarytool store-credentials`). Per-project quality tooling is devDependencies, installed by scaffold + `npm install`. The machine wiring lives in the repo, not in anyone's memory — a fresh computer is one command plus the printed manual steps away from fully enforced.
+Node LTS (nvm) · PM2 · git · Semgrep (brew) · Betterleaks (brew) · Socket CLI, wrapper off (`socket login`, used to score packages) · `~/.npmrc` `min-release-age=2` · Claude Code hooks · haiku agents · notary keychain profile (`xcrun notarytool store-credentials`). Per-project quality tooling is devDependencies, installed by scaffold + `npm install`. The machine wiring lives in the repo, not in anyone's memory — a fresh computer is one command plus the printed manual steps away from fully enforced.
 
 ## Cross-LLM configuration
 
@@ -232,6 +232,9 @@ Only a session opened in build-policy edits the public copy. `policy mirror-sync
 
 | Version | Date | Changes |
 |---|---|---|
+| 2.58 | 2026-10-03 | The Socket npm install wrapper is retired; installs use npm directly. It looked up the whole tree on every install against an hourly quota, so large first installs failed, and its bundled resolver pruned optional dependencies from lockfiles. Every install is now covered by `min-release-age=2`, `npm audit`, and `npm audit signatures` in full gates. Socket scores only packages new to a project (`verify-package.js` records the score in the allowlist entry, and `deps:check` refuses a new entry without one or a developer-written waiver, which the AI may not write) and allowlisted packages with a risk signal, which `health` lists. `doctor` checks the release age and that the wrapper is off. A score is judged on the package's own scores and on critical or high alerts anywhere in its dependencies; the with-dependencies aggregate is recorded, not judged. A flagged package that is accepted needs a recorded decision with a reason. Full gates FAIL on a package that runs code at install time unless it is recorded with a reason, and `scaffold` records the existing set as a baseline. A high or critical advisory with no fixed release can be carried under a dated, developer-written exception in `audit-exceptions.json` (at most 90 days), honoured per advisory and package by the `security` gate and the CI audit step; `check` rejects malformed or expired entries and `health` fails once a fix exists. An urgent fix younger than the release-age quarantine is installed by the developer with a one-off override, which the AI may not run. |
+| 2.57 | 2026-10-03 | Projects need not sit beside build-policy: `scaffold` writes each project's real relative path into the pre-commit hook, AGENTS.md, ci.yml and the deps scripts, and the drift checks read that path back as the template's. `health` checks the recorded stale-dependency verdict after recomputing it, so the first run after `deps-update` no longer reports the updates just applied. The build-policy claim no longer refuses reads: only the segment of a command that runs an interpreter is judged by shape, and relative paths count only if they resolve to build-policy from where the command runs. `check` FAILs a version history with more than one row for the same version. |
+| 2.56 | 2026-10-02 | Deliberate per-app model choices are recorded rather than reported as drift. `registry.json` gains `modelExceptions`, keyed by an app's package.json name, with the model IDs, the reason and the date decided. `check` accepts those IDs for that app only, and WARNs once an exception is past its review window. |
 | 2.55 | 2026-10-02 | The Puppeteer check reads every `package.json` in a project, including a server's own, as the helmet check does (`server/`, `backend/`, `api/`, `app/`, `electron/`, `apps/*`, `packages/*`). The standard now gives the reason that matters: `puppeteer.launch()` runs a Chromium that `npm install` downloaded to `~/.cache/puppeteer`, which is on the build Mac and not in the app bundle, so PDF export fails on customers' Macs. |
 | 2.54 | 2026-10-01 | The CI template's secret scan handles a new repository's first push, where the first pushed commit has no parent: a step detects it and runs gitleaks itself over the full history, with the download checked against the release's SHA-256. The helmet check reads a server's own `package.json` (`server/`, `backend/`, `api/`, `apps/*`, `packages/*`) as well as the root one. `/security-review` needs `origin/HEAD`, which git creates only on clone: `check` warns when it is missing, `scaffold` sets it locally, and the security-review reminder gives the command. |
 | 2.53 | 2026-09-29 | The window-icon check also reads root-level `.html` pages, and the Settings Check-for-updates check ignores comments and accepts a file that wires Settings in code, so apps without a component framework are read correctly. `check` on the policy repo FAILs a change to its scripts, templates or machine wiring with no changelog entry. |

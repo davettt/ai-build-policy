@@ -81,8 +81,27 @@ jobs:
       # the wrapper, or if Dependabot branches start merging without local review
       # — those are the cases CI would actually cover.
 
+      # With audit-exceptions.json (a developer's dated decision to carry an
+      # advisory that has no fix), fail only on high/critical advisories it
+      # does not cover; the same rule `policy gates` applies locally.
       - name: Dependency audit
-        run: npm run security
+        run: |
+          if [ ! -f audit-exceptions.json ]; then npm run security; exit $?; fi
+          npm audit --json --omit=dev > "$RUNNER_TEMP/audit.json" || true
+          node -e '
+            const fs = require("fs");
+            const ex = JSON.parse(fs.readFileSync("audit-exceptions.json", "utf8"));
+            const today = new Date().toISOString().slice(0, 10);
+            const rep = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/audit.json", "utf8"));
+            const open = [];
+            for (const [name, v] of Object.entries(rep.vulnerabilities || {}))
+              for (const via of v.via || [])
+                if (via && typeof via === "object" && /high|critical/.test(via.severity || "")) {
+                  const id = String(via.url || "").split("/").pop(); const e = ex[id];
+                  if (!(e && e.package === (via.name || name) && e.expires >= today)) open.push(id + " in " + (via.name || name));
+                }
+            if (open.length) { console.error("Uncovered advisories:\n" + open.join("\n")); process.exit(1); }
+            console.log("No uncovered high or critical advisories");'
 
       - name: License check
         run: npm run licenses
