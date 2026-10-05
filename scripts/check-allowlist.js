@@ -57,8 +57,38 @@ const undecided = allDeps.filter((dep) => {
   const d = sc.decision || {};
   return !(d.verdict === 'accepted' && d.reason && String(d.reason).trim() && d.date);
 });
+// Re-verification cadence (project-standards § Dependency Maintenance
+// Lifecycle): an entry is re-verified every 180 days, or every
+// `reviewEveryDays` the entry sets (90 for parsers, converters, serializers,
+// crypto and auth). Legitimate and safe to install are not the same as still
+// maintained, and only a fresh look at the package answers the second.
+const REVIEW_DAYS = 180;
+const overdue = allDeps.filter((dep) => {
+  const e = allowlist[dep];
+  if (!e || !e.verified) return false;
+  const days = Number(e.reviewEveryDays) || REVIEW_DAYS;
+  return (Date.now() - Date.parse(e.verified)) / 86400000 > days;
+});
+if (overdue.length > 0) {
+  console.error(
+    `${RED}${BOLD}${overdue.length} allowlist entr${overdue.length === 1 ? 'y is' : 'ies are'} past the re-verification window:${RESET}\n`,
+  );
+  for (const dep of overdue) {
+    const e = allowlist[dep];
+    console.error(
+      `  ${RED}✗${RESET} ${dep} (verified ${e.verified}, window ${Number(e.reviewEveryDays) || REVIEW_DAYS} days)`,
+    );
+  }
+  console.error(
+    `\nRe-verify each: node build-policy/scripts/verify-package.js <package>, then replace the entry (new verified date, ` +
+      `maintenance status, Socket score). A package no longer maintained goes through the migration flow instead.\n`,
+  );
+  process.exit(1);
+}
 if (undecided.length > 0) {
-  console.error(`${RED}${BOLD}${undecided.length} package(s) with a Socket flag and no recorded decision:${RESET}\n`);
+  console.error(
+    `${RED}${BOLD}${undecided.length} package(s) with a Socket flag and no recorded decision:${RESET}\n`,
+  );
   for (const dep of undecided) console.error(`  ${RED}✗${RESET} ${dep}`);
   console.error(
     `\nRecord why each was accepted: "socket": { ..., "decision": { "verdict": "accepted", "reason": "<why>", "date": "YYYY-MM-DD" } }, ` +
@@ -67,7 +97,9 @@ if (undecided.length > 0) {
   process.exit(1);
 }
 if (unscored.length > 0) {
-  console.error(`${RED}${BOLD}${unscored.length} package(s) approved without a Socket score:${RESET}\n`);
+  console.error(
+    `${RED}${BOLD}${unscored.length} package(s) approved without a Socket score:${RESET}\n`,
+  );
   for (const dep of unscored) console.error(`  ${RED}✗${RESET} ${dep}`);
   console.error(
     `\nRe-run node build-policy/scripts/verify-package.js <package> once Socket answers, and copy its "socket" field into ` +
@@ -87,6 +119,6 @@ if (unapproved.length === 0) {
   console.error(
     `\nTo approve a package, first verify it:\n  node build-policy/scripts/verify-package.js <package-name>\n`,
   );
-  console.error('Then add it to allowed-packages.json after security agent review.\n');
+  console.error('Then add the entry it prints (with its Socket score) to allowed-packages.json.\n');
   process.exit(1);
 }

@@ -12,6 +12,10 @@
  *   setup-machine       Bootstrap a new machine: hook script, hooks, agents (from machine/)
  *   doctor              Machine-level setup checks (tools, npmrc, hooks, agents)
  *   check [dir]         Project compliance check (structure, scripts, drift, staleness)
+ *                         --all           every project beside build-policy, as a table
+ *   sync-templates [dir] Overwrite the drift-checked files (ci.yml, dependabot.yml,
+ *                         .husky/pre-commit, AGENTS.md, .nvmrc) from the templates;
+ *                         one project at a time, and the change still needs its gates
  *   gates [dir]         Run quality gates in order; writes .policy/gates.json marker
  *                         --fast          pre-commit subset (validate + secrets)
  *                         --with-review   force the CodeRabbit gate on a source-free diff
@@ -29,10 +33,13 @@
  *   upgrade <pkg>       Ground a MAJOR dependency upgrade: pull real peer-dep constraints
  *                         + migration source from npm, scaffold a decision record under
  *                         .claude/specs/deps/. check/verify-ready FAIL on an un-recorded major.
+ *   approve-exception <GHSA-id>  Developer's approval of an advisory exception
+ *                         (records a hash of the entry in audit-approvals.json)
  *   scaffold [dir]      Create missing standard files/scripts (never overwrites)
+ *   leak-scan [dir]     Pre-commit: private files tracked, home paths in tracked files
  *   mirror              Check public mirror for drift and private-detail leaks
- *   mirror-sync         Copy scripts/ + templates/ to the public mirror and bump its
- *                         headers; public prose is still written by hand
+ *   mirror-sync         Copy scripts/, templates/ + tests/ to the public mirror and bump
+ *                         its headers; public prose is still written by hand
  *   handoff             The session holding the build-policy claim declares its change
  *                         complete; review, mirror and commit move to a build-policy session
  *
@@ -373,6 +380,9 @@ const SECURITY_CONTENT_PATTERNS = [
   /DELETE\s+FROM|DROP\s+TABLE/i,
 ];
 function securitySensitiveFiles(dir, files) {
+  // In the policy repo the enforcement code is the sensitive surface.
+  if (path.resolve(dir) === POLICY_ROOT)
+    return files.filter((f) => /^(scripts|machine|templates)\//.test(f));
   return files.filter((f) => {
     if (!isSourceFile(f)) return false;
     if (SECURITY_PATH_PATTERNS.test(f)) return true;
@@ -549,33 +559,34 @@ function auditPolicyDocVersions(root, label) {
   const bpVer = headerVer(bp);
   if (!bpVer) return fail(`${label}: BUILD-POLICY.md has no "**Version:**" header`);
 
-  const rows = [...bp.matchAll(/^\|\s*(\d+(?:\.\d+)*)\s*\|\s*\d{4}-\d{2}-\d{2}\s*\|/gm)].map(
-    (m) => m[1],
-  );
+  // The table lives in HISTORY.md (2.61): at 77 rows it was most of
+  // BUILD-POLICY.md, which sessions are told to read when planning.
+  const histName = historyFile(root);
+  const rows = historyRows(readFile(path.join(root, histName)));
   if (rows.length === 0) {
-    fail(`${label}: BUILD-POLICY.md version-history table has no parsable rows`);
+    fail(`${label}: ${histName} version-history table has no parsable rows`);
   } else {
     const newest = rows.reduce((a, b) => (cmpSemver(b, a) > 0 ? b : a));
     if (bpVer !== newest) {
       fail(
-        `${label}: BUILD-POLICY.md header says ${bpVer} but the version history records ${newest} — ` +
+        `${label}: BUILD-POLICY.md header says ${bpVer} but ${histName} records ${newest} — ` +
           `bump the header (a new history row without a header bump makes every citation of the version wrong)`,
       );
-    } else ok(`${label}: BUILD-POLICY.md header matches version history (${bpVer})`);
+    } else ok(`${label}: BUILD-POLICY.md header matches ${histName} (${bpVer})`);
 
     // Two sessions numbering their changes from the same committed version
     // both wrote a 2.56 row; the header and ordering checks below pass on that.
     const dupes = [...new Set(rows.filter((v, i) => rows.indexOf(v) !== i))];
     if (dupes.length > 0)
       fail(
-        `${label}: BUILD-POLICY.md version history has more than one row for ${dupes.join(', ')} — ` +
+        `${label}: ${histName} has more than one row for ${dupes.join(', ')} — ` +
           `two changes were numbered from the same release; renumber the later one`,
       );
 
     const misordered = rows.findIndex((v, i) => i > 0 && cmpSemver(v, rows[i - 1]) > 0);
     if (misordered > 0) {
       fail(
-        `${label}: BUILD-POLICY.md version history is not newest-first — ${rows[misordered]} appears below ` +
+        `${label}: ${histName} is not newest-first — ${rows[misordered]} appears below ` +
           `${rows[misordered - 1]}; the top row must be the current version`,
       );
     }
@@ -587,14 +598,30 @@ function auditPolicyDocVersions(root, label) {
     // checks above passed. Every version the unreleased entries cite must have
     // its history row.
     const cl = readFile(path.join(root, 'CHANGELOG.md'));
-    const unreleased = (cl.match(/## \[Unreleased\]([\s\S]*?)(?=\n## \[|$)/) || [])[1] || '';
-    const cited = [...new Set([...unreleased.matchAll(/\bpolicy (\d+\.\d+)\b/gi)].map((m) => m[1]))];
-    const unrecorded = cited.filter((v) => !rows.includes(v));
-    if (unrecorded.length > 0) {
-      fail(
-        `${label}: CHANGELOG.md cites policy ${unrecorded.join(', ')} but BUILD-POLICY.md has no history row for it — ` +
-          `the change is half-finished: bump both doc headers and add the history row (and enforcement-table row) it describes`,
-      );
+    if (cl) {
+      // The changelog closes a release at every policy version, the same rule
+      // the apps live under (top entry matches package.json). An open
+      // [Unreleased] section held 26 versions before this was checked.
+      const top = (cl.match(/^##\s*\[([^\]]+)\]/m) || [])[1];
+      if (top !== bpVer)
+        fail(
+          `${label}: CHANGELOG.md top section is [${top || 'none'}] but the policy is ${bpVer} — ` +
+            `each version bump heads its entries with "## [${bpVer}] - YYYY-MM-DD"; nothing stays under [Unreleased]`,
+        );
+      else ok(`${label}: CHANGELOG.md top section matches the policy version (${bpVer})`);
+
+      const topSection =
+        (cl.match(/^##\s*\[[^\]]+\][^\n]*\n([\s\S]*?)(?=\n##\s*\[|$)/m) || [])[1] || '';
+      const cited = [
+        ...new Set([...topSection.matchAll(/\bpolicy (\d+\.\d+)\b/gi)].map((m) => m[1])),
+      ];
+      const unrecorded = cited.filter((v) => !rows.includes(v));
+      if (unrecorded.length > 0) {
+        fail(
+          `${label}: CHANGELOG.md cites policy ${unrecorded.join(', ')} but ${histName} has no row for it — ` +
+            `the change is half-finished: bump both doc headers and add the history row (and enforcement-table row) it describes`,
+        );
+      }
     }
   }
 
@@ -695,7 +722,8 @@ function auditSite(dir) {
       continue;
     }
     const want = `/${app}/changelog/`;
-    if (meta.url && meta.url.includes(want)) ok(`Site: ${app}/version.json points at its changelog`);
+    if (meta.url && meta.url.includes(want))
+      ok(`Site: ${app}/version.json points at its changelog`);
     else
       fail(
         `Site: ${app}/version.json url is ${JSON.stringify(meta.url || null)}, not the changelog page ` +
@@ -718,6 +746,40 @@ function auditPolicyRepo(root) {
       fail(
         `policy docs: ${code.join(', ')} changed with no CHANGELOG.md entry — describe the change ` +
           `(and bump the version with a history row if it changes what a check enforces)`,
+      );
+
+    // The enforcement code runs on every tool call with the power to deny
+    // them, and this repo has no package.json, so the Stop hook's
+    // security-review check never reached it: policy.js went seven versions
+    // without a recorded review. The same rule as an app's auth code applies:
+    // a change to scripts/ or machine/ needs /security-review and a
+    // security-ack bound to the content it examined.
+    const enforcement = changed.filter((f) => /^(scripts|machine|templates)\//.test(f)).sort();
+    if (enforcement.length > 0) {
+      const rec = loadState(root).securityReview;
+      if (!rec || rec.hash !== contentHash(root, enforcement))
+        fail(
+          `policy repo: ${enforcement.join(', ')} changed without a recorded security review — run /security-review ` +
+            `over the change, then: node ${path.join(root, 'scripts', 'policy.js')} security-ack` +
+            (rec ? ' (a review is recorded, but for different content)' : ''),
+        );
+      else ok(`Security review recorded for ${enforcement.length} enforcement file(s)`);
+    }
+  }
+
+  // The machinery guarantees tests run, so it runs its own. Node's built-in
+  // runner: no dependency, no node_modules in this repo. The hook predicates
+  // needed three false-positive fixes in two weeks, which is what these cover.
+  if (exists(path.join(root, 'tests'))) {
+    const t = sh("node --test 'tests/**/*.test.js'", root);
+    if (t.ok) ok('Policy repo tests pass (node --test tests/**/*.test.js)');
+    else
+      fail(
+        `Policy repo tests fail:\n${t.out
+          .split('\n')
+          .filter((l) => /not ok|Error|expected|actual/.test(l))
+          .slice(0, 12)
+          .join('\n')}`,
       );
   }
 
@@ -744,9 +806,7 @@ function auditPolicyRepo(root) {
     'mirror-blocklist.txt',
   ];
 
-  for (const f of hasPublicMirrorSibling
-    ? requiredFiles.concat(privateOnlyFiles)
-    : requiredFiles) {
+  for (const f of hasPublicMirrorSibling ? requiredFiles.concat(privateOnlyFiles) : requiredFiles) {
     if (exists(path.join(root, f))) ok(`Policy repo file present: ${f}`);
     else fail(`Policy repo file missing: ${f}`);
   }
@@ -825,6 +885,17 @@ function auditPolicyRepo(root) {
           `bump the SHA and its # ${version} comment, or the registry is claiming a version CI never runs`,
       );
   }
+}
+
+/** Where a policy repo keeps its version-history table. */
+function historyFile(root) {
+  return exists(path.join(root, 'HISTORY.md')) ? 'HISTORY.md' : 'BUILD-POLICY.md';
+}
+/** Versions in a history table, in table order. */
+function historyRows(text) {
+  return [...text.matchAll(/^\|\s*(\d+(?:\.\d+)*)\s*\|\s*\d{4}-\d{2}-\d{2}\s*\|/gm)].map(
+    (m) => m[1],
+  );
 }
 
 function cmpSemver(a, b) {
@@ -927,7 +998,8 @@ function auditElectronStandards(dir, proj) {
   // image with "icon" in its path would also pass; the intent is a brand mark,
   // and a false pass is cheaper than failing apps that do show one.
   let brandMark = null;
-  const BRAND_MARK = /<img\b[^>]*\bsrc=[^>]*(?:icon|logo|favicon)[^>]*>|<(?:[A-Z]\w*)?(?:Logo|AppIcon|BrandMark)\b/;
+  const BRAND_MARK =
+    /<img\b[^>]*\bsrc=[^>]*(?:icon|logo|favicon)[^>]*>|<(?:[A-Z]\w*)?(?:Logo|AppIcon|BrandMark)\b/;
   let changelogLink = false;
   const walk = (d) => {
     let entries;
@@ -947,7 +1019,10 @@ function auditElectronStandards(dir, proj) {
       if (!brandMark && /\.(tsx|jsx|html)$/.test(e.name)) {
         const relPath = path.relative(dir, full);
         // Root-level pages cover flat vanilla-JS apps (index.html beside server.js)
-        if (/^(src|renderer|app|public)\/|^[^/]+\.html$/.test(relPath) && BRAND_MARK.test(readFile(full)))
+        if (
+          /^(src|renderer|app|public)\/|^[^/]+\.html$/.test(relPath) &&
+          BRAND_MARK.test(readFile(full))
+        )
           brandMark = relPath;
       }
       if (!/\.(ts|tsx|js|jsx|mjs)$/.test(e.name)) continue;
@@ -991,7 +1066,10 @@ function auditElectronStandards(dir, proj) {
           safeStorage = rel;
         if (!callsAnthropic && /api\.anthropic\.com|['"]@anthropic-ai\/sdk['"]/.test(t))
           callsAnthropic = rel;
-        if (!callsOpenAI && /api\.openai\.com|from\s+['"]openai['"]|require\(['"]openai['"]\)/.test(t))
+        if (
+          !callsOpenAI &&
+          /api\.openai\.com|from\s+['"]openai['"]|require\(['"]openai['"]\)/.test(t)
+        )
           callsOpenAI = rel;
         if (!opensExternal && /shell\s*\.\s*openExternal/.test(t)) opensExternal = true;
         // Matched on intent, not one spelling. One app reads the URL from an
@@ -1095,8 +1173,10 @@ function auditElectronStandards(dir, proj) {
   // inside the bundle where nobody can reach it. A link makes it reachable.
   if (
     exists(path.join(dir, 'THIRD-PARTY-LICENSES.txt')) &&
-    sourceFilesMatching(dir, /THIRD-PARTY-LICENSES|[Tt]hird[- ][Pp]arty [Ll]icen[cs]e|[Oo]pen[- ][Ss]ource [Ll]icen[cs]e/)
-      .length === 0
+    sourceFilesMatching(
+      dir,
+      /THIRD-PARTY-LICENSES|[Tt]hird[- ][Pp]arty [Ll]icen[cs]e|[Oo]pen[- ][Ss]ource [Ll]icen[cs]e/,
+    ).length === 0
   ) {
     findings.push(
       `THIRD-PARTY-LICENSES.txt ships but nothing in the UI links to it — the file is inside the bundle where a user cannot find it (project-standards § Electron)`,
@@ -1138,9 +1218,9 @@ function auditElectronStandards(dir, proj) {
     // promise true as the code changes. Required only where diagnostics exist,
     // so it lands with the feature rather than ahead of it.
     const leakTest = sourceFilesMatching(dir, /diagnostic/i).filter(
-      (f) => /(^|\/)tests?\//.test(f) && /canary|leak|redact|must not (appear|contain)/i.test(
-        readFile(path.join(dir, f)),
-      ),
+      (f) =>
+        /(^|\/)tests?\//.test(f) &&
+        /canary|leak|redact|must not (appear|contain)/i.test(readFile(path.join(dir, f))),
     );
     if (leakTest.length === 0) {
       findings.push(
@@ -1183,12 +1263,19 @@ function auditElectronStandards(dir, proj) {
     const src = readFile(path.join(dir, f))
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .replace(/^\s*\/\/.*$/gm, '');
-    if (/\.startsWith\(\s*(serverOrigin|appOrigin|origin|[`'"]https?:\/\/(127\.0\.0\.1|localhost))/.test(src)) {
+    if (
+      /\.startsWith\(\s*(serverOrigin|appOrigin|origin|[`'"]https?:\/\/(127\.0\.0\.1|localhost))/.test(
+        src,
+      )
+    ) {
       findings.push(
         `${f}: the app-origin test is a string prefix (startsWith), which also accepts http://127.0.0.1:<port>.evil.com. Compare new URL(url).origin === serverOrigin (project-standards § Network Exposure)`,
       );
     }
-    if (/shell\s*\.\s*openExternal\s*\(/.test(src) && !/\.protocol\b|\{\s*protocol\s*\}/.test(src)) {
+    if (
+      /shell\s*\.\s*openExternal\s*\(/.test(src) &&
+      !/\.protocol\b|\{\s*protocol\s*\}/.test(src)
+    ) {
       findings.push(
         `${f}: shell.openExternal receives any URL scheme — file:, smb: and custom handlers go straight to the OS. Allow only https:, http: and mailto: via new URL(url).protocol (project-standards § Network Exposure)`,
       );
@@ -1292,7 +1379,10 @@ function auditElectronStandards(dir, proj) {
       /addEventListener\(\s*['"](?:focus|visibilitychange)['"]/.test(rawCheck) ||
       /['"]browser-window-focus['"]/.test(rawCheck);
     if (!rechecks || !onFocus) {
-      const missing = [!rechecks && 'hourly setInterval', !onFocus && 'focus/visibilitychange listener']
+      const missing = [
+        !rechecks && 'hourly setInterval',
+        !onFocus && 'focus/visibilitychange listener',
+      ]
         .filter(Boolean)
         .join(' and ');
       findings.push(
@@ -1337,7 +1427,10 @@ function auditElectronStandards(dir, proj) {
     dir,
     /process\.env\.(?:APP_VERSION|npm_package_version)/,
   ).filter((f) => !/electron\//.test(f));
-  if (readsEnvVersion.length > 0 && sourceFilesMatching(dir, /process\.env\.APP_VERSION\s*=/).length === 0) {
+  if (
+    readsEnvVersion.length > 0 &&
+    sourceFilesMatching(dir, /process\.env\.APP_VERSION\s*=/).length === 0
+  ) {
     findings.push(
       `${readsEnvVersion[0]} reads the version from the environment, but nothing sets process.env.APP_VERSION — ` +
         `in a packaged app npm_package_version is unset, so this reports "development" from a real build. ` +
@@ -1504,7 +1597,9 @@ function npmInstallDir() {
   if (exists(path.join(bundled, 'lib', 'utils', 'validate-lockfile.js'))) return bundled;
   const r = sh('npm root -g', process.cwd());
   const global = r.ok ? path.join(r.out.split('\n').pop(), 'npm') : null;
-  return global && exists(path.join(global, 'lib', 'utils', 'validate-lockfile.js')) ? global : null;
+  return global && exists(path.join(global, 'lib', 'utils', 'validate-lockfile.js'))
+    ? global
+    : null;
 }
 
 function auditLockfileSync(dir) {
@@ -1517,10 +1612,14 @@ function auditLockfileSync(dir) {
     );
     return;
   }
-  const r = require('child_process').spawnSync(process.execPath, ['-e', LOCKFILE_SYNC_SCRIPT, npmDir, dir], {
-    encoding: 'utf8',
-    timeout: 60000,
-  });
+  const r = require('child_process').spawnSync(
+    process.execPath,
+    ['-e', LOCKFILE_SYNC_SCRIPT, npmDir, dir],
+    {
+      encoding: 'utf8',
+      timeout: 60000,
+    },
+  );
   if (r.status !== 0) {
     fail(
       `Could not check package-lock.json against package.json the way 'npm ci' does: ` +
@@ -1570,7 +1669,8 @@ function serverPackageDirs(dir) {
     } catch {
       /* no such folder */
     }
-    for (const n of names) if (exists(path.join(dir, parent, n, 'package.json'))) out.push(path.join(parent, n));
+    for (const n of names)
+      if (exists(path.join(dir, parent, n, 'package.json'))) out.push(path.join(parent, n));
   }
   return out;
 }
@@ -1588,7 +1688,11 @@ function missingOriginHead(dir) {
   if (sh('git symbolic-ref -q refs/remotes/origin/HEAD', dir).ok) return null;
   const branch = sh('git rev-parse --abbrev-ref HEAD', dir).out.trim();
   for (const b of [branch, 'main', 'master'])
-    if (b && sh(`git rev-parse --verify --quiet refs/remotes/origin/${safeToken(b, 'branch')}`, dir).ok) return b;
+    if (
+      b &&
+      sh(`git rev-parse --verify --quiet refs/remotes/origin/${safeToken(b, 'branch')}`, dir).ok
+    )
+      return b;
   return '';
 }
 
@@ -1609,7 +1713,10 @@ function declaredDeps(dir, proj) {
 
 /** Installed packages that declare preinstall, install or postinstall scripts. */
 function installScriptPackages(dir) {
-  const r = sh(`npm query ':attr(scripts, [preinstall]), :attr(scripts, [install]), :attr(scripts, [postinstall])'`, dir);
+  const r = sh(
+    `npm query ':attr(scripts, [preinstall]), :attr(scripts, [install]), :attr(scripts, [postinstall])'`,
+    dir,
+  );
   if (!r.ok) return null;
   try {
     return [...new Set(JSON.parse(r.out.slice(r.out.indexOf('['))).map((x) => x.name))].sort();
@@ -1672,7 +1779,13 @@ function loadAuditExceptions(dir) {
  * computed by the CI template's audit step.
  */
 function auditEntryHash(e) {
-  const fields = { package: e.package, via: e.via || '', reason: e.reason, decided: e.decided, expires: e.expires };
+  const fields = {
+    package: e.package,
+    via: e.via || '',
+    reason: e.reason,
+    decided: e.decided,
+    expires: e.expires,
+  };
   return crypto.createHash('sha256').update(JSON.stringify(fields)).digest('hex');
 }
 function loadAuditApprovals(dir) {
@@ -1684,7 +1797,11 @@ function auditExceptionApproved(dir, id, e) {
 }
 
 /** Problems with the exception file itself: missing fields, too long, expired. */
-function auditExceptionProblems(exceptions, today = new Date().toISOString().slice(0, 10), dir = null) {
+function auditExceptionProblems(
+  exceptions,
+  today = new Date().toISOString().slice(0, 10),
+  dir = null,
+) {
   const problems = [];
   for (const [id, e] of Object.entries(exceptions)) {
     if (!/^GHSA-[\w-]+$/.test(id)) problems.push(`${id}: key must be a GHSA advisory id`);
@@ -1694,7 +1811,9 @@ function auditExceptionProblems(exceptions, today = new Date().toISOString().sli
     }
     const span = (new Date(e.expires) - new Date(e.decided)) / 86400000;
     if (!(span > 0) || span > AUDIT_EXCEPTION_MAX_DAYS)
-      problems.push(`${id}: expires ${e.expires} is more than ${AUDIT_EXCEPTION_MAX_DAYS} days after ${e.decided}`);
+      problems.push(
+        `${id}: expires ${e.expires} is more than ${AUDIT_EXCEPTION_MAX_DAYS} days after ${e.decided}`,
+      );
     if (e.expires < today) problems.push(`${id}: expired on ${e.expires} — re-decide or remove it`);
     if (dir && !auditExceptionApproved(dir, id, e))
       problems.push(
@@ -1725,7 +1844,13 @@ function auditWithExceptions(dir) {
   for (const [name, v] of Object.entries(report.vulnerabilities || {}))
     for (const via of v.via || [])
       if (via && typeof via === 'object' && /high|critical/.test(via.severity || ''))
-        advisories.push({ id: String(via.url || '').split('/').pop(), pkg: via.name || name, title: via.title });
+        advisories.push({
+          id: String(via.url || '')
+            .split('/')
+            .pop(),
+          pkg: via.name || name,
+          title: via.title,
+        });
   const open = advisories.filter((a) => !(exceptions[a.id] && exceptions[a.id].package === a.pkg));
   const covered = advisories.length - open.length;
   if (open.length)
@@ -1733,7 +1858,12 @@ function auditWithExceptions(dir) {
       ok: false,
       out: open.map((a) => `${a.id} in ${a.pkg}: ${a.title}`).join('\n'),
     };
-  return { ok: true, out: covered ? `${covered} advisory finding(s) covered by audit-exceptions.json` : 'no high or critical advisories' };
+  return {
+    ok: true,
+    out: covered
+      ? `${covered} advisory finding(s) covered by audit-exceptions.json`
+      : 'no high or critical advisories',
+  };
 }
 
 function auditSecurityInfrastructure(dir, proj) {
@@ -1765,7 +1895,8 @@ function auditSecurityInfrastructure(dir, proj) {
   const dangerousFiles = sourceFilesMatching(dir, /dangerouslySetInnerHTML/);
   if (dangerousFiles.length > 0) {
     const hasDOMPurify =
-      'dompurify' in deps || 'isomorphic-dompurify' in deps ||
+      'dompurify' in deps ||
+      'isomorphic-dompurify' in deps ||
       sourceFilesMatching(dir, /DOMPurify|dompurify|sanitize/i).length > 0;
     if (!hasDOMPurify) {
       findings.push(
@@ -1828,14 +1959,22 @@ function serverSourceFiles(dir) {
     for (const e of entries) {
       if (e.name.startsWith('.')) continue;
       if (
-        ['node_modules', 'dist', 'release', 'build', 'coverage', 'tests', 'test', '__tests__'].includes(
-          e.name,
-        )
+        [
+          'node_modules',
+          'dist',
+          'release',
+          'build',
+          'coverage',
+          'tests',
+          'test',
+          '__tests__',
+        ].includes(e.name)
       )
         continue;
       const full = path.join(d, e.name);
       if (e.isDirectory()) walk(full);
-      else if (/\.(js|mjs|cjs|ts)$/.test(e.name) && !/\.(test|spec)\./.test(e.name)) files.push(full);
+      else if (/\.(js|mjs|cjs|ts)$/.test(e.name) && !/\.(test|spec)\./.test(e.name))
+        files.push(full);
     }
   };
   walk(dir);
@@ -1854,13 +1993,22 @@ function auditNetworkExposure(dir) {
     const src = readFile(full);
     const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
 
-    if (/req\.headers\.host\b|req\.headers\[['"]host['"]\]|req\.hostname\b|req\.get\(\s*['"]host['"]\s*\)/i.test(code))
+    if (
+      /req\.headers\.host\b|req\.headers\[['"]host['"]\]|req\.hostname\b|req\.get\(\s*['"]host['"]\s*\)/i.test(
+        code,
+      )
+    )
       hostCheck = true;
-    if (/req\.headers\.origin\b|req\.headers\[['"]origin['"]\]|req\.get\(\s*['"]origin['"]\s*\)/i.test(code))
+    if (
+      /req\.headers\.origin\b|req\.headers\[['"]origin['"]\]|req\.get\(\s*['"]origin['"]\s*\)/i.test(
+        code,
+      )
+    )
       originCheck = true;
 
     // .listen(<port>[, <host>][, <callback>]) — capture the first two arguments.
-    const re = /\.listen\(\s*([^,()]+?)\s*(?:,\s*([^,()]+?|\([^)]*\)\s*=>|async\s*\([^)]*\)\s*=>|function\b)\s*)?[,)]/g;
+    const re =
+      /\.listen\(\s*([^,()]+?)\s*(?:,\s*([^,()]+?|\([^)]*\)\s*=>|async\s*\([^)]*\)\s*=>|function\b)\s*)?[,)]/g;
     let m;
     while ((m = re.exec(code))) {
       const port = m[1].trim();
@@ -1869,7 +2017,8 @@ function auditNetworkExposure(dir) {
       // Only Express/http servers: a port-like first argument.
       if (!/^(\d+|[A-Za-z_$][\w$.]*(\s*\|\|\s*\d+)?)$/.test(port)) continue;
       listens++;
-      const isCallback = !second || /=>|^function\b|^async\b|^(cb|callback|done|onListen\w*)$/.test(second);
+      const isCallback =
+        !second || /=>|^function\b|^async\b|^(cb|callback|done|onListen\w*)$/.test(second);
       if (isCallback) {
         findings.push(
           `${rel}: listen(${port}) has no host, so the server listens on every network interface — anyone on the same Wi-Fi can call its unauthenticated API. Use listen(port, '127.0.0.1', ...) (project-standards § Network Exposure)`,
@@ -1898,7 +2047,10 @@ function auditNetworkExposure(dir) {
       const literals = expr ? [...expr.matchAll(/['"`]([^'"`]+)['"`]/g)].map((x) => x[1]) : [];
       // `IS_ELECTRON ? '127.0.0.1' : undefined` is loopback in the app and every
       // interface under pm2 — the same exposure, in the mode that runs all day.
-      if (expr && (/\bundefined\b|\bnull\b/.test(expr) || literals.some((l) => !LOOPBACK_HOSTS.includes(l)))) {
+      if (
+        expr &&
+        (/\bundefined\b|\bnull\b/.test(expr) || literals.some((l) => !LOOPBACK_HOSTS.includes(l)))
+      ) {
         findings.push(
           `${rel}: listen(${port}, ${second}) where ${second} = ${expr.trim()} — not loopback in every mode (undefined or a non-loopback address means every interface). Bind '127.0.0.1' unconditionally (project-standards § Network Exposure)`,
         );
@@ -1920,7 +2072,11 @@ function auditNetworkExposure(dir) {
       );
     // Reads past escaped slashes: the usual form, /^https?:\/\/localhost(:\d+)?$/,
     // has "\/\/" before localhost, which a plain [^/] stopped at.
-    if (/\borigin\s*:\s*\[?\s*\/(?:\\\/|[^/\n])*localhost(?:\\\/|[^/\n])*\(\s*:\\d\+\s*\)\??/.test(code))
+    if (
+      /\borigin\s*:\s*\[?\s*\/(?:\\\/|[^/\n])*localhost(?:\\\/|[^/\n])*\(\s*:\\d\+\s*\)\??/.test(
+        code,
+      )
+    )
       findings.push(
         `${rel}: CORS accepts localhost on any port — a page from any other local dev server can read this API. Use the exact origin, e.g. \`http://127.0.0.1:\${port}\` (project-standards § Network Exposure)`,
       );
@@ -1941,7 +2097,9 @@ function auditNetworkExposure(dir) {
   for (const f of findings) fail(f);
   for (const w of warnings) warn(w);
   if (findings.length === 0 && warnings.length === 0 && listens > 0)
-    ok('Local server bound to loopback, Host header checked, CORS exact-origin, cross-site writes refused');
+    ok(
+      'Local server bound to loopback, Host header checked, CORS exact-origin, cross-site writes refused',
+    );
 }
 
 /**
@@ -2027,9 +2185,16 @@ function auditModelIds(dir) {
     for (const e of entries) {
       if (e.name.startsWith('.')) continue;
       if (
-        ['node_modules', 'dist', 'release', 'build', 'coverage', 'tests', 'test', '__tests__'].includes(
-          e.name,
-        )
+        [
+          'node_modules',
+          'dist',
+          'release',
+          'build',
+          'coverage',
+          'tests',
+          'test',
+          '__tests__',
+        ].includes(e.name)
       )
         continue;
       const full = path.join(d, e.name);
@@ -2097,10 +2262,17 @@ function auditModelIds(dir) {
  */
 const FIRST_BLOCK_TEXT_RE = /\bcontent\s*(?:\?\.)?\[\s*0\s*\]\s*(?:\?\.|\.)\s*text\b/;
 const THINKING_DEFAULT_MODEL_RE = /['"`](claude-(?:sonnet-5|opus-5|fable|mythos)[a-z0-9.-]*)['"`]/;
+// Models that reject `thinking: {type: 'disabled'}` with a 400: Sonnet 5.5
+// (use `between_tools`), Opus 5.5 (lower the effort), Fable and Mythos (omit
+// the parameter). Sonnet 5 and Opus 5 still accept it.
+const NO_DISABLE_MODEL_RE = /['"`](claude-(?:sonnet-5-5|opus-5-5|fable|mythos)[a-z0-9.-]*)['"`]/;
+const THINKING_DISABLED_RE = /\btype\s*:\s*['"]disabled['"]/;
 
 function auditClaudeResponseParsing(dir) {
   const reads = [];
+  const disabled = [];
   let thinkingModel = null;
+  let noDisableModel = null;
 
   const walk = (d) => {
     let entries;
@@ -2112,9 +2284,18 @@ function auditClaudeResponseParsing(dir) {
     for (const e of entries) {
       if (e.name.startsWith('.')) continue;
       if (
-        ['node_modules', 'dist', 'dist-electron', 'release', 'build', 'coverage', 'tests', 'test', '__tests__', 'venv'].includes(
-          e.name,
-        )
+        [
+          'node_modules',
+          'dist',
+          'dist-electron',
+          'release',
+          'build',
+          'coverage',
+          'tests',
+          'test',
+          '__tests__',
+          'venv',
+        ].includes(e.name)
       )
         continue;
       const full = path.join(d, e.name);
@@ -2130,28 +2311,52 @@ function auditClaudeResponseParsing(dir) {
           if (/^\s*(\/\/|\*|#)/.test(line)) return;
           const rel = `${path.relative(dir, full)}:${i + 1}`;
           if (FIRST_BLOCK_TEXT_RE.test(line)) reads.push(rel);
+          if (THINKING_DISABLED_RE.test(line)) disabled.push(rel);
           const m = !thinkingModel && line.match(THINKING_DEFAULT_MODEL_RE);
           if (m) thinkingModel = `${m[1]} (${rel})`;
+          const n = !noDisableModel && line.match(NO_DISABLE_MODEL_RE);
+          if (n) noDisableModel = `${n[1]} (${rel})`;
         });
     }
   };
   walk(dir);
 
-  if (reads.length === 0) return;
-  const shown = reads.slice(0, 5).join(', ') + (reads.length > 5 ? `, +${reads.length - 5} more` : '');
-  const fix =
-    `Join every block with type === 'text' instead of reading content[0].text, and send thinking: {type: 'disabled'} ` +
-    `for quick text tasks (project-standards § AI Integration)`;
-  if (thinkingModel) {
-    fail(
-      `Claude response read from the first content block (${shown}) while ${thinkingModel} thinks by default — ` +
-        `the first block is a thinking block, so the text is undefined. ${fix}`,
-    );
-  } else {
-    warn(
-      `Claude response read from the first content block (${shown}) — this breaks when the app moves to ` +
-        `claude-sonnet-5 (the registry smart tier), which returns a thinking block first. ${fix}`,
-    );
+  const list = (a) => a.slice(0, 5).join(', ') + (a.length > 5 ? `, +${a.length - 5} more` : '');
+  if (reads.length > 0) {
+    const fix =
+      `Join every block with type === 'text' instead of reading content[0].text, and turn thinking off for quick ` +
+      `text tasks the way the model allows (project-standards § AI Integration)`;
+    if (thinkingModel) {
+      fail(
+        `Claude response read from the first content block (${list(reads)}) while ${thinkingModel} thinks by default — ` +
+          `the first block is a thinking block, so the text is undefined. ${fix}`,
+      );
+    } else {
+      warn(
+        `Claude response read from the first content block (${list(reads)}) — this breaks when the app moves to ` +
+          `claude-sonnet-5 (the registry smart tier), which returns a thinking block first. ${fix}`,
+      );
+    }
+  }
+
+  // The standard used to say "send thinking: {type: 'disabled'} for quick
+  // tasks". On Sonnet 5.5 and Opus 5.5 that request is a 400, so the advice
+  // itself would have broken the next smart-tier migration, the shape of the
+  // content[0].text failure above.
+  if (disabled.length > 0) {
+    const fix =
+      `Sonnet 5.5 turns thinking off with thinking: {type: 'between_tools'}; Opus 5.5 cannot turn it off (use output_config.effort 'low'); ` +
+      `Fable and Mythos reject any explicit setting (omit it). {type: 'disabled'} works only on Sonnet 5, Opus 5 and Haiku 4.5 ` +
+      `(project-standards § AI Integration)`;
+    if (noDisableModel)
+      fail(
+        `thinking: {type: 'disabled'} sent (${list(disabled)}) while the app names ${noDisableModel}, which rejects it with a 400. ${fix}`,
+      );
+    else
+      warn(
+        `thinking: {type: 'disabled'} sent (${list(disabled)}) — accepted by the current smart tier, rejected by Sonnet 5.5 and Opus 5.5, ` +
+          `so the next model move breaks it. ${fix}`,
+      );
   }
 }
 
@@ -2273,7 +2478,7 @@ function cmdCheck(dir, flags = []) {
     const rogue = present.filter((r) => !sanctioned.includes(r));
     if (rogue.length > 0) {
       fail(
-        `sast script has unsanctioned global exclusion(s): ${rogue.map((r) => r.split('.').pop()).join(', ')} — only the four documented exclusions may be global; triage each finding and use per-line // nosemgrep instead (project-standards § Semgrep rule exclusions)`,
+        `sast script has unsanctioned global exclusion(s): ${rogue.map((r) => r.split('.').pop()).join(', ')} — only the five documented exclusions may be global; triage each finding and use per-line // nosemgrep instead (project-standards § Semgrep rule exclusions)`,
       );
     }
   }
@@ -2667,7 +2872,8 @@ function cmdCheck(dir, flags = []) {
       ([name, meta]) =>
         name.startsWith('node_modules/') && !meta.link && !meta.inBundle && !meta.integrity,
     );
-    if (unverified.length === 0) ok('Lockfile: every third-party package carries an integrity hash');
+    if (unverified.length === 0)
+      ok('Lockfile: every third-party package carries an integrity hash');
     else
       fail(
         `${unverified.length} package(s) in package-lock.json have no integrity hash, so npm cannot verify what it downloads ` +
@@ -2702,19 +2908,27 @@ function cmdCheck(dir, flags = []) {
   if (originHead !== null)
     warn(
       `git has no origin/HEAD (created only by a clone), so /security-review cannot run here. Fix: ` +
-        (originHead ? `policy scaffold, or git remote set-head origin ${originHead}` : `git fetch origin, then policy scaffold`),
+        (originHead
+          ? `policy scaffold, or git remote set-head origin ${originHead}`
+          : `git fetch origin, then policy scaffold`),
     );
 
   if (exists(path.join(dir, AUDIT_EXCEPTIONS))) {
     const problems = auditExceptionProblems(loadAuditExceptions(dir), undefined, dir);
     if (problems.length) fail(`audit-exceptions.json: ${problems.join('; ')}`);
-    else ok(`audit-exceptions.json valid (${Object.keys(loadAuditExceptions(dir)).length} exception(s))`);
+    else
+      ok(
+        `audit-exceptions.json valid (${Object.keys(loadAuditExceptions(dir)).length} exception(s))`,
+      );
   }
 
   const ciPath = path.join(dir, '.github/workflows/ci.yml');
   if (exists(ciPath)) {
     const norm = (s) => s.replace(/\s+/g, ' ').trim();
-    if (norm(canonicalPolicyPath(readFile(ciPath), dir)) !== norm(readFile(path.join(TEMPLATES, 'ci.yml')))) {
+    if (
+      norm(canonicalPolicyPath(readFile(ciPath), dir)) !==
+      norm(readFile(path.join(TEMPLATES, 'ci.yml')))
+    ) {
       fail(
         `ci.yml differs from the shared template — sync it: cp ${policyRel(dir)}/templates/ci.yml .github/workflows/ci.yml (deviations belong in the template, not the project)`,
       );
@@ -2725,7 +2939,10 @@ function cmdCheck(dir, flags = []) {
   const pcPath = path.join(dir, '.husky/pre-commit');
   if (exists(pcPath)) {
     const norm = (s) => s.replace(/\s+/g, ' ').trim();
-    if (norm(canonicalPolicyPath(readFile(pcPath), dir)) !== norm(readFile(path.join(TEMPLATES, 'pre-commit')))) {
+    if (
+      norm(canonicalPolicyPath(readFile(pcPath), dir)) !==
+      norm(readFile(path.join(TEMPLATES, 'pre-commit')))
+    ) {
       fail(
         `.husky/pre-commit differs from the shared template — THIS PROJECT IS UNENFORCED (no verify-marker). Sync: delete .husky/pre-commit, then policy scaffold (writes this project's path to build-policy, ${policyRel(dir)})`,
       );
@@ -2737,7 +2954,10 @@ function cmdCheck(dir, flags = []) {
   const dbPath = path.join(dir, '.github/dependabot.yml');
   if (exists(dbPath)) {
     const norm = (s) => s.replace(/['"]/g, '').replace(/\s+/g, ' ').trim();
-    if (norm(canonicalPolicyPath(readFile(dbPath), dir)) !== norm(readFile(path.join(TEMPLATES, 'dependabot.yml')))) {
+    if (
+      norm(canonicalPolicyPath(readFile(dbPath), dir)) !==
+      norm(readFile(path.join(TEMPLATES, 'dependabot.yml')))
+    ) {
       fail(
         `dependabot.yml differs from the shared template — sync: cp ${policyRel(dir)}/templates/dependabot.yml .github/dependabot.yml (deviations belong in the template)`,
       );
@@ -2748,7 +2968,10 @@ function cmdCheck(dir, flags = []) {
   const agPath = path.join(dir, 'AGENTS.md');
   if (exists(agPath)) {
     const norm = (s) => s.replace(/\s+/g, ' ').trim();
-    if (norm(canonicalPolicyPath(readFile(agPath), dir)) !== norm(readFile(path.join(TEMPLATES, 'AGENTS.md')))) {
+    if (
+      norm(canonicalPolicyPath(readFile(agPath), dir)) !==
+      norm(readFile(path.join(TEMPLATES, 'AGENTS.md')))
+    ) {
       fail(
         `AGENTS.md differs from the shared template — sync: delete AGENTS.md, then policy scaffold (writes this project's path to build-policy, ${policyRel(dir)})`,
       );
@@ -2797,7 +3020,9 @@ function checkStaleness(dir, reg) {
     // Never run is the weakest state, not the mildest: dependency staleness has
     // never been measured here at all. Treating it more leniently than an
     // overdue run would exempt exactly the projects that need it most.
-    fail(`No maintenance record — dependency staleness has never been measured here. Run: policy health`);
+    fail(
+      `No maintenance record — dependency staleness has never been measured here. Run: policy health`,
+    );
   }
 
   // Dependency drift inside the declared ranges. Warns rather than fails: a
@@ -2917,7 +3142,7 @@ const GATE_ORDER = [
  * presented, so a gap is found while the fix is cheap. Binding it at release
  * instead would surface structural problems after testing and force a retest.
  */
-function complianceFailures(dir) {
+function complianceSummary(dir) {
   const saved = { ...results, lines: [...results.lines] };
   const savedHook = hookMode;
   results.pass = 0;
@@ -2931,11 +3156,61 @@ function complianceFailures(dir) {
   } catch {
     /* a crashing audit must not take the gates down */
   }
-  const failures = results.lines.filter((l) => l.startsWith('FAIL: ')).map((l) => l.slice(6));
+  const summary = {
+    pass: results.pass,
+    warn: results.warn,
+    fail: results.fail,
+    lines: [...results.lines],
+  };
   Object.assign(results, saved);
   hookMode = savedHook;
   embedded = false;
-  return failures;
+  return summary;
+}
+
+function complianceFailures(dir) {
+  return complianceSummary(dir)
+    .lines.filter((l) => l.startsWith('FAIL: '))
+    .map((l) => l.slice(6));
+}
+
+/**
+ * `check --all`: every project beside build-policy, one table. Compliance is
+ * a gate with no known-debt mechanism, so the number of projects whose gates
+ * cannot run is the portfolio's backlog, and it was only visible by surveying
+ * each project by hand.
+ */
+function cmdCheckAll() {
+  const parent = path.dirname(POLICY_ROOT);
+  const isProject = (d) =>
+    ['package.json', 'AGENTS.md', '.github/workflows/ci.yml', 'CLAUDE.md'].some((f) =>
+      exists(path.join(d, f)),
+    );
+  const dirs = fs
+    .readdirSync(parent, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && !e.name.startsWith('.') && e.name !== 'build-policy-public')
+    .map((e) => path.join(parent, e.name))
+    .filter((d) => d === POLICY_ROOT || isProject(d))
+    .sort();
+  section(`Compliance across ${dirs.length} projects in ${parent}`);
+  const rows = dirs.map((d) => ({ name: path.basename(d), ...complianceSummary(d) }));
+  const w = Math.max(...rows.map((r) => r.name.length), 7);
+  console.log(`  ${'project'.padEnd(w)}   ok  warn  fail`);
+  for (const r of rows)
+    console.log(
+      `  ${r.fail ? RED : GREEN}${r.name.padEnd(w)}${RESET}  ${String(r.pass).padStart(3)}  ${String(r.warn).padStart(4)}  ${String(r.fail).padStart(4)}`,
+    );
+  const failing = rows.filter((r) => r.fail > 0);
+  for (const r of failing) {
+    console.log(`\n${BOLD}${r.name}${RESET}`);
+    for (const l of r.lines.filter((l) => l.startsWith('FAIL: ')))
+      console.log(`  ${RED}✗${RESET} ${l.slice(6)}`);
+  }
+  const totalFail = rows.reduce((n, r) => n + r.fail, 0);
+  console.log(
+    `\n${BOLD}${failing.length ? RED + 'FAIL' : GREEN + 'PASS'}${RESET} — ${rows.length - failing.length} of ${rows.length} projects pass, ${totalFail} failures\n`,
+  );
+  process.exit(failing.length ? 1 : 0);
 }
 
 /**
@@ -2951,21 +3226,46 @@ function reviewRootCommit(dir) {
   try {
     const steps = [
       ['git', ['init', '-q', '-b', 'main'], tmp],
-      ['git', ['-c', 'user.name=policy', '-c', 'user.email=policy@localhost', 'commit', '-q', '--allow-empty', '-m', 'empty base'], tmp],
+      [
+        'git',
+        [
+          '-c',
+          'user.name=policy',
+          '-c',
+          'user.email=policy@localhost',
+          'commit',
+          '-q',
+          '--allow-empty',
+          '-m',
+          'empty base',
+        ],
+        tmp,
+      ],
     ];
     for (const [c, a, w] of steps) {
       const r = require('child_process').spawnSync(c, a, { cwd: w, encoding: 'utf8' });
-      if (r.status !== 0) return { ok: false, out: `could not prepare the first-commit review: ${r.stderr}` };
+      if (r.status !== 0)
+        return { ok: false, out: `could not prepare the first-commit review: ${r.stderr}` };
     }
     const base = sh('git rev-parse HEAD', tmp).out.trim();
     // No shell: the archive goes from git to tar as bytes, so no path is ever
     // interpolated into a command line.
-    const archive = require('child_process').spawnSync('git', ['archive', 'HEAD'], { cwd: dir, maxBuffer: 1 << 30 });
-    if (archive.status !== 0) return { ok: false, out: `could not archive the first commit: ${archive.stderr}` };
-    const untar = require('child_process').spawnSync('tar', ['-x', '-C', tmp], { input: archive.stdout });
-    if (untar.status !== 0) return { ok: false, out: `could not copy the first commit: ${untar.stderr}` };
+    const archive = require('child_process').spawnSync('git', ['archive', 'HEAD'], {
+      cwd: dir,
+      maxBuffer: 1 << 30,
+    });
+    if (archive.status !== 0)
+      return { ok: false, out: `could not archive the first commit: ${archive.stderr}` };
+    const untar = require('child_process').spawnSync('tar', ['-x', '-C', tmp], {
+      input: archive.stdout,
+    });
+    if (untar.status !== 0)
+      return { ok: false, out: `could not copy the first commit: ${untar.stderr}` };
     sh('git add -A', tmp);
-    sh("git -c user.name=policy -c user.email=policy@localhost commit -q -m 'first commit snapshot'", tmp);
+    sh(
+      "git -c user.name=policy -c user.email=policy@localhost commit -q -m 'first commit snapshot'",
+      tmp,
+    );
     const r = sh(`coderabbit review --agent --base-commit ${safeToken(base, 'commit')}`, tmp);
     return { ok: r.ok, out: r.out };
   } finally {
@@ -2984,7 +3284,9 @@ function cmdGates(dir, flags) {
       console.log(`\nFix, then re-run: policy gates\n`);
       process.exit(1);
     }
-    const files = changedFiles(dir).filter((f) => !f.startsWith('.policy/')).sort();
+    const files = changedFiles(dir)
+      .filter((f) => !f.startsWith('.policy/'))
+      .sort();
     const marker = {
       timestamp: new Date().toISOString(),
       diffHash: diffHash(dir),
@@ -3044,11 +3346,14 @@ function cmdGates(dir, flags) {
     let base = null;
     if (prevMarker && prevMarker.head && head) {
       if (prevMarker.head === head) nothingSincePass = true;
-      else if (sh(`git merge-base --is-ancestor ${safeToken(prevMarker.head, 'commit')} HEAD`, dir).ok)
+      else if (
+        sh(`git merge-base --is-ancestor ${safeToken(prevMarker.head, 'commit')} HEAD`, dir).ok
+      )
         base = prevMarker.head;
     } else if (head) {
       const tag = sh('git describe --tags --abbrev=0 HEAD', dir);
-      if (tag.ok && sh(`git rev-list -n 1 ${safeToken(tag.out, 'tag')}`, dir).out !== head) base = tag.out;
+      if (tag.ok && sh(`git rev-list -n 1 ${safeToken(tag.out, 'tag')}`, dir).out !== head)
+        base = tag.out;
     }
     const since = base ? filesBetween(dir, base) : null;
     if (since) {
@@ -3115,7 +3420,6 @@ function cmdGates(dir, flags) {
     console.log(`  ${GREEN}✓${RESET} Compliance`);
   }
 
-
   // CI's first step. Runs in the fast pre-commit subset too: a lockfile
   // `npm ci` rejects must not be committable at all.
   {
@@ -3138,7 +3442,11 @@ function cmdGates(dir, flags) {
   // Registry signatures and provenance for every installed package, from
   // npm itself: no account, no quota (policy 2.58). Full gates only, since it
   // asks the registry about each package.
-  if (!fast && exists(path.join(dir, 'package-lock.json')) && exists(path.join(dir, 'node_modules'))) {
+  if (
+    !fast &&
+    exists(path.join(dir, 'package-lock.json')) &&
+    exists(path.join(dir, 'node_modules'))
+  ) {
     const sig = sh('npm audit signatures', dir);
     if (sig.ok) ok('Registry signatures verified (npm audit signatures)');
     else {
@@ -3216,9 +3524,12 @@ function cmdGates(dir, flags) {
     process.stdout.write(`  ${DIM}running${RESET} ${g.name} (npm run ${g.script}) ... `);
     // Committed work is reviewed against the commit the last pass saw.
     const extra =
-      g.script === 'review' && reviewBase ? ` -- --base-commit ${safeToken(reviewBase, 'commit')}` : '';
+      g.script === 'review' && reviewBase
+        ? ` -- --base-commit ${safeToken(reviewBase, 'commit')}`
+        : '';
     if (extra) process.stdout.write(`${DIM}(committed since ${reviewBase.slice(0, 12)})${RESET} `);
-    if (g.script === 'review' && rootReview) process.stdout.write(`${DIM}(first commit, reviewed from an empty base)${RESET} `);
+    if (g.script === 'review' && rootReview)
+      process.stdout.write(`${DIM}(first commit, reviewed from an empty base)${RESET} `);
     const r =
       g.script === 'security' && exists(path.join(dir, AUDIT_EXCEPTIONS))
         ? auditWithExceptions(dir)
@@ -3287,8 +3598,7 @@ function cmdGates(dir, flags) {
       // The source the review actually examined. Absent when the diff has no
       // source, so a later source change cannot inherit an unrelated pass.
       reviewedSourceHash:
-        srcHash !== null &&
-        (alreadyReviewed || report.some((r) => r.gate === 'CodeRabbit review'))
+        srcHash !== null && (alreadyReviewed || report.some((r) => r.gate === 'CodeRabbit review'))
           ? srcHash
           : reviewCarried && srcHash === null
             ? prevMarker.reviewedSourceHash || null
@@ -3466,7 +3776,9 @@ function cmdVerifyReady(dir, flags) {
         `${sensitive.length} security-sensitive file(s) changed without a recorded review: ${sensitive.join(', ')}.\n` +
           `      Run /security-review over these changes, address what it finds, then record it:\n` +
           `      node ../build-policy/scripts/policy.js security-ack` +
-          (rec ? `\n      ${DIM}(a review is recorded, but for different content — it no longer applies)${RESET}` : ''),
+          (rec
+            ? `\n      ${DIM}(a review is recorded, but for different content — it no longer applies)${RESET}`
+            : ''),
       );
   }
 
@@ -3727,7 +4039,9 @@ function verifyRelease(dir, proj, flags) {
     const status = (headOut.match(/HTTP\/[\d.]+ (\d{3})/) || [])[1];
     const cors = /access-control-allow-origin/i.test(headOut);
     if (status !== '200') {
-      fail(`Update endpoint ${verUrl} returned ${status || 'no response'} — the banner can never fire`);
+      fail(
+        `Update endpoint ${verUrl} returned ${status || 'no response'} — the banner can never fire`,
+      );
     } else if (!cors) {
       fail(
         `Update endpoint ${verUrl} sends no Access-Control-Allow-Origin header. The app reads it cross-origin ` +
@@ -3752,7 +4066,9 @@ function verifyRelease(dir, proj, flags) {
   const checklist = [
     ...RELEASE_CHECKLISTS[profile],
     ...(proj.pkg && proj.pkg.scripts && proj.pkg.scripts['docs:capture']
-      ? ["Ran npm run docs:capture, then rechecked the help pages the help centre's drift check flags (npm run drift in help-centre)"]
+      ? [
+          "Ran npm run docs:capture, then rechecked the help pages the help centre's drift check flags (npm run drift in help-centre)",
+        ]
       : []),
   ];
   // Only the DMG-producing profiles have an artifact to stage the checklist on.
@@ -4036,10 +4352,18 @@ function cmdHealth(dir, flags) {
   // it past that point is choosing not to update. Asked of GitHub's advisory
   // database through gh, one call per exception.
   for (const [id, e] of Object.entries(loadAuditExceptions(dir))) {
-    const r = sh(`gh api /advisories/${safeToken(id, 'advisory id')} -q '[.vulnerabilities[] | select(.package.name == "${safeToken(e.package || '', 'package')}") | .first_patched_version] | map(select(. != null)) | .[0] // ""'`, dir);
-    if (!r.ok) warn(`Could not check ${id} on GitHub (gh unavailable?) — confirm by hand that it still has no fix`);
+    const r = sh(
+      `gh api /advisories/${safeToken(id, 'advisory id')} -q '[.vulnerabilities[] | select(.package.name == "${safeToken(e.package || '', 'package')}") | .first_patched_version] | map(select(. != null)) | .[0] // ""'`,
+      dir,
+    );
+    if (!r.ok)
+      warn(
+        `Could not check ${id} on GitHub (gh unavailable?) — confirm by hand that it still has no fix`,
+      );
     else if (r.out.trim())
-      fail(`${id} now has a fixed release of ${e.package} (${r.out.trim()}) — update to it and remove the exception from audit-exceptions.json`);
+      fail(
+        `${id} now has a fixed release of ${e.package} (${r.out.trim()}) — update to it and remove the exception from audit-exceptions.json`,
+      );
     else ok(`${id}: still no fixed release of ${e.package}; exception stands until ${e.expires}`);
   }
 
@@ -4060,7 +4384,10 @@ function cmdHealth(dir, flags) {
   if (risky.length > 0)
     warn(
       `${risky.length} allowlisted package(s) with a risk signal (dormant, deprecated, archived or under 1,000 weekly downloads) ` +
-        `and no Socket score in 180 days: ${risky.slice(0, 6).map(([n]) => n).join(', ')}${risky.length > 6 ? ', …' : ''} — ` +
+        `and no Socket score in 180 days: ${risky
+          .slice(0, 6)
+          .map(([n]) => n)
+          .join(', ')}${risky.length > 6 ? ', …' : ''} — ` +
         `score each: node ${path.join(POLICY_ROOT, 'scripts', 'verify-package.js')} <package>`,
     );
 
@@ -4145,7 +4472,10 @@ function cmdScaffold(dir) {
       const found = installScriptPackages(dir);
       if (found) {
         allow._installScripts = Object.fromEntries(
-          found.map((n) => [n, `present when install-script tracking began (${new Date().toISOString().split('T')[0]})`]),
+          found.map((n) => [
+            n,
+            `present when install-script tracking began (${new Date().toISOString().split('T')[0]})`,
+          ]),
         );
         fs.writeFileSync(allowPath, JSON.stringify(allow, null, 2) + '\n');
         created.push(`allowed-packages.json _installScripts (${found.length})`);
@@ -4316,6 +4646,57 @@ function cmdScaffold(dir) {
   );
 }
 
+/**
+ * `sync-templates`: overwrite the drift-checked files from the templates.
+ * `scaffold` never overwrites, so the fix for template drift was a `cp` per
+ * file per project, and the pre-commit hook and AGENTS.md carry a localized
+ * path that a plain copy gets wrong. One project per run: the change is
+ * gated like any other (changelog, gates, the developer's commit).
+ */
+function cmdSyncTemplates(dir) {
+  guardLocalPath(dir);
+  if (path.resolve(dir) === POLICY_ROOT) {
+    console.log(`${RED}sync-templates runs in a project, not in build-policy.${RESET}`);
+    process.exit(1);
+  }
+  section(`Template sync: ${path.resolve(dir)}`);
+  const files = [
+    ['ci.yml', '.github/workflows/ci.yml'],
+    ['dependabot.yml', '.github/dependabot.yml'],
+    ['pre-commit', '.husky/pre-commit'],
+    ['AGENTS.md', 'AGENTS.md'],
+  ];
+  const changed = [];
+  for (const [tpl, dest] of files) {
+    const next = localizePolicyPath(readFile(path.join(TEMPLATES, tpl)), dir);
+    const destPath = path.join(dir, dest);
+    if (readFile(destPath) === next) {
+      console.log(`  ${DIM}current ${dest}${RESET}`);
+      continue;
+    }
+    fs.mkdirSync(path.dirname(destPath), { recursive: true });
+    fs.writeFileSync(destPath, next);
+    try {
+      fs.chmodSync(destPath, fs.statSync(path.join(TEMPLATES, tpl)).mode);
+    } catch {
+      /* mode is cosmetic for non-executables */
+    }
+    changed.push(dest);
+    console.log(`  ${GREEN}written${RESET} ${dest}`);
+  }
+  const nodePin = (loadRegistry().entries || {})['node-lts'];
+  if (nodePin && nodePin.value && readFile(path.join(dir, '.nvmrc')).trim() !== nodePin.value) {
+    fs.writeFileSync(path.join(dir, '.nvmrc'), `${nodePin.value}\n`);
+    changed.push('.nvmrc');
+    console.log(`  ${GREEN}written${RESET} .nvmrc (${nodePin.value})`);
+  }
+  console.log(
+    changed.length
+      ? `\nSynced ${changed.length} file(s). Gated like any change: CHANGELOG entry, policy gates, developer commit.\n`
+      : '\nAlready in sync.\n',
+  );
+}
+
 // ------------------------------------------------------------------ mirror
 
 /**
@@ -4363,7 +4744,7 @@ function cmdMirror() {
 
   // Drift: scripts/ and templates/ are mirrored verbatim ("enforcement is
   // publicly verifiable") — any byte difference means the mirror is stale.
-  for (const sub of ['scripts', 'templates']) {
+  for (const sub of ['scripts', 'templates', 'tests']) {
     const privDir = path.join(POLICY_ROOT, sub);
     const pubDir = path.join(PUBLIC_ROOT, sub);
     const list = (d) => (exists(d) ? fs.readdirSync(d).filter((f) => !f.startsWith('.')) : []);
@@ -4404,17 +4785,28 @@ function cmdMirror() {
   // so rule text already published (generic examples such as /api/licenses)
   // is not re-litigated; API paths only in history rows, where they describe
   // a real app rather than illustrate a rule.
-  const added = sh(
-    'git diff HEAD --unified=0 -- BUILD-POLICY.md project-standards.md',
-    PUBLIC_ROOT,
-  )
+  // Text moved between the public docs (the history table into HISTORY.md)
+  // is not new text: a line already published verbatim in any of them at
+  // HEAD is not re-litigated.
+  const publicDocs = ['BUILD-POLICY.md', 'project-standards.md', 'HISTORY.md'];
+  const published = new Set(
+    publicDocs.flatMap((d) => sh(`git show HEAD:${d}`, PUBLIC_ROOT).out.split('\n')),
+  );
+  const added = sh(`git diff HEAD --unified=0 -- ${publicDocs.join(' ')}`, PUBLIC_ROOT)
     .out.split('\n')
     .filter((l) => l.startsWith('+') && !l.startsWith('+++'))
-    .map((l) => l.slice(1));
+    .map((l) => l.slice(1))
+    .filter((l) => !published.has(l));
   const incident = [
     [/\b(found|raised|discovered|reported)\s+(in|while|by)\b/i, 'where it was found'],
-    [/\bwhile preparing\b|\bfor sale\b|\bplanned\s+(DMG|release|launch|build)\b/i, 'a product plan'],
-    [/\b(a|one|another)\s+(finance|budget|journal|photo|music|crypto|stock|mail|email|notes?|task|tracker)\w*\s+app\b/i, 'an app identified by what it does'],
+    [
+      /\bwhile preparing\b|\bfor sale\b|\bplanned\s+(DMG|release|launch|build)\b/i,
+      'a product plan',
+    ],
+    [
+      /\b(a|one|another)\s+(finance|budget|journal|photo|music|crypto|stock|mail|email|notes?|task|tracker)\w*\s+app\b/i,
+      'an app identified by what it does',
+    ],
     [/\b(unrestorable|lost (their|all|user) data|pruned real)\b/i, 'a data-loss incident'],
   ];
   for (const line of added) {
@@ -4426,13 +4818,15 @@ function cmdMirror() {
             `the story of what went wrong stays in the private copy`,
         );
     }
-    const api = /^\|\s*\d+\.\d+\s*\|/.test(line) && line.match(/(GET|POST|PUT|PATCH|DELETE)?\s*`?\/api\/[\w/-]+/);
+    const api =
+      /^\|\s*\d+\.\d+\s*\|/.test(line) &&
+      line.match(/(GET|POST|PUT|PATCH|DELETE)?\s*`?\/api\/[\w/-]+/);
     if (api)
       fail(
         `API path in a public history row ("${api[0].trim()}") — a real app's endpoint is attack detail; describe the rule instead`,
       );
   }
-  for (const doc of ['BUILD-POLICY.md', 'project-standards.md']) {
+  for (const doc of publicDocs) {
     const content = readFile(path.join(PUBLIC_ROOT, doc));
     for (const re of internalProse) {
       const m = content.match(re);
@@ -4500,12 +4894,21 @@ function cmdMirror() {
   // in the public repo. Checked for commits not yet pushed, so the pre-push
   // guard stops them while `git commit --amend` can still reword them.
   const upstream = sh('git rev-parse --abbrev-ref @{u}', PUBLIC_ROOT).ok;
-  const log = sh(`git log --format=%h%x00%B%x1e ${upstream ? '@{u}..HEAD' : '-1 HEAD'}`, PUBLIC_ROOT);
+  const log = sh(
+    `git log --format=%h%x00%B%x1e ${upstream ? '@{u}..HEAD' : '-1 HEAD'}`,
+    PUBLIC_ROOT,
+  );
   const messageRules = [
-    ...terms.map(({ term }) => [new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), `names "${term}"`]),
+    ...terms.map(({ term }) => [
+      new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+      `names "${term}"`,
+    ]),
     [/\b\d+\s+(of\s+\d+\s+)?(projects?|apps?)\b|\b\d+\s+of\s+\d+\b/i, 'a portfolio count'],
     [/\bAction:/, 'a remediation action'],
-    [/\b(found|raised|discovered|reported)\s+(in|while|by)\b|\bwhile preparing\b|\bfor sale\b/i, 'incident or plan detail'],
+    [
+      /\b(found|raised|discovered|reported)\s+(in|while|by)\b|\bwhile preparing\b|\bfor sale\b/i,
+      'incident or plan detail',
+    ],
   ];
   let badMessages = 0;
   for (const entry of (log.ok ? log.out : '').split('\x1e').filter((e) => e.trim())) {
@@ -4521,7 +4924,10 @@ function cmdMirror() {
       }
     }
   }
-  if (badMessages === 0) ok(`Public commit messages ${upstream ? 'not yet pushed' : '(latest)'} carry no private detail`);
+  if (badMessages === 0)
+    ok(
+      `Public commit messages ${upstream ? 'not yet pushed' : '(latest)'} carry no private detail`,
+    );
   return finish();
 }
 
@@ -4549,12 +4955,18 @@ function cmdHandoff() {
   const failures = complianceFailures(POLICY_ROOT);
   if (failures.length > 0) {
     for (const f of failures) fail(f);
-    console.log(`\nFinish the change first: 'policy check' must pass on build-policy before handoff.`);
+    console.log(
+      `\nFinish the change first: 'policy check' must pass on build-policy before handoff.`,
+    );
     return finish();
   }
   fs.writeFileSync(
     POLICY_OWNER,
-    JSON.stringify({ ...owner, status: 'handed-off', handedOffAt: new Date().toISOString() }, null, 2) + '\n',
+    JSON.stringify(
+      { ...owner, status: 'handed-off', handedOffAt: new Date().toISOString() },
+      null,
+      2,
+    ) + '\n',
   );
   ok(`Handed off. The change is waiting for review in a build-policy session.`);
   console.log(
@@ -4577,12 +4989,16 @@ function cmdMirrorSync() {
     fail(`Public mirror not found at ${PUBLIC_ROOT}`);
     return finish();
   }
-  for (const sub of ['scripts', 'templates']) {
+  for (const sub of ['scripts', 'templates', 'tests']) {
     const src = path.join(POLICY_ROOT, sub);
     const dest = path.join(PUBLIC_ROOT, sub);
     fs.mkdirSync(dest, { recursive: true });
-    const names = fs.readdirSync(src).filter((f) => !f.startsWith('.') && fs.statSync(path.join(src, f)).isFile());
-    const copied = names.filter((f) => readFile(path.join(src, f)) !== readFile(path.join(dest, f)));
+    const names = fs
+      .readdirSync(src)
+      .filter((f) => !f.startsWith('.') && fs.statSync(path.join(src, f)).isFile());
+    const copied = names.filter(
+      (f) => readFile(path.join(src, f)) !== readFile(path.join(dest, f)),
+    );
     for (const f of copied) fs.copyFileSync(path.join(src, f), path.join(dest, f));
     ok(`${sub}/: ${copied.length ? `copied ${copied.join(', ')}` : 'already in sync'}`);
   }
@@ -4598,9 +5014,10 @@ function cmdMirrorSync() {
     if (next !== text) fs.writeFileSync(file, next);
   }
   ok(`Public doc headers at ${privVer}`);
-  const rowsOf = (s) => [...s.matchAll(/^\|\s*(\d+\.\d+)\s*\|\s*\d{4}-\d{2}-\d{2}\s*\|/gm)].map((m) => m[1]);
-  const pubRows = new Set(rowsOf(readFile(path.join(PUBLIC_ROOT, 'BUILD-POLICY.md'))));
-  const missing = rowsOf(readFile(path.join(POLICY_ROOT, 'BUILD-POLICY.md'))).filter((v) => !pubRows.has(v));
+  const pubRows = new Set(historyRows(readFile(path.join(PUBLIC_ROOT, historyFile(PUBLIC_ROOT)))));
+  const missing = historyRows(readFile(path.join(POLICY_ROOT, historyFile(POLICY_ROOT)))).filter(
+    (v) => !pubRows.has(v),
+  );
   if (missing.length)
     warn(
       `Write public history rows for ${missing.join(', ')} by hand: the rule and how it is enforced, no incident, ` +
@@ -4624,17 +5041,22 @@ function cmdMirrorSync() {
  * already in the download cache, so casks get --require-sha.
  */
 const BREW_REQUIRED = [
-  ['HOMEBREW_VERIFY_ATTESTATIONS', '1', 'verifies each bottle\'s build provenance with gh'],
+  ['HOMEBREW_VERIFY_ATTESTATIONS', '1', "verifies each bottle's build provenance with gh"],
   ['HOMEBREW_NO_INSECURE_REDIRECT', '1', 'refuses HTTPS-to-HTTP download redirects'],
   ['HOMEBREW_CASK_OPTS', '--require-sha', 'refuses casks without a checksum'],
 ];
 
 function brewEnvFiles() {
-  const prefix = process.env.HOMEBREW_PREFIX || (exists('/opt/homebrew') ? '/opt/homebrew' : '/usr/local');
+  const prefix =
+    process.env.HOMEBREW_PREFIX || (exists('/opt/homebrew') ? '/opt/homebrew' : '/usr/local');
   const user = process.env.XDG_CONFIG_HOME
     ? path.join(process.env.XDG_CONFIG_HOME, 'homebrew', 'brew.env')
     : path.join(os.homedir(), '.homebrew', 'brew.env');
-  return { system: '/etc/homebrew/brew.env', prefix: path.join(prefix, 'etc', 'homebrew', 'brew.env'), user };
+  return {
+    system: '/etc/homebrew/brew.env',
+    prefix: path.join(prefix, 'etc', 'homebrew', 'brew.env'),
+    user,
+  };
 }
 
 /** Effective Homebrew settings from brew.env files (user over prefix over system) and the environment. */
@@ -4653,7 +5075,9 @@ function brewSettings(extraEnv = {}) {
 }
 
 function brewAttestationsOn(settings) {
-  return Boolean(settings.HOMEBREW_VERIFY_ATTESTATIONS) && !settings.HOMEBREW_NO_VERIFY_ATTESTATIONS;
+  return (
+    Boolean(settings.HOMEBREW_VERIFY_ATTESTATIONS) && !settings.HOMEBREW_NO_VERIFY_ATTESTATIONS
+  );
 }
 
 // ------------------------------------------------------------------ doctor
@@ -4708,8 +5132,14 @@ function cmdDoctor() {
 
   const npmrc = readFile(path.join(os.homedir(), '.npmrc'));
   const releaseAge = Number((npmrc.match(/^min-release-age\s*=\s*(\d+)/m) || [])[1] || 0);
-  if (releaseAge >= 2) ok(`~/.npmrc min-release-age=${releaseAge} (packages under ${releaseAge} days old are refused)`);
-  else fail(`~/.npmrc min-release-age is ${releaseAge || 'unset'} — policy 2.58 needs 2 or more. Run: policy setup-machine`);
+  if (releaseAge >= 2)
+    ok(
+      `~/.npmrc min-release-age=${releaseAge} (packages under ${releaseAge} days old are refused)`,
+    );
+  else
+    fail(
+      `~/.npmrc min-release-age is ${releaseAge || 'unset'} — policy 2.58 needs 2 or more. Run: policy setup-machine`,
+    );
 
   // The Socket npm wrapper is retired (policy 2.58): an `npm` alias to it
   // would keep routing installs through its quota and its older resolver.
@@ -4717,7 +5147,9 @@ function cmdDoctor() {
     .map((f) => readFile(path.join(os.homedir(), f)))
     .join('\n');
   if (/^\s*alias\s+npm=["']?socket\b/m.test(shellRc) || /socket wrapper/.test(shellRc))
-    fail('The Socket npm wrapper is still on in your shell profile — run: socket wrapper off (then open a new terminal)');
+    fail(
+      'The Socket npm wrapper is still on in your shell profile — run: socket wrapper off (then open a new terminal)',
+    );
   else ok('Socket npm wrapper is off (installs use npm directly)');
 
   if (sh('command -v brew', process.cwd()).ok) {
@@ -4726,12 +5158,21 @@ function cmdDoctor() {
       k === 'HOMEBREW_CASK_OPTS' ? !String(bs[k] || '').includes(v) : !bs[k],
     ).map(([k]) => k);
     if (bs.HOMEBREW_NO_VERIFY_ATTESTATIONS)
-      fail('HOMEBREW_NO_VERIFY_ATTESTATIONS is set, which turns off bottle attestation checks — remove it');
+      fail(
+        'HOMEBREW_NO_VERIFY_ATTESTATIONS is set, which turns off bottle attestation checks — remove it',
+      );
     else if (missing.length)
-      fail(`Homebrew install safety missing from ${brewEnvFiles().user}: ${missing.join(', ')} — run: policy setup-machine`);
-    else ok('Homebrew verifies bottle attestations, refuses insecure redirects and requires cask checksums (brew.env)');
+      fail(
+        `Homebrew install safety missing from ${brewEnvFiles().user}: ${missing.join(', ')} — run: policy setup-machine`,
+      );
+    else
+      ok(
+        'Homebrew verifies bottle attestations, refuses insecure redirects and requires cask checksums (brew.env)',
+      );
     if (!sh('gh auth status', process.cwd()).ok)
-      fail('gh is not signed in — Homebrew uses it to verify bottle attestations, so brew installs will fail: gh auth login');
+      fail(
+        'gh is not signed in — Homebrew uses it to verify bottle attestations, so brew installs will fail: gh auth login',
+      );
   }
 
   const settings = readJSON(path.join(os.homedir(), '.claude', 'settings.json')) || {};
@@ -4747,8 +5188,13 @@ function cmdDoctor() {
   if (!settingsStr.includes('policy.js') && !settingsStr.includes('session-start'))
     warn('Claude Code hooks not wired — run: policy setup-machine');
   else if (unwired.length > 0)
-    fail(`Claude Code hooks missing from ~/.claude/settings.json: ${unwired.join(', ')} — run: policy setup-machine`);
-  else ok('Claude Code hooks configured in ~/.claude/settings.json (every canonical event and matcher)');
+    fail(
+      `Claude Code hooks missing from ~/.claude/settings.json: ${unwired.join(', ')} — run: policy setup-machine`,
+    );
+  else
+    ok(
+      'Claude Code hooks configured in ~/.claude/settings.json (every canonical event and matcher)',
+    );
 
   const agentsDir = path.join(os.homedir(), '.claude', 'agents');
   const agents = exists(agentsDir)
@@ -4860,12 +5306,15 @@ function cmdSetupMachine() {
   if (sh('command -v brew', process.cwd()).ok) {
     const file = brewEnvFiles().user;
     const current = readFile(file);
-    const add = BREW_REQUIRED.filter(([k]) => !new RegExp(`^\\s*(export\\s+)?${k}\\s*=`, 'm').test(current)).map(
-      ([k, v, why]) => `# ${why}\n${k}=${v}`,
-    );
+    const add = BREW_REQUIRED.filter(
+      ([k]) => !new RegExp(`^\\s*(export\\s+)?${k}\\s*=`, 'm').test(current),
+    ).map(([k, v, why]) => `# ${why}\n${k}=${v}`);
     if (add.length) {
       fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, (current && !current.endsWith('\n') ? current + '\n' : current) + add.join('\n') + '\n');
+      fs.writeFileSync(
+        file,
+        (current && !current.endsWith('\n') ? current + '\n' : current) + add.join('\n') + '\n',
+      );
       ok(`Homebrew install safety written to ${file}`);
     } else ok(`Homebrew install safety already in ${file}`);
   }
@@ -4876,7 +5325,9 @@ function cmdSetupMachine() {
     const cur = readFile(file);
     const m = cur.match(/^min-release-age\s*=\s*(\d+)\s*$/m);
     if (!m || Number(m[1]) < 2) {
-      const next = m ? cur.replace(m[0], 'min-release-age=2') : `${cur}${cur && !cur.endsWith('\n') ? '\n' : ''}min-release-age=2\n`;
+      const next = m
+        ? cur.replace(m[0], 'min-release-age=2')
+        : `${cur}${cur && !cur.endsWith('\n') ? '\n' : ''}min-release-age=2\n`;
       fs.writeFileSync(file, next);
       ok(`~/.npmrc min-release-age set to 2`);
     } else ok(`~/.npmrc min-release-age already ${m[1]}`);
@@ -5069,7 +5520,12 @@ function cmdHookStop() {
   // the policy change must be complete before the turn ends. A later session
   // has none of this one's context, so work left half-done here stays so.
   const owner = readJSON(POLICY_OWNER);
-  if (owner && owner.session === input.session_id && owner.status !== 'handed-off' && policyTreeDirty()) {
+  if (
+    owner &&
+    owner.session === input.session_id &&
+    owner.status !== 'handed-off' &&
+    policyTreeDirty()
+  ) {
     const failures = complianceFailures(POLICY_ROOT);
     const policyCli = path.join(POLICY_ROOT, 'scripts', 'policy.js');
     if (failures.length > 0) {
@@ -5171,7 +5627,9 @@ function cmdHookStop() {
             : '') +
           `Run /security-review over these changes, fix what it finds, then record it: ` +
           `node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} security-ack` +
-          (rec ? ` (a review is recorded, but for different content — it no longer applies).` : '.') +
+          (rec
+            ? ` (a review is recorded, but for different content — it no longer applies).`
+            : '.') +
           ` If a review genuinely does not apply here, say so explicitly rather than skipping it silently.`,
       );
     }
@@ -5256,7 +5714,9 @@ function commandNamesRoot(cmd, root, cwd = process.cwd()) {
   // command runs: from ADMIN_OTHER/dev-work/<app>, "../build-policy" is some
   // other folder, and the text alone refused a session that never touched it.
   const forms = [
-    ...cmd.matchAll(new RegExp(`(?:^|[\\s'"=:(])((?:\\.\\.\\/)+(?:[\\w.-]+\\/)*${name})(?![\\w-])`, 'g')),
+    ...cmd.matchAll(
+      new RegExp(`(?:^|[\\s'"=:(])((?:\\.\\.\\/)+(?:[\\w.-]+\\/)*${name})(?![\\w-])`, 'g'),
+    ),
     ...cmd.matchAll(new RegExp(`(~\\/[^\\s'"]*\\/${name})(?![\\w-])`, 'g')),
   ].map((m) => m[1]);
   return forms.some((f) => isUnderRoot(f, cwd, root));
@@ -5281,19 +5741,26 @@ function bashWriteTargets(cmd, startCwd) {
   // app session editing its own files was refused whenever "build-policy"
   // appeared anywhere in the command (five times in one day).
   const bodies = [];
-  cmd = cmd.replace(/<<-?\s*(['"]?)(\w+)\1([^\n]*)\n([\s\S]*?)\n\s*\2\s*(?=\n|$)/g, (m, q, tag, rest, body) => {
-    bodies.push(body);
-    return `<<HEREDOC${bodies.length - 1}${rest}`;
-  });
+  cmd = cmd.replace(
+    /<<-?\s*(['"]?)(\w+)\1([^\n]*)\n([\s\S]*?)\n\s*\2\s*(?=\n|$)/g,
+    (m, q, tag, rest, body) => {
+      bodies.push(body);
+      return `<<HEREDOC${bodies.length - 1}${rest}`;
+    },
+  );
   let unknown = false;
   const unknownSegments = [];
-  const abs = (t) => path.resolve(cwd, t.replace(/^['"]|['"]$/g, '').replace(/^~(?=\/)/, os.homedir()));
+  const abs = (t) =>
+    path.resolve(cwd, t.replace(/^['"]|['"]$/g, '').replace(/^~(?=\/)/, os.homedir()));
   for (const seg of cmd.split(/&&|\|\||;|\n|\|/)) {
     for (const m of seg.matchAll(/(?<![0-9&<])>>?\s*("[^"]*"|'[^']*'|[^\s;&|<>]+)/g)) {
       if (!/^['"]?\/dev\//.test(m[1])) targets.push(abs(m[1]));
     }
-    const words = (seg.replace(/(?<![0-9&<])>>?\s*("[^"]*"|'[^']*'|[^\s;&|<>]+)/g, '').match(/"[^"]*"|'[^']*'|\S+/g) || [])
-      .map((w) => w.replace(/^['"]|['"]$/g, ''));
+    const words = (
+      seg
+        .replace(/(?<![0-9&<])>>?\s*("[^"]*"|'[^']*'|[^\s;&|<>]+)/g, '')
+        .match(/"[^"]*"|'[^']*'|\S+/g) || []
+    ).map((w) => w.replace(/^['"]|['"]$/g, ''));
     while (words.length && /^\w+=/.test(words[0])) words.shift();
     if (words[0] === 'sudo' || words[0] === 'command' || words[0] === 'exec') words.shift();
     const cmd0 = words[0];
@@ -5303,11 +5770,16 @@ function bashWriteTargets(cmd, startCwd) {
       if (args[0]) cwd = abs(args[0]);
     } else if (['cp', 'mv', 'install', 'rsync', 'ln'].includes(cmd0)) {
       if (args.length) targets.push(abs(args[args.length - 1]));
-    } else if (['rm', 'rmdir', 'touch', 'truncate', 'mkdir', 'tee', 'chmod', 'unlink'].includes(cmd0)) {
+    } else if (
+      ['rm', 'rmdir', 'touch', 'truncate', 'mkdir', 'tee', 'chmod', 'unlink'].includes(cmd0)
+    ) {
       for (const a of args) targets.push(abs(a));
     } else if ((cmd0 === 'sed' || cmd0 === 'perl') && words.some((w) => /^-[a-z]*i/.test(w))) {
       for (const a of args.slice(1)) targets.push(abs(a));
-    } else if (cmd0 === 'git' && /\s(checkout|restore|reset|stash|apply|revert|clean|am|merge|pull|rebase)\b/.test(seg)) {
+    } else if (
+      cmd0 === 'git' &&
+      /\s(checkout|restore|reset|stash|apply|revert|clean|am|merge|pull|rebase)\b/.test(seg)
+    ) {
       const c = seg.match(/\s-C\s+(\S+)/);
       targets.push(c ? abs(c[1]) : cwd);
     } else if (cmd0 === 'patch') {
@@ -5319,7 +5791,10 @@ function bashWriteTargets(cmd, startCwd) {
       else if (!/policy\.js\b/.test(seg)) {
         unknown = true;
         const body = (seg.match(/<<HEREDOC(\d+)/) || [])[1];
-        unknownSegments.push({ text: body !== undefined ? `${seg}\n${bodies[Number(body)]}` : seg, cwd });
+        unknownSegments.push({
+          text: body !== undefined ? `${seg}\n${bodies[Number(body)]}` : seg,
+          cwd,
+        });
       }
     }
   }
@@ -5380,10 +5855,17 @@ function splitStringLiterals(text) {
 function literalPathsUnder(text, root, cwd, depth = 0) {
   const { literals, code } = splitStringLiterals(text);
   for (const lit of literals) {
-    if (lit.length > 1 && !/\s/.test(lit) && /[/~.]/.test(lit) && isUnderRoot(lit, cwd, root)) return true;
+    if (lit.length > 1 && !/\s/.test(lit) && /[/~.]/.test(lit) && isUnderRoot(lit, cwd, root))
+      return true;
     // A string holding code (a shell-quoted `node -e "..."` script) has its
     // own literals: look inside it too.
-    if (/\w\(/.test(lit) && /['"`]/.test(lit) && depth < 3 && literalPathsUnder(lit, root, cwd, depth + 1)) return true;
+    if (
+      /\w\(/.test(lit) &&
+      /['"`]/.test(lit) &&
+      depth < 3 &&
+      literalPathsUnder(lit, root, cwd, depth + 1)
+    )
+      return true;
   }
   return commandNamesRoot(code, root, cwd);
 }
@@ -5391,7 +5873,11 @@ function literalPathsUnder(text, root, cwd, depth = 0) {
 function refuse(reason) {
   console.log(
     JSON.stringify({
-      hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason },
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: reason,
+      },
     }),
   );
   process.exit(0);
@@ -5411,7 +5897,12 @@ function claimPolicyRepo(input) {
     fs.writeFileSync(
       POLICY_OWNER,
       JSON.stringify(
-        { session, project: input.cwd || process.cwd(), since: new Date().toISOString(), status: 'editing' },
+        {
+          session,
+          project: input.cwd || process.cwd(),
+          since: new Date().toISOString(),
+          status: 'editing',
+        },
         null,
         2,
       ) + '\n',
@@ -5449,7 +5940,8 @@ function cmdHookPretool() {
       ? // The operation must act on the file; prose that mentions it is fine.
         /(\b(rm|mv|cp|tee|truncate|touch|unlink)\b|>>?|\b(open|writeFileSync|appendFileSync|unlinkSync|rmSync|renameSync)\s*\()[^|;&\n]*\.policy\/owner\.json/.test(
           cmd,
-        ) && (commandNamesRoot(cmd, POLICY_ROOT) || isUnderPolicyRoot(input.cwd || process.cwd()))
+        ) &&
+        (commandNamesRoot(cmd, POLICY_ROOT) || isUnderPolicyRoot(input.cwd || process.cwd()))
       : /owner\.json$/.test(ti.file_path || '') && isUnderPolicyRoot(ti.file_path, input.cwd);
   if (claimFileWrite)
     refuse(
@@ -5483,20 +5975,28 @@ function cmdHookPretool() {
   {
     const ti3 = input.tool_input || {};
     const writesApprovals =
-      (['Edit', 'Write', 'MultiEdit'].includes(input.tool_name) && /audit-approvals\.json$/.test(ti3.file_path || '')) ||
+      (['Edit', 'Write', 'MultiEdit'].includes(input.tool_name) &&
+        /audit-approvals\.json$/.test(ti3.file_path || '')) ||
       (input.tool_name === 'Bash' &&
-        (bashWriteTargets(cmd, input.cwd || process.cwd()).targets.some((t) => /audit-approvals\.json$/.test(t)) ||
-          /(\b(tee|cp|mv|truncate)\b|>>?|\b(open|writeFileSync|appendFileSync|renameSync)\s*\()[^|;&\n]*audit-approvals\.json/.test(cmd)));
-    if (writesApprovals || (input.tool_name === 'Bash' && /policy\.js["']?\s+approve-exception\b/.test(cmd)))
+        (bashWriteTargets(cmd, input.cwd || process.cwd()).targets.some((t) =>
+          /audit-approvals\.json$/.test(t),
+        ) ||
+          /(\b(tee|cp|mv|truncate)\b|>>?|\b(open|writeFileSync|appendFileSync|renameSync)\s*\()[^|;&\n]*audit-approvals\.json/.test(
+            cmd,
+          )));
+    if (
+      writesApprovals ||
+      (input.tool_name === 'Bash' && /policy\.js["']?\s+approve-exception\b/.test(cmd))
+    )
       refuse(
-        'BUILD-POLICY: approving an advisory exception is the developer\'s decision. Write or update the entry in ' +
+        "BUILD-POLICY: approving an advisory exception is the developer's decision. Write or update the entry in " +
           'audit-exceptions.json, show the developer the full entry and what you checked in this project, then give them ' +
           'the command to run themselves: ! node <build-policy>/scripts/policy.js approve-exception <GHSA-id>',
       );
     if (input.tool_name === 'Bash' && /--min-release-age(=|\s+)\d/.test(cmd))
       refuse(
         'BUILD-POLICY: overriding min-release-age installs a version younger than the quarantine. For an urgent security fix ' +
-          'that is the developer\'s call: score the exact version first (verify-package.js), then give the developer the command ' +
+          "that is the developer's call: score the exact version first (verify-package.js), then give the developer the command " +
           'to run themselves, e.g. ! npm install <pkg>@<version> --min-release-age=0',
       );
   }
@@ -5512,7 +6012,7 @@ function cmdHookPretool() {
     const target = `${ti2.file_path || ''} ${cmd}`;
     if (/allowed-packages\.json/.test(target) && /["']?waived["']?\s*:/.test(text))
       refuse(
-        'BUILD-POLICY: a Socket waiver in allowed-packages.json approves a package nobody scored. That is the developer\'s ' +
+        "BUILD-POLICY: a Socket waiver in allowed-packages.json approves a package nobody scored. That is the developer's " +
           'decision: ask them to add "socket": { "waived": "<reason>" } to the entry by hand, or retry verify-package.js ' +
           'when Socket answers.',
       );
@@ -5545,8 +6045,15 @@ function cmdHookPretool() {
   }
   // Homebrew installs must verify bottle attestations. Read from brew.env and
   // any HOMEBREW_* assignments on the command line itself.
-  if (input.tool_name === 'Bash' && /(?:^|[;&|(]|&&|\|\|)\s*(?:[A-Z_]+=\S*\s+)*brew\s+(?:install|upgrade|reinstall|bundle)\b/.test(cmd)) {
-    const inline = Object.fromEntries([...cmd.matchAll(/\b(HOMEBREW_[A-Z_]+)=(\S*)/g)].map((m) => [m[1], m[2] || '1']));
+  if (
+    input.tool_name === 'Bash' &&
+    /(?:^|[;&|(]|&&|\|\|)\s*(?:[A-Z_]+=\S*\s+)*brew\s+(?:install|upgrade|reinstall|bundle)\b/.test(
+      cmd,
+    )
+  ) {
+    const inline = Object.fromEntries(
+      [...cmd.matchAll(/\b(HOMEBREW_[A-Z_]+)=(\S*)/g)].map((m) => [m[1], m[2] || '1']),
+    );
     if (!brewAttestationsOn(brewSettings(inline)))
       refuse(
         `BUILD-POLICY: this brew command would install without verifying bottle attestations. Set it up once with ` +
@@ -5852,7 +6359,9 @@ function cmdApproveException(ids) {
   const dir = process.cwd();
   section('Approve advisory exception');
   const exceptions = loadAuditExceptions(dir);
-  const targets = ids.length ? ids : Object.keys(exceptions).filter((id) => !auditExceptionApproved(dir, id, exceptions[id]));
+  const targets = ids.length
+    ? ids
+    : Object.keys(exceptions).filter((id) => !auditExceptionApproved(dir, id, exceptions[id]));
   if (targets.length === 0) {
     ok('Nothing to approve: every entry in audit-exceptions.json is already approved');
     return finish();
@@ -5865,7 +6374,8 @@ function cmdApproveException(ids) {
       continue;
     }
     console.log(`\n${BOLD}${id}${RESET}`);
-    for (const k of ['package', 'via', 'reason', 'decided', 'expires']) console.log(`  ${k.padEnd(8)} ${e[k] || ''}`);
+    for (const k of ['package', 'via', 'reason', 'decided', 'expires'])
+      console.log(`  ${k.padEnd(8)} ${e[k] || ''}`);
     const problems = auditExceptionProblems({ [id]: e });
     if (problems.length) {
       fail(`${id} cannot be approved: ${problems.join('; ')}`);
@@ -5893,7 +6403,9 @@ function main() {
     case 'setup-machine':
       return cmdSetupMachine();
     case 'check':
-      return cmdCheck(dir, flags);
+      return flags.includes('--all') ? cmdCheckAll() : cmdCheck(dir, flags);
+    case 'sync-templates':
+      return cmdSyncTemplates(dir);
     case 'gates':
       return cmdGates(dir, flags);
     case 'verify-marker':
@@ -5932,4 +6444,21 @@ function main() {
   }
 }
 
-main();
+if (require.main === module) main();
+
+// For tests/ only: the pure predicates the hooks and gates decide on.
+module.exports = {
+  bashWriteTargets,
+  writesUnder,
+  literalPathsUnder,
+  commandNamesRoot,
+  splitStringLiterals,
+  cmpSemver,
+  historyRows,
+  brewAttestationsOn,
+  isSourceFile,
+  isGatedFile,
+  THINKING_DISABLED_RE,
+  NO_DISABLE_MODEL_RE,
+  FIRST_BLOCK_TEXT_RE,
+};

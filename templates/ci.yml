@@ -71,15 +71,16 @@ jobs:
             --exclude-rule html.security.audit.missing-integrity.missing-integrity
 
       # Socket supply-chain scanning is deliberately NOT run here. Every package
-      # reaching the lockfile is already scanned locally by one of two controls:
-      # the `socket npm` wrapper at install time, and a `socket:scan` run over
-      # Dependabot branches before merge. A CI step would re-scan a lockfile that
-      # was cleared before the commit existed, while costing an API quota unit
-      # per run and requiring SOCKET_SECURITY_API_KEY in every repo.
+      # reaching the lockfile is already checked locally: the full gates verify
+      # registry signatures (npm audit signatures) and stop on new install-time
+      # scripts, and each package new to a project takes one Socket score before
+      # it is allowlisted. A CI step would re-scan a lockfile that was cleared
+      # before the commit existed, while costing an API quota unit per run and
+      # requiring SOCKET_SECURITY_API_KEY in every repo.
       #
-      # Re-add it only if a project gains contributors who do not install through
-      # the wrapper, or if Dependabot branches start merging without local review
-      # — those are the cases CI would actually cover.
+      # Re-add it only if a project gains contributors who do not go through the
+      # local allowlist flow, or if Dependabot branches start merging without
+      # local review: those are the cases CI would actually cover.
 
       # With audit-exceptions.json (a dated decision to carry an advisory that
       # has no fix, approved by the developer in audit-approvals.json), fail

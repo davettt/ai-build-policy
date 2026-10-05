@@ -1,7 +1,7 @@
 # Project Standards
 
 The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
-**Version:** 2.60
+**Version:** 2.61
 **Last updated:** 2026-10-05
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
@@ -427,7 +427,8 @@ Icon: `build/icon.png` (512x512 PNG). electron-builder converts to `.icns` autom
 - Rate limiting on expensive endpoints
 - **Model IDs — the source of truth is `build-policy/registry.json`.** Never invent tier IDs; copy from the registry into each app's active fast/smart routing and model picker. Each registry entry carries a `verified` date; `policy health`/`check` flag entries past their review window. On review, check current official pricing and model capabilities, update the registry, then propagate. There is no hand-kept list of apps to update: `check` scans each project's source and WARNs on any Anthropic or OpenAI model ID that is not a current registry value (a dated snapshot of a registry alias counts as current), so every app reports its own drift when opened. Migration maps that must name old IDs so saved selections keep working opt out with a `// policy:legacy-model-ids` comment, which exempts lines up to the block's closing `}` or `]`. Check request parameters and stored model selections during a family migration; a matching ID alone does not prove the API call works.
 - **Deliberate per-app model choices are recorded, not left as drift.** When an app needs different models from the tiers, add its IDs to `registry.json` `modelExceptions` under the app's package.json name, with the reason and the date decided. `check` then accepts those IDs for that app only, and WARNs when the exception passes its review window so it is re-confirmed. An ID that is not a tier value or a recorded exception is still flagged.
-- **Read Claude responses by content-block type, never `content[0].text`.** Sonnet 5, Opus 5/5.5, Fable and Mythos think by default when a request omits `thinking` (Sonnet 4.6 and Opus 4.8 did not), so the response opens with a `thinking` block and the first block has no text. Join every block whose `type === 'text'`; when none is present, report `stop_reason` (`max_tokens` means cut off, `refusal` means declined) rather than a generic format error. Quick text tasks (summaries, grammar, suggestions) should also send `thinking: {type: 'disabled'}` so thinking neither adds latency nor eats a small `max_tokens`; Haiku 4.5 accepts the same value. Two apps here broke this way on the move to `claude-sonnet-5`. `check` FAILs a first-block read in a project that names a thinking-by-default model, and WARNs on one anywhere else, since it breaks on the next smart-tier migration.
+- **Read Claude responses by content-block type, never `content[0].text`.** Sonnet 5, Opus 5/5.5, Fable and Mythos think by default when a request omits `thinking` (Sonnet 4.6 and Opus 4.8 did not), so the response opens with a `thinking` block and the first block has no text. Join every block whose `type === 'text'`; when none is present, report `stop_reason` (`max_tokens` means cut off, `refusal` means declined) rather than a generic format error. Two apps here broke this way on the move to `claude-sonnet-5`. `check` FAILs a first-block read in a project that names a thinking-by-default model, and WARNs on one anywhere else, since it breaks on the next smart-tier migration.
+- **Turning thinking off is model-specific, so quick text tasks branch on the model.** Summaries, grammar and suggestions do not need thinking, which adds latency and eats a small `max_tokens`. Sonnet 5, Opus 5 and Haiku 4.5 accept `thinking: {type: 'disabled'}`. Sonnet 5.5 rejects it with a 400 and takes `thinking: {type: 'between_tools'}` instead (effort `high` or below, no other field). Opus 5.5 cannot turn it off at all; use `output_config: {effort: 'low'}`. Fable and Mythos reject any explicit setting, so omit the parameter. The earlier text here said to send `disabled` everywhere, which would have broken the next smart-tier move the same way the first-block read did. `check` FAILs `type: 'disabled'` in a project that names Sonnet 5.5, Opus 5.5, Fable or Mythos, and WARNs on it anywhere else.
 - **Model entries review every 60 days, not the registry default of 90.** Model families now turn over faster than a quarter, and a stale entry costs more than an out-of-date name: Sonnet 5 superseded Sonnet 4.6 at a *lower* price ($2/$10 per MTok against $3/$15), so sitting on the old ID meant paying more for less. Each model entry records its price at verification, so a review can answer "is the newer one cheaper" without researching the model it replaced. Compare price as well as capability, and in both directions — a newer model is not automatically dearer.
 
 ---
@@ -486,7 +487,7 @@ npm run sast        # semgrep scan --config auto --error (with exclusions)
 - `express-res-sendfile` — can't detect validation guards (`isValidSafetyName` checks `basename === filename` + prefix/suffix) before `sendFile()`
 - `remote-property-injection` — can't distinguish static allowlist iteration (`for (const key of allowed)`) from user-controlled bracket keys
 
-These four are the ONLY sanctioned global exclusions. Anything else is suppressed per-line with `// nosemgrep: <rule-suffix>` on the specific finding (e.g. `unsafe-formatstring` on `console.error` of server-internal values), so each suppression stays visible in review. Never exclude `dependabot-missing-cooldown` — it means `.github/dependabot.yml` is missing the template's `cooldown:` block (valid keys are `default-days`/`semver-*-days`; bare `semver-minor:`/`semver-patch:` are invalid and break Dependabot).
+These are the ONLY sanctioned global exclusions (`check` FAILs any other). Anything else is suppressed per-line with `// nosemgrep: <rule-suffix>` on the specific finding (e.g. `unsafe-formatstring` on `console.error` of server-internal values), so each suppression stays visible in review. Never exclude `dependabot-missing-cooldown` — it means `.github/dependabot.yml` is missing the template's `cooldown:` block (valid keys are `default-days`/`semver-*-days`; bare `semver-minor:`/`semver-patch:` are invalid and break Dependabot).
 
 **Required ESLint plugins:**
 - `@typescript-eslint` — TypeScript-aware rules
@@ -509,7 +510,7 @@ These four are the ONLY sanctioned global exclusions. Anything else is suppresse
 
 **Required secret scanning:**
 - `betterleaks` — detects API keys, tokens, passwords, and other secrets in git history (official successor to Gitleaks, by the same author)
-- **Homebrew only** (`brew install betterleaks`). Do not install via npm — betterleaks is also not distributed via npm, install via Homebrew only. In CI, use `gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9` (pinned to full commit SHA — third-party actions must be SHA-pinned against supply-chain attacks) until a Betterleaks action is available.
+- **Homebrew only** (`brew install betterleaks`). Do not install via npm — betterleaks is also not distributed via npm, install via Homebrew only. In CI, use the gitleaks action version `registry.json` records (`gh-action-gitleaks`), pinned to its full commit SHA in `templates/ci.yml` (third-party actions must be SHA-pinned against supply-chain attacks), until a Betterleaks action is available. The registry and the template are checked against each other, so the version is written in one place.
 - Wire into quality script as `npm run secrets`
 
 **Required license compliance:**
@@ -859,7 +860,7 @@ For local apps, list the exact origins the app loads from (`http://127.0.0.1:<po
 
 ### CSRF Protection
 
-Local apps served on localhost are not vulnerable to CSRF in the traditional sense (same-origin policy protects them), but cloud/SaaS apps must implement CSRF tokens on state-changing endpoints. Use the `csurf` middleware or the double-submit cookie pattern.
+Local apps are exposed to cross-site writes too: a page the user visits can submit a form or a no-body `POST` to `http://127.0.0.1:<port>` without a preflight, and the same-origin policy only stops it reading the response. The local defence is the `Origin` check in § Network Exposure (layer 4), which `check` enforces. Cloud/SaaS apps additionally implement CSRF tokens on state-changing endpoints, with the `csurf` middleware or the double-submit cookie pattern, because their sessions ride on cookies that any site can cause the browser to send.
 
 ### Secrets
 
@@ -1097,7 +1098,7 @@ Packages that ship native binaries (rolldown, lightningcss, `@tailwindcss/oxide`
 
 `check` and `gates` FAIL when a lockfile declares platform binaries it has no resolutions for. The rule looks only at families of two or more platform-named siblings, so genuinely optional native modules such as `canvas` are unaffected.
 
-That rule matches one shape of breakage. The general check is npm's own: every `gates` run, fast and full, runs the validation `npm ci` performs before installing: it builds the dependency tree from `package.json` and fails if the lockfile lacks anything in it. The tree includes every platform's optional packages (filtering by platform happens later, at install), so the answer on a Mac is the answer on CI's Linux runner. It installs nothing and takes under a second. Passing tests against a local `node_modules` does not give that assurance. One app's lockfile lost electron-winstaller's optional `@electron/windows-sign` subtree three times in eleven days, each time when a dependency was added on this Mac, and each time the local gates passed and CI failed. The cause was Socket's npm wrapper, not npm or macOS: `socket npm install <pkg>` resolves with a vendored copy of npm's Arborist based on npm 11.0.0, which prunes optional subtrees from the lockfile and `node_modules`. When the sync check fails after adding a package, restore the pruned entries with a plain install and no package name, `socket raw-npm install --ignore-scripts`, which re-resolves from `package.json`; the Socket scan gate then covers what it restored. Keep adding packages through `socket npm install` so each one is scanned. Dependency manifests are gated like source: `verify-marker` blocks a commit of `package.json` or `package-lock.json` without a full-gates pass, and the Stop hook blocks presenting one.
+That rule matches one shape of breakage. The general check is npm's own: every `gates` run, fast and full, runs the validation `npm ci` performs before installing: it builds the dependency tree from `package.json` and fails if the lockfile lacks anything in it. The tree includes every platform's optional packages (filtering by platform happens later, at install), so the answer on a Mac is the answer on CI's Linux runner. It installs nothing and takes under a second. Passing tests against a local `node_modules` does not give that assurance. One app's lockfile lost electron-winstaller's optional `@electron/windows-sign` subtree three times in eleven days, each time when a dependency was added on this Mac, and each time the local gates passed and CI failed. The cause was Socket's npm wrapper, not npm or macOS: `socket npm install <pkg>` resolved with a vendored copy of npm's Arborist based on npm 11.0.0, which pruned optional subtrees from the lockfile and `node_modules`. The wrapper was retired in 2.58 and installs now use npm directly (§ Supply Chain Security). If a lockfile from that period still fails the sync check, a plain `npm install` with no package name re-resolves it from `package.json`. Dependency manifests are gated like source: `verify-marker` blocks a commit of `package.json` or `package-lock.json` without a full-gates pass, and the Stop hook blocks presenting one.
 
 ### Keeping dependencies current
 
@@ -1105,7 +1106,7 @@ Two lanes, both minor/patch only. Majors always go through `policy upgrade <pkg>
 
 **Local refresh (`policy deps-update`)** is the primary lane. It runs `npm update`, which moves each package to the newest version its declared range allows and does not rewrite the ranges in `package.json` (npm's documented behaviour). With `save-prefix = ^` that means minor and patch. One command brings the whole tree current, verified by one full gates run rather than one review cycle per package.
 
-Guardrails, all automatic: the lockfile changing makes `gates` run the Socket supply-chain scan; `min-release-age=1` quarantines anything published in the last 24 hours; full gates and tests must pass before the commit is possible; the change needs a CHANGELOG entry like any other.
+Guardrails, all automatic: `min-release-age=2` quarantines anything published in the last two days; the next full `gates` run verifies registry signatures (`npm audit signatures`), audits advisories and stops on any new install-time script; full gates and tests must pass before the commit is possible; the change needs a CHANGELOG entry like any other.
 
 Run it when `check` reports drift, and before starting feature work rather than in the middle of it.
 
@@ -1113,28 +1114,27 @@ Run it when `check` reports drift, and before starting feature work rather than 
 
 `check` warns at session start when more than 10 packages sit behind their allowed range and the last refresh is over 30 days old. It warns rather than fails, since a routine refresh should not block unrelated work. The count is cached and re-measured at most once a day, because `npm outdated` is a network call and the session-start hook has a 10 second budget.
 
-**Dependabot PR Flow (minor and patch only, with Socket):**
-1. Review the Dependabot PR on GitHub — confirm it is a minor or patch bump
+**Dependabot PR Flow (minor and patch only):** the `dependabot-reviewer` agent runs it, one agent per branch.
+1. Review the Dependabot PR on GitHub and confirm it is a minor or patch bump
 2. `git fetch origin` to pull the branch locally
 3. `git checkout <dependabot-branch-name>`
-4. `npm run socket:scan` to scan for supply-chain risks using the same org/policy/quota as `policy gates`
-5. `npm install && npm run quality` to verify build, lint, types, SAST, and security all pass
-6. If clean, merge on GitHub
-7. `git checkout main && git pull` to return to main
+4. `npm install && npm audit signatures`. A signature or provenance failure is a do-not-merge
+5. If the bump adds a direct package not in `allowed-packages.json`, score it: `node ../build-policy/scripts/verify-package.js <pkg>` (one lookup per new package, never a whole-tree scan)
+6. `npm run quality` to verify build, lint, types, SAST, and security all pass
+7. If clean, merge on GitHub
+8. `git checkout main && git pull` to return to main
 
 **Commands:**
 ```bash
-npm run socket:scan                         # Canonical project supply-chain scan
-socket scan create --report --org your-org  # Direct whole-tree scan under the org
-socket npm install <pkg>                    # Install with Socket scanning (automatic if wrapper is on)
-socket fix                                  # Fix CVEs in dependencies
-socket wrapper on/off                       # Enable/disable automatic npm wrapping
+node ../build-policy/scripts/verify-package.js <pkg>   # Maintenance, popularity, publisher + one Socket score
+npm audit signatures                                   # Registry signatures and provenance for the installed tree
+socket wrapper off                                     # The install wrapper stays off (doctor FAILs while it is on)
 ```
 
 **Minimum Release Age:**
-`min-release-age=1` is set globally in `~/.npmrc`. npm will refuse to resolve any package version published less than 24 hours ago. This filters out the riskiest window for supply chain attacks — most malicious packages are detected and removed within hours of publication.
+`min-release-age=2` is set globally in `~/.npmrc` by `policy setup-machine`; `doctor` FAILs below 2. npm will refuse to resolve any package version published less than two days ago. This filters out the riskiest window for supply chain attacks — most malicious packages are detected and removed within that window. An urgent fix younger than that goes through the developer-run override in § Supply Chain Security.
 
-**Setup:** Free tier (1,000 scans/month). Run `socket login` to authenticate with your API token.
+**Setup:** `socket login` once per machine so `verify-package.js` can score packages.
 
 ### Dependency Allowlist
 
@@ -1154,13 +1154,12 @@ Every project maintains an `allowed-packages.json` in its root. Only packages on
 ```
 
 **Adding a new package:**
-1. Run `npm run deps:verify <package-name>` — queries npm registry and Socket for metadata, flags risks
-2. A security-focused agent independently reviews the verification output
-3. The primary agent reviews the security agent's findings and the raw data
-4. Only if both reviewers approve, add the entry to `allowed-packages.json`
-5. Both the verification output and the allowlist diff are visible to the developer at commit time
+1. Run `npm run deps:verify <package-name>`: it queries the npm registry for publisher, repository, downloads and maintenance signals, takes one Socket score, and prints the allowlist entry with every flag it raised
+2. Read the flags against § Package verification below (genuine upstream, official repository, not a name-squat of a tool distributed elsewhere). A flagged package may still be accepted, with the reason recorded in the entry's `decision`
+3. Add the printed entry to `allowed-packages.json`; `deps:check` FAILs an entry with no score, or a flagged entry with no decision
+4. The verification output and the allowlist diff are both in front of the developer at commit time, which is the human review of the addition
 
-**Dual-reviewer requirement:** No package may be added to the allowlist by a single reviewer. The verification script provides the data; a security agent and the primary agent must independently confirm the package is legitimate. This catches name-squatted, abandoned, or unnecessary packages that automated scanners miss.
+The checks are mechanical where they can be (`deps:check`) and the judgment is written down where it cannot (`decision`), so the next session reads why a package was accepted instead of re-arguing it.
 
 **Scripts (shared in `build-policy/scripts/`):**
 ```bash
@@ -1219,13 +1218,13 @@ Allowlist and Socket cover whether a package is *legitimate* and *safe to instal
 - **deprecated**: npm `deprecated` flag set, or repo archived, or maintainer has announced end-of-life.
 - **superseded**: a maintained fork or successor exists and is recommended by the original maintainer or community. Migration should be planned.
 
-**Re-verification.** `policy health` re-checks the maintenance status of allowlisted packages:
+**Re-verification.** Every allowlist entry is re-verified on a schedule from its `verified` date:
 
-- Standard packages: every 180 days from their `verified` date.
-- Security-sensitive packages (parsers, converters, serializers, crypto, auth): every 90 days. Sensitivity is determined by the package's role, not its name.
-- A re-verification queries `npm view <pkg> time` for latest publish date, checks the GitHub API for archive status, and updates the allowlist entry.
+- Standard packages: every 180 days.
+- Security-sensitive packages (parsers, converters, serializers, crypto, auth): every 90 days, set per entry with `"reviewEveryDays": 90`. Sensitivity is determined by the package's role, not its name.
+- A re-verification is `verify-package.js <pkg>` again: it reads `npm view <pkg> time` for the latest publish date, the GitHub API for archive status, and takes a fresh Socket score; replace the entry with what it prints.
 
-`check` FAILs when any allowlisted package has a `verified` date older than its review window. `health` does the network calls and updates the entries; `check` enforces the recorded state.
+`deps:check` FAILs when any allowlisted package is past its window, in the fast gate and pre-commit like the rest of the allowlist rules, so an entry cannot quietly go years without anyone looking at the package again. `health` additionally WARNs on risk-flagged packages (dormant, deprecated, superseded, archived, low download count) with no Socket score in 180 days.
 
 **What triggers a migration decision:**
 
