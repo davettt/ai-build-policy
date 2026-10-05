@@ -2944,7 +2944,7 @@ function complianceFailures(dir) {
  * a clean tree could never pass the review gate. Copy the committed files
  * into a scratch repository that starts with an empty commit, and review the
  * snapshot against it: the method the review gate's own failure message
- * described, done by hand by a session setting up client-site-starter.
+ * described, first done by hand for a repository created from a template.
  */
 function reviewRootCommit(dir) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-root-review-'));
