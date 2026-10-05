@@ -81,9 +81,10 @@ jobs:
       # the wrapper, or if Dependabot branches start merging without local review
       # — those are the cases CI would actually cover.
 
-      # With audit-exceptions.json (a developer's dated decision to carry an
-      # advisory that has no fix), fail only on high/critical advisories it
-      # does not cover; the same rule `policy gates` applies locally.
+      # With audit-exceptions.json (a dated decision to carry an advisory that
+      # has no fix, approved by the developer in audit-approvals.json), fail
+      # only on high/critical advisories it does not cover; the same rule
+      # `policy gates` applies locally.
       - name: Dependency audit
         run: |
           if [ ! -f audit-exceptions.json ]; then npm run security; exit $?; fi
@@ -91,6 +92,8 @@ jobs:
           node -e '
             const fs = require("fs");
             const ex = JSON.parse(fs.readFileSync("audit-exceptions.json", "utf8"));
+            const ap = fs.existsSync("audit-approvals.json") ? JSON.parse(fs.readFileSync("audit-approvals.json", "utf8")) : {};
+            const hash = (e) => require("crypto").createHash("sha256").update(JSON.stringify({ package: e.package, via: e.via || "", reason: e.reason, decided: e.decided, expires: e.expires })).digest("hex");
             const today = new Date().toISOString().slice(0, 10);
             const rep = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/audit.json", "utf8"));
             const open = [];
@@ -98,7 +101,8 @@ jobs:
               for (const via of v.via || [])
                 if (via && typeof via === "object" && /high|critical/.test(via.severity || "")) {
                   const id = String(via.url || "").split("/").pop(); const e = ex[id];
-                  if (!(e && e.package === (via.name || name) && e.expires >= today)) open.push(id + " in " + (via.name || name));
+                  const approved = e && ap[id] && ap[id].hash === hash(e);
+                  if (!(approved && e.package === (via.name || name) && e.expires >= today)) open.push(id + " in " + (via.name || name));
                 }
             if (open.length) { console.error("Uncovered advisories:\n" + open.join("\n")); process.exit(1); }
             console.log("No uncovered high or critical advisories");'

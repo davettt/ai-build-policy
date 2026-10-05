@@ -1657,14 +1657,34 @@ function auditInstallScripts(dir) {
  * draft an entry but not write the file.
  */
 const AUDIT_EXCEPTIONS = 'audit-exceptions.json';
+const AUDIT_APPROVALS = 'audit-approvals.json';
 const AUDIT_EXCEPTION_MAX_DAYS = 90;
 
 function loadAuditExceptions(dir) {
   return readJSON(path.join(dir, AUDIT_EXCEPTIONS)) || {};
 }
 
+/**
+ * The AI drafts exceptions; only the developer approves them (policy 2.59).
+ * `policy approve-exception <id>` records, in the committed audit-approvals.json,
+ * a hash of the entry's fields. An entry counts only while that hash matches,
+ * so an entry changed after approval needs approving again. The same hash is
+ * computed by the CI template's audit step.
+ */
+function auditEntryHash(e) {
+  const fields = { package: e.package, via: e.via || '', reason: e.reason, decided: e.decided, expires: e.expires };
+  return crypto.createHash('sha256').update(JSON.stringify(fields)).digest('hex');
+}
+function loadAuditApprovals(dir) {
+  return readJSON(path.join(dir, AUDIT_APPROVALS)) || {};
+}
+function auditExceptionApproved(dir, id, e) {
+  const a = loadAuditApprovals(dir)[id];
+  return Boolean(a && e && a.hash === auditEntryHash(e));
+}
+
 /** Problems with the exception file itself: missing fields, too long, expired. */
-function auditExceptionProblems(exceptions, today = new Date().toISOString().slice(0, 10)) {
+function auditExceptionProblems(exceptions, today = new Date().toISOString().slice(0, 10), dir = null) {
   const problems = [];
   for (const [id, e] of Object.entries(exceptions)) {
     if (!/^GHSA-[\w-]+$/.test(id)) problems.push(`${id}: key must be a GHSA advisory id`);
@@ -1676,6 +1696,11 @@ function auditExceptionProblems(exceptions, today = new Date().toISOString().sli
     if (!(span > 0) || span > AUDIT_EXCEPTION_MAX_DAYS)
       problems.push(`${id}: expires ${e.expires} is more than ${AUDIT_EXCEPTION_MAX_DAYS} days after ${e.decided}`);
     if (e.expires < today) problems.push(`${id}: expired on ${e.expires} — re-decide or remove it`);
+    if (dir && !auditExceptionApproved(dir, id, e))
+      problems.push(
+        `${id}: not approved${loadAuditApprovals(dir)[id] ? ' (changed since it was approved)' : ''} — the developer runs: ` +
+          `node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} approve-exception ${id}`,
+      );
   }
   return problems;
 }
@@ -1687,7 +1712,7 @@ function auditExceptionProblems(exceptions, today = new Date().toISOString().sli
  */
 function auditWithExceptions(dir) {
   const exceptions = loadAuditExceptions(dir);
-  const problems = auditExceptionProblems(exceptions);
+  const problems = auditExceptionProblems(exceptions, undefined, dir);
   if (problems.length) return { ok: false, out: `audit-exceptions.json: ${problems.join('; ')}` };
   const r = sh('npm audit --json --omit=dev', dir);
   let report;
@@ -2681,7 +2706,7 @@ function cmdCheck(dir, flags = []) {
     );
 
   if (exists(path.join(dir, AUDIT_EXCEPTIONS))) {
-    const problems = auditExceptionProblems(loadAuditExceptions(dir));
+    const problems = auditExceptionProblems(loadAuditExceptions(dir), undefined, dir);
     if (problems.length) fail(`audit-exceptions.json: ${problems.join('; ')}`);
     else ok(`audit-exceptions.json valid (${Object.keys(loadAuditExceptions(dir)).length} exception(s))`);
   }
@@ -2913,6 +2938,41 @@ function complianceFailures(dir) {
   return failures;
 }
 
+/**
+ * Review a repository's first commit. CodeRabbit reviews a diff against a
+ * base, and a root commit has none, so a new repository's first gates run on
+ * a clean tree could never pass the review gate. Copy the committed files
+ * into a scratch repository that starts with an empty commit, and review the
+ * snapshot against it: the method the review gate's own failure message
+ * described, done by hand by a session setting up client-site-starter.
+ */
+function reviewRootCommit(dir) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-root-review-'));
+  try {
+    const steps = [
+      ['git', ['init', '-q', '-b', 'main'], tmp],
+      ['git', ['-c', 'user.name=policy', '-c', 'user.email=policy@localhost', 'commit', '-q', '--allow-empty', '-m', 'empty base'], tmp],
+    ];
+    for (const [c, a, w] of steps) {
+      const r = require('child_process').spawnSync(c, a, { cwd: w, encoding: 'utf8' });
+      if (r.status !== 0) return { ok: false, out: `could not prepare the first-commit review: ${r.stderr}` };
+    }
+    const base = sh('git rev-parse HEAD', tmp).out.trim();
+    // No shell: the archive goes from git to tar as bytes, so no path is ever
+    // interpolated into a command line.
+    const archive = require('child_process').spawnSync('git', ['archive', 'HEAD'], { cwd: dir, maxBuffer: 1 << 30 });
+    if (archive.status !== 0) return { ok: false, out: `could not archive the first commit: ${archive.stderr}` };
+    const untar = require('child_process').spawnSync('tar', ['-x', '-C', tmp], { input: archive.stdout });
+    if (untar.status !== 0) return { ok: false, out: `could not copy the first commit: ${untar.stderr}` };
+    sh('git add -A', tmp);
+    sh("git -c user.name=policy -c user.email=policy@localhost commit -q -m 'first commit snapshot'", tmp);
+    const r = sh(`coderabbit review --agent --base-commit ${safeToken(base, 'commit')}`, tmp);
+    return { ok: r.ok, out: r.out };
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 function cmdGates(dir, flags) {
   guardLocalPath(dir);
   const proj = detectProject(dir);
@@ -2976,6 +3036,9 @@ function cmdGates(dir, flags) {
   let workFiles = changedNow;
   let reviewBase = null;
   let nothingSincePass = false;
+  // A clean tree on a repository's first commit, with nothing earlier to
+  // compare against: review the whole commit from an empty base.
+  let rootReview = false;
   if (changedNow.length === 0 && proj.isGit) {
     const head = currentHead(dir);
     let base = null;
@@ -2991,6 +3054,9 @@ function cmdGates(dir, flags) {
     if (since) {
       reviewBase = base;
       workFiles = since.filter((f) => !f.startsWith('.policy/'));
+    } else if (!nothingSincePass && head && !sh('git rev-parse --verify --quiet HEAD^', dir).ok) {
+      rootReview = true;
+      workFiles = sh('git ls-tree -r --name-only HEAD', dir).out.split('\n').filter(Boolean);
     }
   }
   const srcHash = sourceOnlyHash();
@@ -3152,10 +3218,13 @@ function cmdGates(dir, flags) {
     const extra =
       g.script === 'review' && reviewBase ? ` -- --base-commit ${safeToken(reviewBase, 'commit')}` : '';
     if (extra) process.stdout.write(`${DIM}(committed since ${reviewBase.slice(0, 12)})${RESET} `);
+    if (g.script === 'review' && rootReview) process.stdout.write(`${DIM}(first commit, reviewed from an empty base)${RESET} `);
     const r =
       g.script === 'security' && exists(path.join(dir, AUDIT_EXCEPTIONS))
         ? auditWithExceptions(dir)
-        : sh(`npm run ${safeToken(g.script, 'script name')}${extra}`, dir);
+        : g.script === 'review' && rootReview
+          ? reviewRootCommit(dir)
+          : sh(`npm run ${safeToken(g.script, 'script name')}${extra}`, dir);
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
     // A gate that ran but examined nothing is not a pass. CodeRabbit exits 0
     // with `"status":"review_skipped","message":"No changes detected"` whenever
@@ -5205,12 +5274,19 @@ const INTERPRETER = /^(python3?|node|ruby|perl|bash|sh|zsh|deno|bun|npx|osascrip
 function bashWriteTargets(cmd, startCwd) {
   let cwd = startCwd;
   const targets = [];
-  // A heredoc's body is not a command line; with one present the whole
-  // command is judged by shape. Otherwise only the segments that hand control
-  // to an interpreter are, so `ls`, `diff` or `cp` beside an unrelated
-  // `npx prettier` stay readable.
-  let unknown = /<</.test(cmd);
-  const unknownSegments = unknown ? [{ text: cmd, cwd }] : [];
+  // Heredoc bodies are taken out of the command line first, so the body of
+  // `cat > notes.md <<EOF` is data written to the redirect target, and the
+  // body of `python3 - <<EOF` is code judged with the segment that runs it.
+  // Before this, any heredoc made the whole command judged by shape, so an
+  // app session editing its own files was refused whenever "build-policy"
+  // appeared anywhere in the command (five times in one day).
+  const bodies = [];
+  cmd = cmd.replace(/<<-?\s*(['"]?)(\w+)\1([^\n]*)\n([\s\S]*?)\n\s*\2\s*(?=\n|$)/g, (m, q, tag, rest, body) => {
+    bodies.push(body);
+    return `<<HEREDOC${bodies.length - 1}${rest}`;
+  });
+  let unknown = false;
+  const unknownSegments = [];
   const abs = (t) => path.resolve(cwd, t.replace(/^['"]|['"]$/g, '').replace(/^~(?=\/)/, os.homedir()));
   for (const seg of cmd.split(/&&|\|\||;|\n|\|/)) {
     for (const m of seg.matchAll(/(?<![0-9&<])>>?\s*("[^"]*"|'[^']*'|[^\s;&|<>]+)/g)) {
@@ -5242,7 +5318,8 @@ function bashWriteTargets(cmd, startCwd) {
       if (/policy\.js["']?\s+mirror-sync\b/.test(seg)) targets.push(PUBLIC_ROOT);
       else if (!/policy\.js\b/.test(seg)) {
         unknown = true;
-        unknownSegments.push({ text: seg, cwd });
+        const body = (seg.match(/<<HEREDOC(\d+)/) || [])[1];
+        unknownSegments.push({ text: body !== undefined ? `${seg}\n${bodies[Number(body)]}` : seg, cwd });
       }
     }
   }
@@ -5259,14 +5336,56 @@ function writesUnder(input, root) {
   const cmd = ti.command || '';
   const w = bashWriteTargets(cmd, cwd);
   if (w.targets.some((t) => isUnderRoot(t, '/', root))) return true;
-  // An interpreter or heredoc may write anywhere: judge that segment by shape,
-  // a write operation in it plus the repo named in it or the segment running
-  // inside the repo. Other segments were already judged by their targets.
+  // An interpreter may write anywhere: judge its segment (with any heredoc
+  // script it reads) by shape, a write operation in it plus a quoted path
+  // literal that resolves into the repo, or the segment running inside the
+  // repo. Prose that mentions the repo inside a longer string is not a path.
   return w.unknownSegments.some(
     (u) =>
       POLICY_WRITE_OP.test(u.text) &&
-      (commandNamesRoot(u.text, root, u.cwd) || isUnderRoot(u.cwd, '/', root)),
+      (literalPathsUnder(u.text, root, u.cwd) || isUnderRoot(u.cwd, '/', root)),
   );
+}
+
+/** Split code into its string literals and the code around them. Handles
+ *  ', ", ` and Python's triple quotes, with backslash escapes. */
+function splitStringLiterals(text) {
+  const literals = [];
+  let code = '';
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const triple = text.slice(i, i + 3) === ch.repeat(3) ? ch.repeat(3) : null;
+      const close = triple || ch;
+      let j = i + close.length;
+      let lit = '';
+      while (j < text.length && text.slice(j, j + close.length) !== close) {
+        if (text[j] === '\\') {
+          lit += text.slice(j, j + 2);
+          j += 2;
+        } else lit += text[j++];
+      }
+      literals.push(lit);
+      code += ' ';
+      i = j + close.length;
+    } else code += text[i++];
+  }
+  return { literals, code };
+}
+
+/** Does this code name a path inside root: a whole, space-free string literal
+ *  that resolves there, or a path written in the code itself? A sentence that
+ *  mentions the repo inside a longer string is prose, not a path. */
+function literalPathsUnder(text, root, cwd, depth = 0) {
+  const { literals, code } = splitStringLiterals(text);
+  for (const lit of literals) {
+    if (lit.length > 1 && !/\s/.test(lit) && /[/~.]/.test(lit) && isUnderRoot(lit, cwd, root)) return true;
+    // A string holding code (a shell-quoted `node -e "..."` script) has its
+    // own literals: look inside it too.
+    if (/\w\(/.test(lit) && /['"`]/.test(lit) && depth < 3 && literalPathsUnder(lit, root, cwd, depth + 1)) return true;
+  }
+  return commandNamesRoot(code, root, cwd);
 }
 
 function refuse(reason) {
@@ -5357,24 +5476,22 @@ function cmdHookPretool() {
     const refusal = claimPolicyRepo(input);
     if (refusal) refuse(refusal);
   }
-  // audit-exceptions.json accepts a known high vulnerability, and a release-age
-  // override installs a version younger than the quarantine. Both are the
-  // developer's decisions (policy 2.58): the AI drafts, the developer runs.
+  // The AI drafts advisory exceptions in audit-exceptions.json; approving one
+  // is the developer's decision (policy 2.59), so the AI may neither run
+  // approve-exception nor write audit-approvals.json. A release-age override
+  // installs a version younger than the quarantine: also the developer's call.
   {
     const ti3 = input.tool_input || {};
-    const writesExceptions =
-      (['Edit', 'Write', 'MultiEdit'].includes(input.tool_name) && /audit-exceptions\.json$/.test(ti3.file_path || '')) ||
+    const writesApprovals =
+      (['Edit', 'Write', 'MultiEdit'].includes(input.tool_name) && /audit-approvals\.json$/.test(ti3.file_path || '')) ||
       (input.tool_name === 'Bash' &&
-        // The write must target the file; prose that names it is fine.
-        (bashWriteTargets(cmd, input.cwd || process.cwd()).targets.some((t) => /audit-exceptions\.json$/.test(t)) ||
-          /(\b(tee|cp|mv|truncate)\b|>>?|\b(open|writeFileSync|appendFileSync|renameSync)\s*\()[^|;&\n]*audit-exceptions\.json/.test(
-            cmd,
-          )));
-    if (writesExceptions)
+        (bashWriteTargets(cmd, input.cwd || process.cwd()).targets.some((t) => /audit-approvals\.json$/.test(t)) ||
+          /(\b(tee|cp|mv|truncate)\b|>>?|\b(open|writeFileSync|appendFileSync|renameSync)\s*\()[^|;&\n]*audit-approvals\.json/.test(cmd)));
+    if (writesApprovals || (input.tool_name === 'Bash' && /policy\.js["']?\s+approve-exception\b/.test(cmd)))
       refuse(
-        'BUILD-POLICY: audit-exceptions.json accepts a known high or critical vulnerability, a security exclusion the developer ' +
-          'decides. Draft the entry (advisory id, package, via, reason, decided, expires at most 90 days later) and ask the ' +
-          'developer to add it.',
+        'BUILD-POLICY: approving an advisory exception is the developer\'s decision. Write or update the entry in ' +
+          'audit-exceptions.json, show the developer the full entry and what you checked in this project, then give them ' +
+          'the command to run themselves: ! node <build-policy>/scripts/policy.js approve-exception <GHSA-id>',
       );
     if (input.tool_name === 'Bash' && /--min-release-age(=|\s+)\d/.test(cmd))
       refuse(
@@ -5724,6 +5841,44 @@ For each ⚠ peer above where the project is below the required major: what has 
   return finish();
 }
 
+/**
+ * `policy approve-exception <GHSA-id> [...]`: the developer's approval of an
+ * advisory exception drafted in audit-exceptions.json. Shows each entry in
+ * full, refuses an invalid one, and records the approval (bound to the entry's
+ * content) in audit-approvals.json. Run by the developer, never the AI: the
+ * PreToolUse hook refuses it, as it refuses --ack-manual.
+ */
+function cmdApproveException(ids) {
+  const dir = process.cwd();
+  section('Approve advisory exception');
+  const exceptions = loadAuditExceptions(dir);
+  const targets = ids.length ? ids : Object.keys(exceptions).filter((id) => !auditExceptionApproved(dir, id, exceptions[id]));
+  if (targets.length === 0) {
+    ok('Nothing to approve: every entry in audit-exceptions.json is already approved');
+    return finish();
+  }
+  const approvals = loadAuditApprovals(dir);
+  for (const id of targets) {
+    const e = exceptions[id];
+    if (!e) {
+      fail(`${id} is not in ${path.join(dir, AUDIT_EXCEPTIONS)}`);
+      continue;
+    }
+    console.log(`\n${BOLD}${id}${RESET}`);
+    for (const k of ['package', 'via', 'reason', 'decided', 'expires']) console.log(`  ${k.padEnd(8)} ${e[k] || ''}`);
+    const problems = auditExceptionProblems({ [id]: e });
+    if (problems.length) {
+      fail(`${id} cannot be approved: ${problems.join('; ')}`);
+      continue;
+    }
+    approvals[id] = { hash: auditEntryHash(e), approvedAt: new Date().toISOString() };
+    ok(`${id} approved (until ${e.expires}; changing the entry needs approval again)`);
+  }
+  fs.writeFileSync(path.join(dir, AUDIT_APPROVALS), JSON.stringify(approvals, null, 2) + '\n');
+  console.log(`\nCommit ${AUDIT_EXCEPTIONS} and ${AUDIT_APPROVALS} together.`);
+  return finish();
+}
+
 // -------------------------------------------------------------------- main
 
 function main() {
@@ -5753,6 +5908,8 @@ function main() {
       return cmdDepsUpdate(dir);
     case 'upgrade':
       return cmdUpgrade(dir, rest);
+    case 'approve-exception':
+      return cmdApproveException(rest.filter((a) => !a.startsWith('--')));
     case 'scaffold':
       return cmdScaffold(dir);
     case 'handoff':
