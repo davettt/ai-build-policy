@@ -7,6 +7,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
@@ -175,4 +176,19 @@ test('historyRows: versions in table order, non-row lines ignored', () => {
   const table =
     '| Version | Date | Changes |\n|---|---|---|\n| 2.61 | 2026-10-06 | a |\n| 2.60 | 2026-10-05 | b |\n| 2.4.4 | 2026-08-18 | c |\nprose | 1.0 | not a row\n';
   assert.deepEqual(policy.historyRows(table), ['2.61', '2.60', '2.4.4']);
+});
+
+test('shippedDmgVersions: test builds under distribution none are not shipped', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-dmg-'));
+  fs.mkdirSync(path.join(dir, 'release'));
+  fs.writeFileSync(path.join(dir, 'release', 'App-0.1.0-universal.dmg'), '');
+  const none = { isElectron: true, pkg: { version: '0.1.0', policy: { distribution: 'none' } } };
+  const gumroad = { isElectron: true, pkg: { version: '0.1.0', policy: { distribution: 'gumroad' } } };
+  const inferred = { isElectron: true, pkg: { version: '0.1.0' } };
+  assert.equal(policy.releaseProfile(none), 'none');
+  assert.equal(policy.releaseProfile(inferred), 'gumroad');
+  assert.equal(policy.shippedDmgVersions(dir, none).size, 0);
+  assert.deepEqual([...policy.shippedDmgVersions(dir, gumroad)], ['0.1.0']);
+  assert.deepEqual([...policy.shippedDmgVersions(dir, inferred)], ['0.1.0']);
+  fs.rmSync(dir, { recursive: true, force: true });
 });

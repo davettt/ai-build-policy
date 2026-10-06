@@ -417,6 +417,18 @@ function builtDmgVersions(dir) {
   return versions;
 }
 
+/** The DMG versions that count as shipped. A DMG is a copy a customer may
+ *  hold only once the project distributes: with `policy.distribution` set to
+ *  `none` the DMGs in release/ are test builds installed on the developer's
+ *  own machine, so nothing is frozen by them and no tag or update banner is
+ *  owed for them. The release-only rules (freeze, tag, banner) read this;
+ *  the build hook and the post-build checklist keep reading builtDmgVersions,
+ *  because they are about the artifact itself, not about customers. */
+function shippedDmgVersions(dir, proj) {
+  if (releaseProfile(proj) === 'none') return new Set();
+  return builtDmgVersions(dir);
+}
+
 /** The DMG built for a given version, or null. Only `release/` itself is
  *  searched: `release/archive/` holds superseded builds, and assessing one of
  *  those would report on an artifact that is not being shipped. */
@@ -1398,10 +1410,19 @@ function auditElectronStandards(dir, proj) {
   // several DMGs, with a version.json published for it on the site, and no
   // banner in the app at all: it passed every banner check by having no banner.
   // A rule that presupposes the feature can never require it.
-  if (!versionCheck && builtDmgVersions(dir).size > 0) {
+  //
+  // Required once the project distributes (a shipped DMG exists, or
+  // distribution is declared gumroad before the first one is built, so the
+  // gap is caught at check time rather than after the launch build). With
+  // distribution none the DMGs are test builds and the banner is added when
+  // the app is far enough along to test it against a version.json.
+  const declaredGumroad =
+    !!(proj.pkg && proj.pkg.policy && proj.pkg.policy.distribution === 'gumroad');
+  if (!versionCheck && (shippedDmgVersions(dir, proj).size > 0 || declaredGumroad)) {
     findings.push(
-      `no update check at all, yet this app ships a DMG — customers have no way to learn a new version exists, ` +
-        `and the site already publishes a version.json for it. Fetch it on launch and show the banner (project-standards § Electron)`,
+      `no update check at all, yet this app ${declaredGumroad ? 'is declared for Gumroad distribution' : 'ships a DMG'} — ` +
+        `customers have no way to learn a new version exists. Fetch the site's version.json on launch and show the banner ` +
+        `(project-standards § Electron)`,
     );
   }
   // A server that reads the version from the environment needs the main process
@@ -2810,7 +2831,7 @@ function cmdCheck(dir, flags = []) {
   }
 
   // Shipped version frozen: source changes on a version that already has a DMG
-  if (proj.pkg && proj.pkg.version && builtDmgVersions(dir).has(proj.pkg.version)) {
+  if (proj.pkg && proj.pkg.version && shippedDmgVersions(dir, proj).has(proj.pkg.version)) {
     if (changedFiles(dir).filter(isSourceFile).length > 0) {
       fail(
         `Source changed but version ${proj.pkg.version} already has a built DMG (shipped = frozen) — bump the version and start a new CHANGELOG section`,
@@ -3758,7 +3779,7 @@ function cmdVerifyReady(dir, flags) {
     proj.pkg &&
     proj.pkg.version &&
     sourceChanged.length > 0 &&
-    builtDmgVersions(dir).has(proj.pkg.version)
+    shippedDmgVersions(dir, proj).has(proj.pkg.version)
   ) {
     fail(
       `Version ${proj.pkg.version} already shipped as a DMG — bump the version and start a new CHANGELOG section before declaring ready`,
@@ -5594,7 +5615,7 @@ function cmdHookStop() {
         `Update it now (or state why no entry is needed).`,
     );
   }
-  if (proj.pkg && proj.pkg.version && builtDmgVersions(dir).has(proj.pkg.version)) {
+  if (proj.pkg && proj.pkg.version && shippedDmgVersions(dir, proj).has(proj.pkg.version)) {
     reasons.push(
       `Version ${proj.pkg.version} already has a built DMG in release/ — it is shipped and FROZEN. ` +
         `Bump the version in package.json (patch for fixes, minor for features) and start a NEW ` +
@@ -6458,6 +6479,8 @@ module.exports = {
   brewAttestationsOn,
   isSourceFile,
   isGatedFile,
+  releaseProfile,
+  shippedDmgVersions,
   THINKING_DISABLED_RE,
   NO_DISABLE_MODEL_RE,
   FIRST_BLOCK_TEXT_RE,

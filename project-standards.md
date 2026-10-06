@@ -1,8 +1,8 @@
 # Project Standards
 
 The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
-**Version:** 2.61
-**Last updated:** 2026-10-05
+**Version:** 2.62
+**Last updated:** 2026-10-06
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 

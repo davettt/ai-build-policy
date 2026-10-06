@@ -1,4 +1,7 @@
 # Private data must never reach a commit — security checks block, they do not report
+# The policy scripts live in the sibling build-policy repo, which only exists on the developer's
+# machines. Anyone else working on a handed-over project commits without these checks.
+[ -f ../build-policy/scripts/policy.js ] || exit 0
 node ../build-policy/scripts/policy.js leak-scan || exit 1
 
 # Full gates must have passed on this exact tree before any source commit
