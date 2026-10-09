@@ -2,7 +2,7 @@
 
 A complete build and development workflow for shipping software with AI coding assistants — **enforced by machinery, not memory**.
 
-This is the actual process used to build and maintain [Tiong Creative](https://tiongcreative.com.au) apps — desktop apps (Electron/macOS), local-first tools (Node.js/PM2), and cloud SaaS (Cloudflare). It's published here so users and teams can see exactly how we build, and so other teams can adapt it.
+This is the process I use to build and maintain my apps: desktop apps (Electron/macOS), local-first tools (Node.js/PM2), and cloud SaaS (Cloudflare). It's published so others can see exactly how the apps are built, and fork it to adapt for their own work.
 
 ## What's in here
 
@@ -68,4 +68,4 @@ MIT — use it however you like.
 
 ## About
 
-Built and maintained by [David Tiong](https://tiongcreative.com.au) using Claude Code and other AI development tools.
+Built and maintained by David Tiong using Claude Code and other AI development tools.

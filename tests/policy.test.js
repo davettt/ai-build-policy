@@ -251,3 +251,59 @@ test('secret report locations: file, line and rule, never the value', () => {
   assert.deepEqual(secretReportLocations(null), []);
   assert.deepEqual(secretReportLocations({ not: 'an array' }), []);
 });
+
+test('footerBannerFindings: rights wording, Terms link and per-version dismissal', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-footer-'));
+  const write = (rel, body) => {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), body);
+  };
+  const run = (opts) =>
+    policy.footerBannerFindings(dir, { termsUrl: 'https://example.com/terms/', ...opts });
+
+  // Close button that only clears state: no remembered version, so it fails.
+  write('src/App.tsx', `<p>© 2026 Example. All rights reserved.</p>\n<button onClick={() => setUpdate(null)}>×</button>`);
+  let f = run({ distributes: true, versionCheck: 'src/App.tsx' });
+  assert.equal(f.length, 3);
+  assert.match(f[0], /src\/App\.tsx: says "All rights reserved"/);
+  assert.match(f[1], /no Terms link/);
+  assert.match(f[2], /cannot be dismissed per version/);
+
+  // Fixed: Terms in the footer, per-version dismissal, the wording only in a
+  // comment and a test (neither is UI).
+  write(
+    'src/App.tsx',
+    `// Drop "All rights reserved" (Berne)\n<a href="https://example.com/terms/">Terms</a>\n{latest && latest !== dismissedVersion && <Banner/>}`,
+  );
+  write('tests/footer.test.ts', `expect(text).not.toContain('All rights reserved')`);
+  assert.deepEqual(run({ distributes: true, versionCheck: 'src/App.tsx' }), []);
+
+  // Flat app: rights wording in index.html is found.
+  write('index.html', `<footer>© 2026 Example — All Rights Reserved</footer>`);
+  assert.match(run({ distributes: true, versionCheck: 'src/App.tsx' })[0], /^index\.html: says/);
+  fs.rmSync(path.join(dir, 'index.html'));
+
+  // No termsUrl in the registry (null, as in the public mirror): any /terms/ link counts.
+  assert.deepEqual(policy.footerBannerFindings(dir, { distributes: true, versionCheck: null, termsUrl: null }), []);
+  write('src/App.tsx', `<p>v1</p>`);
+  assert.match(policy.footerBannerFindings(dir, { distributes: true, versionCheck: null, termsUrl: null })[0], /the site's \/terms\/ page/);
+
+  // Terms owed only once the app distributes; dismissal only with a banner.
+  fs.writeFileSync(path.join(dir, 'src/App.tsx'), `<p>v1</p>`);
+  assert.deepEqual(run({ distributes: false, versionCheck: null }), []);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('DISMISS_PER_VERSION_RE: the shapes the apps use, not a bare dismiss', () => {
+  for (const ok of [
+    'if (latest === dismissedVersion) return null;',
+    'dismissed === latest',
+    "localStorage.getItem('dismissedUpdateVersion') === data.version",
+    'setDismissed(localStorage.getItem(DISMISSED_KEY) === site)',
+    'dismissedUpdateVersion !== updateAvailable.version',
+    'updateVersion !== dismissedVersion',
+  ])
+    assert.match(ok, policy.DISMISS_PER_VERSION_RE, ok);
+  for (const bad of ['onClick={dismiss}', 'const [dismissed, setDismissed] = useState(false)', 'x === y'])
+    assert.doesNotMatch(bad, policy.DISMISS_PER_VERSION_RE, bad);
+});

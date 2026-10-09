@@ -1,7 +1,7 @@
 # Project Standards
 
 The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
-**Version:** 2.64
+**Version:** 2.65
 **Last updated:** 2026-10-09
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
@@ -220,10 +220,10 @@ Checklist of what "done" looks like.
 
   Each line earns its place. The **version** answers the first question any bug report needs. The **copyright notice** names who made the app and when, which matters for a paid product; it is identification rather than protection, since copyright subsists without it. Drop "All rights reserved" — it is a Buenos Aires Convention relic that stopped doing any work once every relevant country joined Berne. **Open source licences** links `THIRD-PARTY-LICENSES.txt`, which apps ship and none surfaces, leaving it inside the bundle where a user cannot reach it. **Export diagnostics** is the support path (§ Diagnostics Logging).
 
-  Adapt the content to the app: a project with no AI needs no privacy disclosure, and the open source licences link applies once the app ships an attribution file. `check` FAILs on a missing copyright notice, on a shipped `THIRD-PARTY-LICENSES.txt` that nothing links to, and on a missing "Export diagnostics" affordance.
+  Adapt the content to the app: a project with no AI needs no privacy disclosure, and the open source licences link applies once the app ships an attribution file. `check` FAILs the footer when the copyright notice is missing or "All rights reserved" appears in UI source. Once the app distributes, it also needs a Terms link (the URL is `termsUrl` in `registry.json`; without it, any link to a `/terms/` page counts). A shipped `THIRD-PARTY-LICENSES.txt` must be linked, and an "Export diagnostics" affordance must exist.
 - **The update banner is the same in every app.** It detects version *drift*, not "newer than": a simple mismatch between the installed version and the one the site publishes (see the mismatch rule below). It states both numbers, so the user can report them without hunting: `You have 1.5.6 · 1.5.9 is available`. Its only link is the app's changelog page, which carries the download route and the install instructions.
 
-  **It is dismissible.** A bold bar pinned to the top of the app is right once and irritating thereafter, and a lapsed member cannot act on it at all. Dismissal is per version: dismissing 1.5.9 hides 1.5.9, and a later release shows again.
+  **It is dismissible.** A bold bar pinned to the top of the app is right once and irritating thereafter, and a lapsed member cannot act on it at all. Dismissal is per version: dismissing 1.5.9 hides 1.5.9, and a later release shows again. `check` FAILs an app with an update check where no remembered dismissed version is compared against the one on offer (`latest !== dismissedVersion`).
 
   **The settings footer always states it, whether or not the banner was dismissed.** That is the persistent, quiet copy — `v1.5.6 · 1.5.9 available` linking to the same changelog page — so the user can always find out they are behind, and dismissal never buries the fact permanently.
 
@@ -243,7 +243,7 @@ Note the site-wide CORS rule is dashboard configuration, outside version control
 - **The update banner links to the app's changelog page, not to a store.** A URL baked into a shipped DMG cannot be changed for anyone who already installed it. The changelog page is the one end of that link that stays editable, so it is what the app must point at; the changelog page then carries the download link. Pointing an installed app straight at a store means that if distribution ever moves, every copy already out there has a dead link and no route to the update. `check` FAILs an Electron project whose source fetches a `version.json` but contains no `/changelog/` URL, and the marketing-site half is checked separately (below).
 - **The public changelog page is written per release, not per version.** It is where the update banner lands, so it has one job: tell a customer what changed and get them the new build.
 
-  **Top of the page, before any history:** the Gumroad library link, and how to install over an existing copy (download, drag to Applications, replace when asked; data and settings are kept). The same instructions usually live in the app's FAQ — say it in both places rather than linking away, because someone who arrived from a banner is mid-task.
+  **Top of the page, before any history:** the store's download link, and how to install over an existing copy (download, drag to Applications, replace when asked; data and settings are kept). The same instructions usually live in the app's FAQ — say it in both places rather than linking away, because someone who arrived from a banner is mid-task.
 
   **One entry per shipped release, covering everything since the previous shipped release.** Versions that were built but never shipped do not get entries. If 1.5.6 is the last release and 1.5.9 is going out, that is a single `1.5.9` entry covering 1.5.7 through 1.5.9 as one bullet list, not three entries. A git tag marks a release, so tags and changelog entries should correspond.
 
@@ -445,7 +445,7 @@ Apps stay local-first; mobile access must never route data through our servers. 
 
 **The ladder (climb only on proven demand):**
 1. **No-app rungs first** — iOS Shortcut writing to an iCloud Drive inbox file the Mac app imports (capture), or an encrypted self-contained HTML snapshot exported to iCloud Drive (reference). Days of work, tests demand. Reference specs: `a-reference-app/.claude/specs/mobile-capture-spec.md`, `a-reference-app/.claude/specs/mobile-snapshot-spec.md`.
-2. **Free App Store companion** per app — iCloud Drive file sync via the user's own iCloud (Developer ID Mac apps cannot use CloudKit; plain files in iCloud Drive are the mechanism), QR-code pairing for E2E encryption, capture-and-reference scope. No unlock key: the companion is free and useless without the Mac app's data — the Gumroad download stays the gate, which also avoids App Store external-purchase review friction.
+2. **Free App Store companion** per app — iCloud Drive file sync via the user's own iCloud (Developer ID Mac apps cannot use CloudKit; plain files in iCloud Drive are the mechanism), QR-code pairing for E2E encryption, capture-and-reference scope. No unlock key: the companion is free and useless without the Mac app's data — the paid download stays the gate, which also avoids App Store external-purchase review friction.
 3. **Hosted sync service — never by default.** It inverts the privacy positioning and creates data liability.
 
 **Rules for anything synced:** every synced record carries `schemaVersion` and `updatedAt`; the downgrade guard applies across devices (a phone snapshot is another "app version" reading the data); iCloud can sync files mid-write, so all readers must tolerate partial/garbled files without data loss; snapshots display their export timestamp.

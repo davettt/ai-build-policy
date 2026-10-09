@@ -445,7 +445,7 @@ function releaseDmgPath(dir, version) {
 
 /** Project-relative source files whose contents match `pattern`. Used to ask
  *  "does this project already do X", where X may live in any file. */
-function sourceFilesMatching(dir, pattern) {
+function sourceFilesMatching(dir, pattern, exts = /\.(ts|tsx|js|jsx|mjs|cjs)$/) {
   const hits = [];
   const walk = (d) => {
     let entries;
@@ -462,12 +462,79 @@ function sourceFilesMatching(dir, pattern) {
         walk(full);
         continue;
       }
-      if (!/\.(ts|tsx|js|jsx|mjs|cjs)$/.test(e.name)) continue;
+      if (!exts.test(e.name)) continue;
       if (pattern.test(readFile(full))) hits.push(path.relative(dir, full));
     }
   };
   walk(dir);
   return hits.sort();
+}
+
+// Settings footer and update banner rules that project-standards § Electron
+// had stated since the footer was specified and `check` never read. An app
+// session found `check` passing two revisions of its banner and footer that
+// missed them: dismissal, the Terms link, and "All rights reserved" removed.
+// Each is matched on what it is, in UI source (flat apps keep it in .html).
+const UI_FILES = /\.(ts|tsx|js|jsx|mjs|cjs|html)$/;
+const ALL_RIGHTS_RESERVED_RE = /all rights reserved/i;
+// The Terms URL comes from registry.json `termsUrl`, so the public mirror's
+// scripts name no real site. Without it, any link to a /terms/ page counts.
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function termsLinkRe(termsUrl) {
+  if (!termsUrl) return /\/terms\/?['"`]/;
+  return new RegExp(escapeRe(termsUrl.replace(/^https?:\/\//, '').replace(/\/$/, '')));
+}
+// Per-version dismissal is a comparison between a remembered dismissed version
+// and the one on offer: `latest === dismissedVersion`, `dismissed !== latest`,
+// `getItem('dismissedUpdateVersion') === v`. A close button alone that only
+// clears state would re-show the banner at the hourly recheck; one that never
+// compares hides every later release too. Both fail this.
+const DISMISS_PER_VERSION_RE =
+  /dismiss\w*(?:['"`]?\s*\))?\s*[!=]==|[!=]==\s*[\w$.]*dismiss/i;
+
+/** Comments removed, so a line explaining a rule is not read as obeying or
+ *  breaking it. Rough: a `//` inside a string survives as code, which errs
+ *  toward reporting, never toward a false pass on the banner. */
+function stripComments(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+}
+
+/** UI source files, excluding tests and servers, whose comment-stripped
+ *  contents match. */
+function uiFilesMatching(dir, pattern) {
+  return sourceFilesMatching(dir, /[\s\S]/, UI_FILES).filter(
+    (f) =>
+      !/(^|\/)(tests?|__tests__|server|e2e)\//.test(f) &&
+      !/\.(test|spec)\.[jt]sx?$/.test(f) &&
+      pattern.test(stripComments(readFile(path.join(dir, f)))),
+  );
+}
+
+/** Findings for the footer's Terms link and wording and for banner dismissal.
+ *  `distributes`: the app ships to customers (a shipped DMG or declared
+ *  gumroad), which is when Terms are owed. `versionCheck`: the file holding
+ *  the update check, or null when the app has no banner to dismiss. */
+function footerBannerFindings(dir, { distributes, versionCheck, termsUrl = loadRegistry().termsUrl }) {
+  const findings = [];
+  for (const f of uiFilesMatching(dir, ALL_RIGHTS_RESERVED_RE)) {
+    findings.push(
+      `${f}: says "All rights reserved" — drop it; the footer's © line stands on its own (project-standards § Electron)`,
+    );
+  }
+  if (distributes && uiFilesMatching(dir, termsLinkRe(termsUrl)).length === 0) {
+    findings.push(
+      `no Terms link — the settings footer must link ${termsUrl || 'the site\'s /terms/ page'}, where the product terms and the BYOK privacy disclosure live (project-standards § Electron)`,
+    );
+  }
+  if (versionCheck && uiFilesMatching(dir, DISMISS_PER_VERSION_RE).length === 0) {
+    findings.push(
+      `the update banner cannot be dismissed per version — no dismissed version is compared against the one on offer. Add a close control that remembers the dismissed version (e.g. localStorage) and hides the banner only while that version is the one available, so a later release shows again (project-standards § Electron)`,
+    );
+  }
+  return findings;
 }
 
 function diffHash(dir) {
@@ -1179,7 +1246,7 @@ function auditElectronStandards(dir, proj) {
   // passing on an unrelated mention.
   if (sourceFilesMatching(dir, /©|&copy;|\\u00a9/).length === 0) {
     findings.push(
-      `no copyright notice in the UI — the settings footer should name who made the app and when, e.g. \`© {year} David Tiong\` (project-standards § Electron)`,
+      `no copyright notice in the UI — the settings footer should name who made the app and when, e.g. \`© {year} <your name>\` (project-standards § Electron)`,
     );
   }
   // The attribution file ships (verify-ready --release requires it) but is
@@ -1407,7 +1474,7 @@ function auditElectronStandards(dir, proj) {
   }
 
   // An app that ships a DMG must HAVE an update check. Every other banner rule
-  // is conditional on one existing, which is the trap that let DiagramSnap ship
+  // is conditional on one existing, which is the trap that let one app ship
   // several DMGs, with a version.json published for it on the site, and no
   // banner in the app at all: it passed every banner check by having no banner.
   // A rule that presupposes the feature can never require it.
@@ -1426,6 +1493,12 @@ function auditElectronStandards(dir, proj) {
         `(project-standards § Electron)`,
     );
   }
+  findings.push(
+    ...footerBannerFindings(dir, {
+      distributes: shippedDmgVersions(dir, proj).size > 0 || declaredGumroad,
+      versionCheck,
+    }),
+  );
   // A server that reads the version from the environment needs the main process
   // to put it there.
   //
@@ -2489,7 +2562,10 @@ function cmdCheck(dir, flags = []) {
   // The marketing site is the other half of the update path: shipped apps point
   // their update banner at a changelog page here, so a missing page is a dead
   // link in software already on customers' machines and unfixable there.
-  if (path.basename(path.resolve(dir)) === 'tiongcreative-site') auditSite(dir);
+  // The site project is named by registry.json `siteProject`, so the mirrored
+  // scripts name no real site.
+  const siteProject = loadRegistry().siteProject;
+  if (siteProject && path.basename(path.resolve(dir)) === siteProject) auditSite(dir);
 
   if (!proj.hasPkg) {
     // A project carrying scaffolding but no package.json is mid-setup, not
@@ -3247,7 +3323,7 @@ const GATE_ORDER = [
   { name: 'Unit tests', script: 'test:unit' },
   { name: 'Smoke tests', script: 'test:smoke' },
   { name: 'Integration tests', script: 'test:integration' },
-  // End-to-end flows through the built app (Playwright). Help-centre pages and
+  // End-to-end flows through the built app (Playwright). Help pages and
   // screenshots are captured from these flows, so a change that breaks a
   // documented screen fails the app's own gates instead of surfacing later as
   // a stale help page. Full gates only: a browser run is too slow for the
@@ -4156,7 +4232,7 @@ function verifyRelease(dir, proj, flags) {
 
   // The update endpoint must actually be fetchable from inside the app.
   //
-  // Music Discovery shipped DMGs whose banner could never fire: the app is
+  // One app shipped DMGs whose banner could never fire: the app is
   // served from localhost, so reading version.json is a cross-origin request,
   // and without an Access-Control-Allow-Origin header the browser blocks it
   // before any app code runs. Nothing caught it because every check reads the
@@ -4210,14 +4286,14 @@ function verifyRelease(dir, proj, flags) {
   // version was cut from. Enforced at sign-off rather than earlier, because the
   // developer creates the tag, and only once the release is real.
   const profile = releaseProfile(proj);
-  // Apps with help-centre pages capture their screenshots from the flow tests
+  // Apps with help pages capture their screenshots from the flow tests
   // (docs:capture). A release is when a documented screen can change, so the
-  // capture and the help centre's drift check are part of signing it off.
+  // capture and the help site's drift check are part of signing it off.
   const checklist = [
     ...RELEASE_CHECKLISTS[profile],
     ...(proj.pkg && proj.pkg.scripts && proj.pkg.scripts['docs:capture']
       ? [
-          "Ran npm run docs:capture, then rechecked the help pages the help centre's drift check flags (npm run drift in help-centre)",
+          "Ran npm run docs:capture, then rechecked the help pages the help site's drift check flags (npm run drift in the help site project)",
         ]
       : []),
   ];
@@ -4554,7 +4630,7 @@ function cmdHealth(dir, flags) {
 /**
  * The path from a project to build-policy. Templates and standard scripts say
  * "../build-policy", which is right for a project beside it; one kept deeper
- * (ADMIN_OTHER/dev-work/<app>) needs "../../CLAUDE/build-policy", and with the
+ * (two levels deeper than its siblings) needs "../../<policy-parent>/build-policy", and with the
  * template's path its pre-commit hook failed every commit. scaffold writes the
  * project's real path, and the drift checks read it back as the template's.
  */
@@ -4926,14 +5002,14 @@ function cmdMirror() {
   }
 
   // Leak scan: blocklist terms + generic patterns must not appear in public files.
-  // '!'-prefixed terms are checked everywhere; others are exempt in README.md
-  // (which carries deliberate branding).
+  // Every term is checked in every file. A leading '!' (from when README.md
+  // was exempt for branding) is accepted and ignored.
   const terms = readFile(BLOCKLIST_PATH)
     .split('\n')
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith('#'))
     .map((l) =>
-      l.startsWith('!') ? { term: l.slice(1), everywhere: true } : { term: l, everywhere: false },
+      l.startsWith('!') ? { term: l.slice(1), everywhere: true } : { term: l, everywhere: true },
     );
   // Portfolio detail is not a "leak" by term or pattern — it names nothing
   // private — but it describes the private estate (how many projects exist,
@@ -5020,33 +5096,32 @@ function cmdMirror() {
       else {
         const content = readFile(full);
         const rel = path.relative(PUBLIC_ROOT, full);
-        const isReadme = rel === 'README.md';
-        for (const { term, everywhere } of terms) {
-          if ((everywhere || !isReadme) && content.includes(term)) {
+        // Every file, README included: the mirror is for others to fork, and
+        // business branding in its README is as irrelevant to them as anywhere.
+        for (const { term } of terms) {
+          if (content.includes(term)) {
             fail(`Leak in public mirror ${rel}: contains "${term}"`);
             leaks++;
           }
         }
-        if (!isReadme) {
-          for (const re of genericPatterns) {
-            // Check every match, not just the first — a doc placeholder must
-            // not mask a real secret later in the same file.
-            const all =
-              content.match(
-                new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g'),
-              ) || [];
-            // Placeholders are documentation, not leaks. Same exemption list as
-            // the tracked-file scan in `check`, applied to paths as well as
-            // emails — the docs demonstrate the rule using `/Users/you/...`.
-            const hit = all.find(
-              (s) =>
-                !PLACEHOLDER_ID.test(s.replace(/^\/(?:Users|home)\//, '').replace(/@.*$/, '')) &&
-                s !== 'xxxx-xxxx-xxxx-xxxx',
-            );
-            if (hit) {
-              fail(`Leak in public mirror ${rel}: matches ${re} ("${hit}")`);
-              leaks++;
-            }
+        for (const re of genericPatterns) {
+          // Check every match, not just the first — a doc placeholder must
+          // not mask a real secret later in the same file.
+          const all =
+            content.match(
+              new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g'),
+            ) || [];
+          // Placeholders are documentation, not leaks. Same exemption list as
+          // the tracked-file scan in `check`, applied to paths as well as
+          // emails — the docs demonstrate the rule using `/Users/you/...`.
+          const hit = all.find(
+            (s) =>
+              !PLACEHOLDER_ID.test(s.replace(/^\/(?:Users|home)\//, '').replace(/@.*$/, '')) &&
+              s !== 'xxxx-xxxx-xxxx-xxxx',
+          );
+          if (hit) {
+            fail(`Leak in public mirror ${rel}: matches ${re} ("${hit}")`);
+            leaks++;
           }
         }
       }
@@ -5877,7 +5952,7 @@ function commandNamesRoot(cmd, root, cwd = process.cwd()) {
   const name = path.basename(root).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   if (new RegExp(esc + '(?![\\w-])').test(cmd)) return true;
   // Relative and ~ forms count only if they resolve to the repo from where the
-  // command runs: from ADMIN_OTHER/dev-work/<app>, "../build-policy" is some
+  // command runs: from a project two levels deeper, "../build-policy" is some
   // other folder, and the text alone refused a session that never touched it.
   const forms = [
     ...cmd.matchAll(
@@ -6637,4 +6712,6 @@ module.exports = {
   STANDARD_SCRIPTS,
   SECRET_SCAN_LEAKY_FLAG_RE,
   secretReportLocations,
+  footerBannerFindings,
+  DISMISS_PER_VERSION_RE,
 };
