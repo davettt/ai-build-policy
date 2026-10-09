@@ -1,8 +1,8 @@
 # Project Standards
 
 The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
-**Version:** 2.62
-**Last updated:** 2026-10-06
+**Version:** 2.64
+**Last updated:** 2026-10-09
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -113,7 +113,7 @@ JSON schemas or SQL schemas for all stored data.
 ### API/AI Integration
 - Endpoints needed
 - Claude prompts with expected JSON responses
-- Cost considerations (prefer Haiku 4.5)
+- Cost considerations (prefer the registry fast tier)
 
 ### Third-Party Integrations (if applicable)
 - Auth provider and flow
@@ -428,8 +428,10 @@ Icon: `build/icon.png` (512x512 PNG). electron-builder converts to `.icns` autom
 - **Model IDs — the source of truth is `build-policy/registry.json`.** Never invent tier IDs; copy from the registry into each app's active fast/smart routing and model picker. Each registry entry carries a `verified` date; `policy health`/`check` flag entries past their review window. On review, check current official pricing and model capabilities, update the registry, then propagate. There is no hand-kept list of apps to update: `check` scans each project's source and WARNs on any Anthropic or OpenAI model ID that is not a current registry value (a dated snapshot of a registry alias counts as current), so every app reports its own drift when opened. Migration maps that must name old IDs so saved selections keep working opt out with a `// policy:legacy-model-ids` comment, which exempts lines up to the block's closing `}` or `]`. Check request parameters and stored model selections during a family migration; a matching ID alone does not prove the API call works.
 - **Deliberate per-app model choices are recorded, not left as drift.** When an app needs different models from the tiers, add its IDs to `registry.json` `modelExceptions` under the app's package.json name, with the reason and the date decided. `check` then accepts those IDs for that app only, and WARNs when the exception passes its review window so it is re-confirmed. An ID that is not a tier value or a recorded exception is still flagged.
 - **Read Claude responses by content-block type, never `content[0].text`.** Sonnet 5, Opus 5/5.5, Fable and Mythos think by default when a request omits `thinking` (Sonnet 4.6 and Opus 4.8 did not), so the response opens with a `thinking` block and the first block has no text. Join every block whose `type === 'text'`; when none is present, report `stop_reason` (`max_tokens` means cut off, `refusal` means declined) rather than a generic format error. Two apps here broke this way on the move to `claude-sonnet-5`. `check` FAILs a first-block read in a project that names a thinking-by-default model, and WARNs on one anywhere else, since it breaks on the next smart-tier migration.
-- **Turning thinking off is model-specific, so quick text tasks branch on the model.** Summaries, grammar and suggestions do not need thinking, which adds latency and eats a small `max_tokens`. Sonnet 5, Opus 5 and Haiku 4.5 accept `thinking: {type: 'disabled'}`. Sonnet 5.5 rejects it with a 400 and takes `thinking: {type: 'between_tools'}` instead (effort `high` or below, no other field). Opus 5.5 cannot turn it off at all; use `output_config: {effort: 'low'}`. Fable and Mythos reject any explicit setting, so omit the parameter. The earlier text here said to send `disabled` everywhere, which would have broken the next smart-tier move the same way the first-block read did. `check` FAILs `type: 'disabled'` in a project that names Sonnet 5.5, Opus 5.5, Fable or Mythos, and WARNs on it anywhere else.
-- **Model entries review every 60 days, not the registry default of 90.** Model families now turn over faster than a quarter, and a stale entry costs more than an out-of-date name: Sonnet 5 superseded Sonnet 4.6 at a *lower* price ($2/$10 per MTok against $3/$15), so sitting on the old ID meant paying more for less. Each model entry records its price at verification, so a review can answer "is the newer one cheaper" without researching the model it replaced. Compare price as well as capability, and in both directions — a newer model is not automatically dearer.
+- **Turning thinking off is model-specific, so quick text tasks branch on the model.** Summaries, grammar and suggestions do not need thinking, which adds latency and eats a small `max_tokens`. Sonnet 5, Opus 5 and Haiku 4.5 accept `thinking: {type: 'disabled'}`, and Haiku 5.5 accepts it at effort `high` or below (it rejects `between_tools`). Sonnet 5.5 rejects it with a 400 and takes `thinking: {type: 'between_tools'}` instead (effort `high` or below, no other field). Opus 5.5 cannot turn it off at all; use `output_config: {effort: 'low'}`. Fable and Mythos reject any explicit setting, so omit the parameter. The earlier text here said to send `disabled` everywhere, which would have broken the next smart-tier move the same way the first-block read did. `check` FAILs `type: 'disabled'` in a project that names Sonnet 5.5, Opus 5.5, Fable or Mythos, and WARNs on it anywhere else.
+- **No sampling parameters on the 5.5 generation.** Haiku 5.5, Sonnet 5.5, Opus 5.5, Fable and Mythos return a 400 for any non-default `temperature`, `top_p` or `top_k` (Haiku 4.5, Sonnet 5 and Opus 5 accepted them). A `temperature: 0` on a classification route is the usual case: remove it and constrain the output from the prompt, a tool with enum fields, or `output_config.format`. Found on the fast-tier move to Haiku 5.5, where the model ID was current and the request still carried the parameter. `check` FAILs a sampling parameter in a project that names one of those models, and WARNs on it anywhere else.
+- **Leave `max_tokens` room for thinking on a thinks-by-default model.** Haiku 5.5 thinks unless told not to, so a cap sized for a one-line answer (200 to 512 tokens) can be spent on thinking and the response stops at `max_tokens` with no text. On quick routes either turn thinking off the way the model allows (previous bullet) or set `output_config: {effort: 'low'}`, and keep at least 1024 tokens of headroom. The fast tier's tokenizer also counts about 30% more tokens than Haiku 4.5 for the same text, so caps tuned on 4.5 cut equivalent output short.
+- **Model entries review every 60 days, not the registry default of 90.** Model families now turn over faster than a quarter, and a stale entry costs more than an out-of-date name: Sonnet 5 superseded Sonnet 4.6 at a *lower* price ($2/$10 per MTok against $3/$15), and Haiku 5.5 superseded Haiku 4.5 at a tenth of the per-token price ($0.10/$0.50 against $1/$5 on prompts up to 100K tokens), so sitting on the old ID meant paying more for less. Each model entry records its price at verification, so a review can answer "is the newer one cheaper" without researching the model it replaced. Compare price as well as capability, and in both directions — a newer model is not automatically dearer.
 
 ---
 
@@ -511,7 +513,9 @@ These are the ONLY sanctioned global exclusions (`check` FAILs any other). Anyth
 **Required secret scanning:**
 - `betterleaks` — detects API keys, tokens, passwords, and other secrets in git history (official successor to Gitleaks, by the same author)
 - **Homebrew only** (`brew install betterleaks`). Do not install via npm — betterleaks is also not distributed via npm, install via Homebrew only. In CI, use the gitleaks action version `registry.json` records (`gh-action-gitleaks`), pinned to its full commit SHA in `templates/ci.yml` (third-party actions must be SHA-pinned against supply-chain attacks), until a Betterleaks action is available. The registry and the template are checked against each other, so the version is written in one place.
-- Wire into quality script as `npm run secrets`
+- Wire into quality script as `npm run secrets` (history scan) and into the pre-commit subset as `npm run secrets:staged` (`betterleaks git --staged --redact`, the staged diff only). The history scan cannot see the commit being made, so on its own it caught a staged key one commit late, after a push could already have carried it to the remote. `gates --fast` runs the staged scan and fails outright when the script is missing; `gates` (full) runs the history scan.
+- **No `-v` on either scan.** In betterleaks 1.x `-v` is `--verbose` and prints the secret's value into the terminal and CI logs. In betterleaks 2 the same letter is `--validate`, which sends every finding to the credential's provider to ask whether it is live (`-a` / `--analyze` does that and more). The exit code is the gate and is the same without the flag. Every project carried `-v` from the scaffold until policy 2.64; `check` FAILs a secrets script with `-v`, `-a`, `--verbose`, `--validate`, `--validation` or `--analyze`.
+- **`--redact` on both scans.** Betterleaks 2 prints findings by default, so without it a detected key lands in the terminal, in the AI session transcript and in CI logs; betterleaks 1.x printed findings only under `-v`. `--redact` masks the value in logs and stdout and leaves the exit code alone. `check` FAILs a betterleaks script without it. Without `-v`, betterleaks 1.x prints only `leaks found: N`, so when a secret-scan gate fails `gates` asks betterleaks for a JSON report (in a private temp dir, removed afterwards) and prints each finding as `file:line (rule)` with the value redacted.
 
 **Required license compliance:**
 - `license-checker` — validates that production dependencies use approved licenses (GPL/AGPL must fail)
@@ -539,7 +543,8 @@ These are the ONLY sanctioned global exclusions (`check` FAILs any other). Anyth
   "type-check": "tsc --noEmit",
   "security": "npm audit --audit-level=high --omit=dev",
   "sast": "semgrep scan --config auto --error --quiet --exclude-rule javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-res-sendfile.express-res-sendfile --exclude-rule javascript.express.security.audit.remote-property-injection.remote-property-injection",
-  "secrets": "betterleaks git . -v",
+  "secrets": "betterleaks git . --redact",
+  "secrets:staged": "betterleaks git --staged --redact",
   "licenses": "license-checker --production --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary",
   "licenses:file": "license-checker --production --relativeLicensePath | sed -e \"s|$PWD/||g\" -e \"s|$PWD|.|g\" > THIRD-PARTY-LICENSES.txt",
   "deps:check": "node ../build-policy/scripts/check-allowlist.js .",
@@ -864,7 +869,7 @@ Local apps are exposed to cross-site writes too: a page the user visits can subm
 
 ### Secrets
 
-- No secrets in code. `check` runs betterleaks/gitleaks on every commit.
+- No secrets in code. The pre-commit hook scans the staged diff with betterleaks (`secrets:staged`), so a key never reaches a commit; the full gates and CI scan the history (`secrets`, gitleaks).
 - No high or critical npm audit vulnerabilities allowed. `npm audit --audit-level=high --omit=dev` runs in the quality gate.
 - API keys encrypted at rest with AES-256-CBC and a machine-derived key (covered in § Electron).
 - `.env` is gitignored and never committed.

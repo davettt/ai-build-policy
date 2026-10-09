@@ -168,6 +168,20 @@ test('model regexes: thinking-off detection and the models that reject it', () =
   assert.match("'claude-opus-5-5'", policy.NO_DISABLE_MODEL_RE);
   assert.doesNotMatch("'claude-sonnet-5'", policy.NO_DISABLE_MODEL_RE);
   assert.doesNotMatch("'claude-opus-5'", policy.NO_DISABLE_MODEL_RE);
+  // Haiku 5.5 thinks by default but still accepts `disabled` at effort high or below.
+  assert.match("'claude-haiku-5-5'", policy.THINKING_DEFAULT_MODEL_RE);
+  assert.doesNotMatch("'claude-haiku-4-5'", policy.THINKING_DEFAULT_MODEL_RE);
+  assert.doesNotMatch("'claude-haiku-5-5'", policy.NO_DISABLE_MODEL_RE);
+  // Sampling parameters: a 400 on the 5.5 generation, accepted on Haiku 4.5.
+  assert.match("'claude-haiku-5-5'", policy.NO_SAMPLING_MODEL_RE);
+  assert.match("'claude-sonnet-5-5'", policy.NO_SAMPLING_MODEL_RE);
+  assert.doesNotMatch("'claude-haiku-4-5'", policy.NO_SAMPLING_MODEL_RE);
+  assert.doesNotMatch("'claude-sonnet-5'", policy.NO_SAMPLING_MODEL_RE);
+  assert.match('      temperature: 0.2,', policy.SAMPLING_PARAM_RE);
+  assert.match('temperature=0', policy.SAMPLING_PARAM_RE);
+  assert.match('top_p: 0.9', policy.SAMPLING_PARAM_RE);
+  assert.doesNotMatch("label: 'Temperature'", policy.SAMPLING_PARAM_RE);
+  assert.doesNotMatch('const temperature = settings.temperature;', policy.SAMPLING_PARAM_RE);
   assert.match('const t = msg.content[0].text', policy.FIRST_BLOCK_TEXT_RE);
   assert.match('msg.content?.[0]?.text', policy.FIRST_BLOCK_TEXT_RE);
 });
@@ -191,4 +205,49 @@ test('shippedDmgVersions: test builds under distribution none are not shipped', 
   assert.deepEqual([...policy.shippedDmgVersions(dir, gumroad)], ['0.1.0']);
   assert.deepEqual([...policy.shippedDmgVersions(dir, inferred)], ['0.1.0']);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('secret scans: staged diff at pre-commit, history in the full run', () => {
+  const { GATE_ORDER, BASE_SCRIPTS, STANDARD_SCRIPTS } = policy;
+  const fastSet = GATE_ORDER.filter((g) => g.fast).map((g) => g.script);
+  const fullSet = GATE_ORDER.filter((g) => !g.fastOnly).map((g) => g.script);
+  assert.ok(fastSet.includes('secrets:staged'), 'pre-commit subset scans the stage');
+  assert.ok(!fastSet.includes('secrets'), 'history scan is not in the pre-commit subset');
+  assert.ok(fullSet.includes('secrets'), 'full run scans history');
+  assert.ok(!fullSet.includes('secrets:staged'), 'full run does not repeat the staged scan');
+  assert.ok(BASE_SCRIPTS.includes('secrets:staged'), 'secrets:staged is a required script');
+  assert.match(STANDARD_SCRIPTS['secrets:staged'], /betterleaks git .*--staged/);
+  assert.match(STANDARD_SCRIPTS.secrets, /betterleaks git \./);
+  for (const s of [STANDARD_SCRIPTS.secrets, STANDARD_SCRIPTS['secrets:staged']])
+    assert.match(s, /(?:^|\s)--redact(?=\s|$)/, `standard command lacks --redact: ${s}`);
+  const { SECRET_SCAN_LEAKY_FLAG_RE: leaky } = policy;
+  for (const s of [STANDARD_SCRIPTS.secrets, STANDARD_SCRIPTS['secrets:staged']])
+    assert.ok(!leaky.test(s), `standard command carries a leaky flag: ${s}`);
+  for (const s of [
+    'betterleaks git . -v',
+    'betterleaks git --pre-commit --staged -v',
+    'betterleaks git . --validation',
+    'betterleaks fs . --validate',
+    'betterleaks fs . -a',
+    'betterleaks git . --verbose',
+  ])
+    assert.ok(leaky.test(s), `leaky flag missed: ${s}`);
+  for (const s of ['betterleaks git . --redact', 'betterleaks git . --no-verbose', 'betterleaks git ./my-vault'])
+    assert.ok(!leaky.test(s), `false positive: ${s}`);
+});
+
+test('secret report locations: file, line and rule, never the value', () => {
+  const { secretReportLocations } = policy;
+  const findings = [
+    { File: 'server/ai.js', StartLine: 12, RuleID: 'github-pat', Secret: 'REDACTED', Match: 'REDACTED' },
+    { File: '.env.local', StartLine: 3, RuleID: 'generic-api-key', Secret: 'REDACTED' },
+    { Description: 'no File field' },
+  ];
+  const out = secretReportLocations(findings);
+  assert.deepEqual(out, ['server/ai.js:12 (github-pat)', '.env.local:3 (generic-api-key)']);
+  assert.ok(!out.join('\n').includes('REDACTED'), 'the value field is never echoed');
+  const hostile = secretReportLocations([{ File: 'a\x1b[2Kb\nc.js', StartLine: 1, RuleID: 'x\x07y' }]);
+  assert.deepEqual(hostile, ['a\\x1b[2Kb\\x0ac.js:1 (x\\x07y)'], 'control characters are escaped');
+  assert.deepEqual(secretReportLocations(null), []);
+  assert.deepEqual(secretReportLocations({ not: 'an array' }), []);
 });

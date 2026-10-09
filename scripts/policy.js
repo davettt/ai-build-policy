@@ -550,6 +550,7 @@ const BASE_SCRIPTS = [
   'validate',
   'quality',
   'secrets',
+  'secrets:staged',
   'licenses',
   'deps:check',
   'review',
@@ -2268,8 +2269,8 @@ function auditModelIds(dir) {
 /**
  * Claude response parsing must not assume the first content block is text.
  *
- * Sonnet 5, Opus 5/5.5, Fable and Mythos run adaptive thinking when the request
- * omits `thinking` (Sonnet 4.6 and Opus 4.8 did not), so the response opens with
+ * Sonnet 5/5.5, Opus 5/5.5, Haiku 5.5, Fable and Mythos run adaptive thinking when
+ * the request omits `thinking` (Sonnet 4.6, Opus 4.8 and Haiku 4.5 did not), so the response opens with
  * a `thinking` block and `content[0].text` is undefined. One app threw
  * "Invalid Claude API response format" on every Smart-tier call and another
  * shipped returning undefined, both on the registry move to claude-sonnet-5. The model-ID check above passed both: the ID was current, the
@@ -2282,18 +2283,41 @@ function auditModelIds(dir) {
  * think) — project-standards § AI Integration.
  */
 const FIRST_BLOCK_TEXT_RE = /\bcontent\s*(?:\?\.)?\[\s*0\s*\]\s*(?:\?\.|\.)\s*text\b/;
-const THINKING_DEFAULT_MODEL_RE = /['"`](claude-(?:sonnet-5|opus-5|fable|mythos)[a-z0-9.-]*)['"`]/;
+const THINKING_DEFAULT_MODEL_RE = /['"`](claude-(?:sonnet-5|opus-5|haiku-5|fable|mythos)[a-z0-9.-]*)['"`]/;
 // Models that reject `thinking: {type: 'disabled'}` with a 400: Sonnet 5.5
 // (use `between_tools`), Opus 5.5 (lower the effort), Fable and Mythos (omit
-// the parameter). Sonnet 5 and Opus 5 still accept it.
+// the parameter). Sonnet 5, Opus 5 and Haiku 4.5 still accept it, and Haiku 5.5
+// accepts it at effort `high` or below (it rejects `between_tools`).
 const NO_DISABLE_MODEL_RE = /['"`](claude-(?:sonnet-5-5|opus-5-5|fable|mythos)[a-z0-9.-]*)['"`]/;
 const THINKING_DISABLED_RE = /\btype\s*:\s*['"]disabled['"]/;
+// Models that reject non-default `temperature`, `top_p` and `top_k` with a 400:
+// the 5.5 generation, Fable and Mythos. Haiku 4.5, Sonnet 5 and Opus 5 accept
+// them. A sampling parameter is read as the request field (`temperature:` or
+// `temperature=`), not the word in prose or a UI label.
+const NO_SAMPLING_MODEL_RE = /['"`](claude-(?:sonnet-5-5|opus-5-5|haiku-5-5|fable|mythos)[a-z0-9.-]*)['"`]/;
+// A betterleaks flag that exposes the finding itself: -v / --verbose print the
+// value (1.x), -v / --validate and -a / --analyze send it to the provider (2.x),
+// --validation does the same in 1.x. Matched on the flag as a whole word so
+// `--no-verbose` or a path containing `-v` cannot trip it.
+const SECRET_SCAN_LEAKY_FLAG_RE = /(?:^|\s)(-v|-a|--verbose|--validate|--validation|--analyze)(?=\s|$)/;
+const SAMPLING_PARAM_RE = /\b(temperature|top_p|top_k)\s*[:=]\s*[0-9.]/;
+
+/** The registry's smart and fast tier IDs, for check messages that name where an app is heading. */
+function registryTiers() {
+  const entries = loadRegistry().entries || {};
+  return {
+    smart: (entries['anthropic-model-smart'] || {}).value || 'the registry smart tier',
+    fast: (entries['anthropic-model-fast'] || {}).value || 'the registry fast tier',
+  };
+}
 
 function auditClaudeResponseParsing(dir) {
   const reads = [];
   const disabled = [];
+  const sampling = [];
   let thinkingModel = null;
   let noDisableModel = null;
+  let noSamplingModel = null;
 
   const walk = (d) => {
     let entries;
@@ -2333,16 +2357,20 @@ function auditClaudeResponseParsing(dir) {
           const rel = `${path.relative(dir, full)}:${i + 1}`;
           if (FIRST_BLOCK_TEXT_RE.test(line)) reads.push(rel);
           if (THINKING_DISABLED_RE.test(line)) disabled.push(rel);
+          if (SAMPLING_PARAM_RE.test(line)) sampling.push(rel);
           const m = !thinkingModel && line.match(THINKING_DEFAULT_MODEL_RE);
           if (m) thinkingModel = `${m[1]} (${rel})`;
           const n = !noDisableModel && line.match(NO_DISABLE_MODEL_RE);
           if (n) noDisableModel = `${n[1]} (${rel})`;
+          const s = !noSamplingModel && line.match(NO_SAMPLING_MODEL_RE);
+          if (s) noSamplingModel = `${s[1]} (${rel})`;
         });
     }
   };
   walk(dir);
 
   const list = (a) => a.slice(0, 5).join(', ') + (a.length > 5 ? `, +${a.length - 5} more` : '');
+  const tiers = registryTiers();
   if (reads.length > 0) {
     const fix =
       `Join every block with type === 'text' instead of reading content[0].text, and turn thinking off for quick ` +
@@ -2355,28 +2383,47 @@ function auditClaudeResponseParsing(dir) {
     } else {
       warn(
         `Claude response read from the first content block (${list(reads)}) — this breaks when the app moves to ` +
-          `claude-sonnet-5 (the registry smart tier), which returns a thinking block first. ${fix}`,
+          `${tiers.smart} or ${tiers.fast} (the registry tiers), which return a thinking block first. ${fix}`,
       );
     }
   }
 
   // The standard used to say "send thinking: {type: 'disabled'} for quick
   // tasks". On Sonnet 5.5 and Opus 5.5 that request is a 400, so the advice
-  // itself would have broken the next smart-tier migration, the shape of the
+  // itself broke the smart-tier move to Sonnet 5.5, the shape of the
   // content[0].text failure above.
   if (disabled.length > 0) {
     const fix =
       `Sonnet 5.5 turns thinking off with thinking: {type: 'between_tools'}; Opus 5.5 cannot turn it off (use output_config.effort 'low'); ` +
-      `Fable and Mythos reject any explicit setting (omit it). {type: 'disabled'} works only on Sonnet 5, Opus 5 and Haiku 4.5 ` +
-      `(project-standards § AI Integration)`;
+      `Fable and Mythos reject any explicit setting (omit it). {type: 'disabled'} works on Sonnet 5, Opus 5, Haiku 4.5 and ` +
+      `Haiku 5.5 (effort high or below) (project-standards § AI Integration)`;
     if (noDisableModel)
       fail(
         `thinking: {type: 'disabled'} sent (${list(disabled)}) while the app names ${noDisableModel}, which rejects it with a 400. ${fix}`,
       );
     else
       warn(
-        `thinking: {type: 'disabled'} sent (${list(disabled)}) — accepted by the current smart tier, rejected by Sonnet 5.5 and Opus 5.5, ` +
-          `so the next model move breaks it. ${fix}`,
+        `thinking: {type: 'disabled'} sent (${list(disabled)}) — accepted by Haiku 5.5 (the fast tier) at effort high or below, ` +
+          `rejected by Sonnet 5.5 (the smart tier) and Opus 5.5, so sending it on a smart-tier call returns a 400. ${fix}`,
+      );
+  }
+
+  // Haiku 4.5, Sonnet 5 and Opus 5 accept `temperature: 0` on a classification
+  // route; Haiku 5.5, Sonnet 5.5, Opus 5.5, Fable and Mythos return a 400 for
+  // any non-default sampling value. Found on the fast-tier move to Haiku 5.5:
+  // the model ID was current, the request still carried the 4.5-era parameter.
+  if (sampling.length > 0) {
+    const fix =
+      `Remove temperature, top_p and top_k and constrain the output from the prompt, a tool with enum fields, or ` +
+      `output_config.format instead (project-standards § AI Integration)`;
+    if (noSamplingModel)
+      fail(
+        `Sampling parameter sent (${list(sampling)}) while the app names ${noSamplingModel}, which rejects it with a 400. ${fix}`,
+      );
+    else
+      warn(
+        `Sampling parameter sent (${list(sampling)}) — accepted by Haiku 4.5, Sonnet 5 and Opus 5, rejected by the 5.5 generation, ` +
+          `Fable and Mythos, so the next model move breaks it. ${fix}`,
       );
   }
 }
@@ -2508,6 +2555,25 @@ function cmdCheck(dir, flags = []) {
     fail(
       `security script is "${scripts.security}" — standard is "${STANDARD_SCRIPTS.security}" (gate = shipped deps at high; 'policy health' audits the full tree incl dev). Weakened audit levels are never sanctioned.`,
     );
+  }
+
+  // Secret scan flags — a flag that prints or transmits the finding. -v is
+  // --verbose in betterleaks 1.x (the secret's value lands in terminal and CI
+  // logs) and --validate in betterleaks 2 (the secret is sent to its provider
+  // to check whether it is live). Every project carried -v until 2.64, from
+  // the scaffold; the move to 2.x on Homebrew would have turned a log line
+  // into an outbound request without any script changing.
+  for (const name of ['secrets', 'secrets:staged']) {
+    if (!scripts[name]) continue;
+    const m = scripts[name].match(SECRET_SCAN_LEAKY_FLAG_RE);
+    if (m)
+      fail(
+        `${name} script is "${scripts[name]}" — ${m[1]} prints the secret (betterleaks 1.x --verbose) or sends it to the provider (betterleaks 2 --validate / --analyze). Drop the flag; the exit code is the gate. Standard: "${STANDARD_SCRIPTS[name]}"`,
+      );
+    if (/\bbetterleaks\b/.test(scripts[name]) && !/(?:^|\s)--redact(?:=\d+)?(?=\s|$)/.test(scripts[name]))
+      fail(
+        `${name} script is "${scripts[name]}" — missing --redact, so a finding prints the secret's value into the terminal, the session transcript and CI logs (betterleaks 2 prints findings by default; 1.x under -v). Standard: "${STANDARD_SCRIPTS[name]}"`,
+      );
   }
 
   // Review gate scope — the CLI default reviews tracked changes only, so a gate
@@ -3116,13 +3182,53 @@ function finish() {
 
 // ------------------------------------------------------------------- gates
 
+// Where a secret scan found something. Without -v, betterleaks 1.x prints only
+// "leaks found: N" — no file, no line — so a blocked commit left the developer
+// guessing which staged file to open. A JSON report carries File, StartLine
+// and RuleID, and under --redact its Secret and Match fields read REDACTED, so
+// the location can be printed without the value. The report goes to a private
+// temp dir that is removed before returning; nothing is written into the
+// project. betterleaks 2 renames -r to --output and names the file in its own
+// output, so a failed report call just yields nothing extra.
+function secretReportLocations(findings) {
+  if (!Array.isArray(findings)) return [];
+  // File and RuleID come from the scanned repo; a file name can carry escape
+  // sequences or newlines that would spoof or hide a line in the terminal and
+  // the session transcript, so control characters are shown as escapes.
+  const clean = (v) =>
+    String(v).replace(/[\x00-\x1f\x7f-\x9f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
+  return findings
+    .filter((f) => f && typeof f.File === 'string')
+    .map((f) => `${clean(f.File)}:${f.StartLine || '?'} (${clean(f.RuleID || 'rule unknown')})`);
+}
+function secretScanLocations(dir, staged) {
+  let tmp;
+  try {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-leaks-'));
+    const report = path.join(tmp, 'report.json');
+    shArgs('betterleaks', ['git', ...(staged ? ['--staged'] : ['.']), '--redact', '-r', report], dir);
+    return secretReportLocations(readJSON(report));
+  } catch {
+    return [];
+  } finally {
+    if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 const GATE_ORDER = [
   { name: 'Type check', script: 'type-check', fast: true },
   { name: 'Lint', script: 'lint', fast: true },
   { name: 'HTML validation', script: 'lint:html', fast: true },
   { name: 'CSS validation', script: 'lint:css', fast: true },
   { name: 'Format check', script: 'format:check', fast: true },
-  { name: 'Secret scan', script: 'secrets', fast: true },
+  // Two secret scans, one per gate mode. `secrets` reads git HISTORY, so at
+  // pre-commit it sees every commit except the one being made: a staged key
+  // passed the hook and was caught one commit later, after a push could have
+  // carried it to the remote (found 2026-10-09). The pre-commit subset scans
+  // the staged diff instead; the full run keeps the history scan, which also
+  // catches anything that landed before the staged scan existed.
+  { name: 'Secret scan (staged)', script: 'secrets:staged', fast: true, fastOnly: true },
+  { name: 'Secret scan (history)', script: 'secrets' },
   { name: 'Dependency allowlist', script: 'deps:check', fast: true },
   { name: 'SAST (Semgrep)', script: 'sast' },
   { name: 'Dependency audit', script: 'security' },
@@ -3328,7 +3434,20 @@ function cmdGates(dir, flags) {
   const fast = flags.includes('--fast');
   const withReview = flags.includes('--with-review');
   const scripts = proj.pkg.scripts || {};
-  const gates = GATE_ORDER.filter((g) => (fast ? g.fast : true)).filter((g) => scripts[g.script]);
+  const gates = GATE_ORDER.filter((g) => (fast ? g.fast : !g.fastOnly)).filter(
+    (g) => scripts[g.script],
+  );
+  // The filter above skips a gate whose script the project lacks, which is
+  // right for optional tooling and wrong for the one scan the hook exists to
+  // run: without `secrets:staged` the pre-commit subset would pass on a
+  // staged key exactly as it did before the script existed.
+  if (fast && !scripts['secrets:staged']) {
+    console.log(`\n${RED}${BOLD}Gate failed: no staged secret scan.${RESET}`);
+    console.log(
+      `  ${RED}✗${RESET} package.json has no "secrets:staged" script — the history scan ("secrets") cannot see the commit being made. Run: policy scaffold`,
+    );
+    process.exit(1);
+  }
 
   // A diff that touches no source has nothing for a code reviewer to read. An
   // empty diff is NOT that case — it means the work is already committed, and
@@ -3584,6 +3703,16 @@ function cmdGates(dir, flags) {
       console.log(`${RED}FAIL${RESET} ${DIM}${secs}s${RESET}\n`);
       const tail = r.out.split('\n').slice(-40).join('\n');
       console.log(tail);
+      if (g.script === 'secrets' || g.script === 'secrets:staged') {
+        const where = secretScanLocations(dir, g.script === 'secrets:staged');
+        if (where.length > 0) {
+          console.log(`\n  ${RED}Found in:${RESET}`);
+          for (const w of where) console.log(`    ${w}`);
+          console.log(
+            `  ${DIM}(value redacted; remove it from the file, or from history if already committed, then rotate the credential)${RESET}`,
+          );
+        }
+      }
       console.log(
         `\n${RED}${BOLD}Gate failed: ${g.name}.${RESET} Fix, then re-run FULL gates (a commit needs the full-gates marker): policy gates\n` +
           (fast
@@ -4457,7 +4586,23 @@ const STANDARD_SCRIPTS = {
   // project-standards § Semgrep rule exclusions). Anything else is per-line
   // `// nosemgrep` — enforced below in cmdCheck.
   sast: 'semgrep scan --config auto --error --quiet --exclude-rule javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-res-sendfile.express-res-sendfile --exclude-rule javascript.express.security.audit.remote-property-injection.remote-property-injection --exclude-rule html.security.audit.missing-integrity.missing-integrity',
-  secrets: 'betterleaks git . -v',
+  // No -v on either scan. In betterleaks 1.x it is --verbose and prints the
+  // secret's value into the terminal and CI logs; in betterleaks 2 the same
+  // letter is --validate, which sends every finding to the credential's
+  // provider to ask whether it is live. The exit code is identical without
+  // it (1 on a finding, 0 otherwise). Verified against betterleaks 1.6.1 and
+  // the 2.x README on 2026-10-09; the drift check below enforces it.
+  // --redact on both: betterleaks 2 prints findings by default (1.x printed
+  // them only under -v), so without it the key lands in the terminal, the AI
+  // session transcript and CI logs. In 1.x --redact masks the value in logs
+  // and stdout and the exit code is unchanged (verified 1.6.1); the 2.x
+  // migration guide's own pre-commit example is `git --staged --redact`.
+  secrets: 'betterleaks git . --redact',
+  // Staged diff only: what the commit being made would add. Exit 1 on a
+  // finding, 0 with nothing staged. `--staged` alone is the form betterleaks 2
+  // keeps; 1.x accepts it too (verified 1.6.1). 1.x's `--pre-commit` becomes
+  // `--unstaged` in 2.x, which excludes the index, so it is not sent.
+  'secrets:staged': 'betterleaks git --staged --redact',
   licenses: "license-checker --production --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary",
   // The attribution file ships to customers and is committed to public repos,
   // so it must not carry the build machine's home directory. license-checker
@@ -6483,5 +6628,13 @@ module.exports = {
   shippedDmgVersions,
   THINKING_DISABLED_RE,
   NO_DISABLE_MODEL_RE,
+  THINKING_DEFAULT_MODEL_RE,
+  NO_SAMPLING_MODEL_RE,
+  SAMPLING_PARAM_RE,
   FIRST_BLOCK_TEXT_RE,
+  GATE_ORDER,
+  BASE_SCRIPTS,
+  STANDARD_SCRIPTS,
+  SECRET_SCAN_LEAKY_FLAG_RE,
+  secretReportLocations,
 };
