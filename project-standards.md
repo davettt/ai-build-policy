@@ -1,7 +1,7 @@
 # Project Standards
 
 The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
-**Version:** 2.66
+**Version:** 2.67
 **Last updated:** 2026-10-10
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
@@ -414,7 +414,18 @@ Icon: `build/icon.png` (512x512 PNG). electron-builder converts to `.icns` autom
 ### Third-Party Service Preferences
 - **Auth:** Clerk (free tier up to 10k MAU, React SDK, JWT)
 - **Payments:** LemonSqueezy (merchant of record, handles global tax, SaaS subscriptions)
-- **Fonts:** Google Fonts API
+- **Fonts:** bundled with the app or the system stack, never a runtime third-party host (§ Fonts below). Google Fonts is a place to download a woff2 from, not something the app contacts.
+
+### Fonts (all apps and sites)
+
+This line used to read "Fonts: Google Fonts API", and the apps that followed it loaded a web font from Google on every launch: a `<link>` to `fonts.googleapis.com` sends the user's IP address and user agent to Google before the app has drawn anything, which contradicts a local-first promise, and the text renders in a fallback face offline, so fonts now ship with the app.
+
+- **Bundle the files.** Variable woff2 subsets from the `@fontsource-variable/<family>` package (jsDelivr serves them at `https://cdn.jsdelivr.net/npm/@fontsource-variable/<family>@<version>/files/<family>-latin-wght-normal.woff2`; download, do not import) go in `public/fonts/`, with the package's `LICENSE` beside them as `LICENSE-<family>.txt`. Latin plus latin-ext is enough for an English UI; add a script subset only for text the app actually shows in that script. Declare each file with `@font-face` in the root stylesheet, keeping the family name the CSS already uses so no `font-family` rule changes, `font-weight: 100 900` (the variable range), `font-display: swap`, and the `unicode-range` from the package's CSS so the browser fetches only the subset it needs.
+- **Or use the system stack.** `system-ui, -apple-system, sans-serif` needs no files and matches the OS.
+- **CSP stays closed.** `font-src 'self'` and no font host in `style-src`. A helmet `fontSrc: ['https://fonts.gstatic.com']` is the same leak with the server's approval.
+- **Licences.** Most Google-distributed families are SIL OFL 1.1, which permits bundling with the licence text included. Note the change in the privacy section of the app's CHANGELOG entry when removing a remote load, since it is user-visible: the app stops contacting Google.
+
+`check` and the pre-commit `leak-scan` FAIL any tracked UI source, stylesheet or server config that names a font host (`fonts.googleapis.com`, `fonts.gstatic.com`, Typekit, Bunny, Fontshare, cdnfonts, rsms.me). Comments, tests and `docs/` are ignored, and a line that names a host in order to detect it on someone else's site carries `// policy:names-font-host` on that line. It sits in the leak scan rather than only `check` because it is a privacy regression, and those block instead of reporting.
 
 ### Python Projects
 - Typer + Rich for CLI
@@ -805,7 +816,7 @@ Every Express app must use `helmet` for HTTP security headers. `helmet()` sets `
 
 For Electron apps serving on localhost, `helmet` still applies. The headers protect the renderer from loading unexpected content types or being framed by a malicious page if a link escapes the app.
 
-**Content Security Policy.** For cloud/SaaS apps, configure CSP through `helmet`'s `contentSecurityPolicy` option. For local Express apps, the default `helmet()` CSP is sufficient. Never set `'unsafe-inline'` or `'unsafe-eval'` in production CSP without documenting why in a code comment.
+**Content Security Policy.** For cloud/SaaS apps, configure CSP through `helmet`'s `contentSecurityPolicy` option. For local Express apps, the default `helmet()` CSP is sufficient. Never set `'unsafe-inline'` or `'unsafe-eval'` in production CSP without documenting why in a code comment. `font-src` is `'self'` and `style-src` names no font host (§ Fonts): fonts are bundled, and a CSP allowance for `fonts.gstatic.com` is flagged by `check` and `leak-scan` the same as the `<link>` it would permit.
 
 ### Network Exposure (Local Servers)
 

@@ -1,6 +1,6 @@
 # Build & Development Policy
 
-**Version:** 2.66
+**Version:** 2.67
 **Last updated:** 2026-10-10
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
@@ -44,7 +44,7 @@ node ../build-policy/scripts/policy.js <command>
 | `upgrade <pkg>` | Grounds a major dependency upgrade in npm facts (real peer constraints, migration source); scaffolds a decision record | Before any major version bump; `check`/`verify-ready` FAIL without the record |
 | `deps-update` | Refreshes dependencies inside their declared ranges (minor/patch); majors untouched | When `check` reports drift; before starting feature work |
 | `approve-exception <GHSA-id>` | Prints the drafted advisory exception as prose for the developer to read; `--confirm` then records the approval, bound to the entry and the project | After the AI drafts an entry in `audit-exceptions.json`; the hook refuses an AI running it |
-| `leak-scan` | Private files tracked in git, home paths inside tracked files | Every commit (husky pre-commit) |
+| `leak-scan` | Private files tracked in git, home paths inside tracked files, fonts loaded from a third-party host at runtime | Every commit (husky pre-commit) |
 | `handoff` | The session holding uncommitted build-policy work declares it complete | End of a policy change made from an app session |
 | `mirror-sync` | Copies `scripts/`, `templates/` and `tests/` to the public mirror and bumps its headers | From a build-policy session, before writing the public history row |
 | `mirror` | Public-mirror drift + private-detail leak scan | Before pushing the public policy repo |

@@ -287,6 +287,41 @@ test('footerBannerFindings: rights wording, Terms link and per-version dismissal
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('remoteFontFindings: a Google Fonts link, @import or CSP allowance; bundled fonts and opt-outs pass', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-fonts-'));
+  const write = (rel, body) => {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), body);
+  };
+  // The three shapes the sweep found: <link> in index.html, a helmet fontSrc
+  // allowance in the server, and an @import in a stylesheet.
+  write(
+    'index.html',
+    `<link rel="preconnect" href="https://fonts.googleapis.com" />\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />\n<link href="https://fonts.googleapis.com/css2?family=Inter&display=swap" rel="stylesheet" />`,
+  );
+  write('server/index.js', `fontSrc: ['https://fonts.gstatic.com'],`);
+  write('src/index.css', `@import url('https://fonts.googleapis.com/css2?family=Inter');`);
+  assert.deepEqual(policy.remoteFontFindings(dir), [
+    'index.html (3 lines)',
+    'server/index.js (1 line)',
+    'src/index.css (1 line)',
+  ]);
+
+  // Fixed: bundled files, font-src 'self', the host only in a comment, a
+  // test fixture, and an analyzer line that opts out.
+  write('index.html', `<!-- fonts bundled; was fonts.googleapis.com -->\n<title>App</title>`);
+  write('server/index.js', `// no fonts.gstatic.com: fonts are bundled\nfontSrc: ["'self'"],`);
+  write('src/index.css', `@font-face { font-family: 'Inter'; src: url('/fonts/inter-latin-wght-normal.woff2') format('woff2-variations'); }`);
+  write('tests/analyzer.test.js', `expect(hosts).toContain('fonts.googleapis.com')`);
+  write('src/analyzer.js', `const FONT_HOSTS = ['fonts.googleapis.com', 'fonts.gstatic.com']; // policy:names-font-host`);
+  assert.deepEqual(policy.remoteFontFindings(dir), []);
+
+  // The opt-out covers its own line only.
+  write('src/analyzer.js', `// policy:names-font-host\nconst FONT_HOSTS = ['fonts.googleapis.com'];`);
+  assert.deepEqual(policy.remoteFontFindings(dir), ['src/analyzer.js (1 line)']);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('DISMISS_PER_VERSION_RE: the shapes the apps use, not a bare dismiss', () => {
   for (const ok of [
     'if (latest === dismissedVersion) return null;',

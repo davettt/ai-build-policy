@@ -548,6 +548,38 @@ function footerBannerFindings(dir, { distributes, versionCheck, termsUrl = loadR
   return findings;
 }
 
+// Fonts fetched from a third-party host at runtime. project-standards had
+// listed "Google Fonts API" under Third-Party Service Preferences since the
+// standards were written, so apps that followed it loaded Inter from Google
+// on every launch, sending the user's IP address and user agent to Google
+// while the apps are sold as local-first. The sweep that found it (2.67)
+// counted three shipped apps and the marketing site. The rule is now the
+// inverse: fonts ship with the app (`public/fonts/*.woff2` + `@font-face`) or
+// come from the system; `font-src 'self'` in any CSP. Matched on the host,
+// in UI source, stylesheets and server config alike, since the leak lives in
+// a `<link>`, an `@import url()` or a helmet `fontSrc` allowance equally.
+const REMOTE_FONT_HOST_RE =
+  /fonts\.googleapis\.com|fonts\.gstatic\.com|use\.typekit\.net|fonts\.bunny\.net|fontshare\.com|fonts\.cdnfonts\.com|rsms\.me\/inter/i;
+const FONT_SOURCE_FILES = /\.(ts|tsx|js|jsx|mjs|cjs|html|css|scss|astro|svelte|vue)$/;
+// A line that names a host in order to detect it on someone else's site (a
+// website analyzer) opts out with this marker on the same line.
+const FONT_HOST_OPT_OUT = /policy:names-font-host/;
+
+/** Project-relative files that load fonts from a remote host, with the count
+ *  of offending lines. Comments are stripped first (a line explaining the
+ *  rule is not a load); a trailing opt-out marker on a code line survives. */
+function remoteFontFindings(dir) {
+  const findings = [];
+  for (const f of sourceFilesMatching(dir, REMOTE_FONT_HOST_RE, FONT_SOURCE_FILES)) {
+    if (/(^|\/)(tests?|__tests__|e2e|docs)\//.test(f) || /\.(test|spec)\.[jt]sx?$/.test(f)) continue;
+    const lines = stripComments(readFile(path.join(dir, f)))
+      .split('\n')
+      .filter((l) => REMOTE_FONT_HOST_RE.test(l) && !FONT_HOST_OPT_OUT.test(l));
+    if (lines.length > 0) findings.push(`${f} (${lines.length} line${lines.length === 1 ? '' : 's'})`);
+  }
+  return findings;
+}
+
 function diffHash(dir) {
   // Hash the changed-file list + their current contents. Deliberately
   // staging-invariant: `git add` must not invalidate a gates marker, so we
@@ -2584,6 +2616,19 @@ function auditTrackedPrivacy(dir) {
       `Absolute home paths in tracked file(s): ${[...leaking].join(', ')} — these publish the build machine's username and directory layout. Regenerate or make relative (placeholders like /Users/you/... are fine)`,
     );
   } else ok('No absolute home paths in tracked files');
+
+  // Private CONTENT that leaves the machine rather than reaching the repo: a
+  // font loaded from Google (or any third-party host) at runtime sends the
+  // user's IP address and user agent to that host on every launch, which a
+  // local-first app has promised not to do. Lives here so the pre-commit
+  // blocks it the same as a leaked path, rather than `check` reporting it
+  // past the next release.
+  const fontLoads = remoteFontFindings(dir);
+  if (fontLoads.length > 0) {
+    fail(
+      `Fonts load from a third-party host at runtime in: ${fontLoads.join(', ')} — every launch sends the user's IP and user agent to that host. Bundle the woff2 files under public/fonts/ with @font-face and keep any CSP at font-src 'self' (project-standards § Fonts). A line that names a host only to detect it on other sites opts out with // policy:names-font-host`,
+    );
+  } else ok('No fonts loaded from third-party hosts');
 }
 
 function cmdCheck(dir, flags = []) {
@@ -6905,4 +6950,6 @@ module.exports = {
   secretReportLocations,
   footerBannerFindings,
   DISMISS_PER_VERSION_RE,
+  remoteFontFindings,
+  REMOTE_FONT_HOST_RE,
 };
