@@ -103,18 +103,11 @@ test('writesUnder: an app session editing its own files with the repo in a hered
 test('commandNamesRoot: real path yes, sibling public mirror no, relative only when it resolves', () => {
   assert.equal(policy.commandNamesRoot(`cat ${ROOT}/README.md`, ROOT), true);
   assert.equal(policy.commandNamesRoot(`cat ${ROOT}-public/README.md`, ROOT), false);
-  assert.equal(
-    policy.commandNamesRoot('cat ../build-policy/README.md', ROOT, path.join(PARENT, 'some-app')),
-    true,
-  );
-  assert.equal(
-    policy.commandNamesRoot(
-      'cat ../build-policy/README.md',
-      ROOT,
-      path.join(ELSEWHERE, 'some-app'),
-    ),
-    false,
-  );
+  // The relative form names the repo by its folder name, which is whatever the
+  // running copy is called (the public mirror is one such copy).
+  const rel = `cat ../${path.basename(ROOT)}/README.md`;
+  assert.equal(policy.commandNamesRoot(rel, ROOT, path.join(PARENT, 'some-app')), true);
+  assert.equal(policy.commandNamesRoot(rel, ROOT, path.join(ELSEWHERE, 'some-app')), false);
 });
 
 test('literalPathsUnder: whole path literals count, sentences do not', () => {
