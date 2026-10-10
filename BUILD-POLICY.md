@@ -1,7 +1,7 @@
 # Build & Development Policy
 
-**Version:** 2.65
-**Last updated:** 2026-10-09
+**Version:** 2.66
+**Last updated:** 2026-10-10
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
 
@@ -35,7 +35,7 @@ node ../build-policy/scripts/policy.js <command>
 | `doctor` | Machine setup checks: tools, npmrc, hooks, agents, notary profile | New machine; troubleshooting |
 | `check` | Project compliance: required scripts/files/configs, template drift, staleness. `--all` runs it for every project beside build-policy and prints one table | **Automatically at every session start** (Claude hook); after fixing gaps; `--all` to see the portfolio backlog |
 | `scaffold` | Creates missing standard files and scripts; never overwrites | New projects; fixing `check` gaps |
-| `sync-templates` | Overwrites the drift-checked files (ci.yml, dependabot.yml, pre-commit, AGENTS.md, .nvmrc) from the templates, one project per run | When `check` reports template drift |
+| `sync-templates` | Overwrites the drift-checked files (ci.yml, dependabot.yml, pre-commit, AGENTS.md, .nvmrc) from the templates and resets the two secret-scan scripts to the standard, one project per run. Not a destructive action: it is the sanctioned fix, gated like any change | When `check` reports template drift or a drifted secret-scan script |
 | `gates` | Runs all quality gates in order; writes a diff-hashed pass marker | Before presenting any work (`/gates`); `--fast` subset on every commit (husky) |
 | `verify-marker` | Pre-commit: refuses a commit of source or dependency files without a full-gates marker for the exact tree | Every commit (husky), never by hand |
 | `verify-ready` | Marker matches current diff + CHANGELOG updated + smoke coverage + security review recorded; records a pass the DMG build requires | Before declaring work ready; `--release` before shipping |
@@ -43,7 +43,7 @@ node ../build-policy/scripts/policy.js <command>
 | `health` | npm outdated/audit, registry staleness; records run timestamp | When `check` flags maintenance overdue (>30 days) |
 | `upgrade <pkg>` | Grounds a major dependency upgrade in npm facts (real peer constraints, migration source); scaffolds a decision record | Before any major version bump; `check`/`verify-ready` FAIL without the record |
 | `deps-update` | Refreshes dependencies inside their declared ranges (minor/patch); majors untouched | When `check` reports drift; before starting feature work |
-| `approve-exception <GHSA-id>` | The developer's approval of an advisory exception, recorded as a hash of the entry | After the AI drafts an entry in `audit-exceptions.json`; the hook refuses an AI running it |
+| `approve-exception <GHSA-id>` | Prints the drafted advisory exception as prose for the developer to read; `--confirm` then records the approval, bound to the entry and the project | After the AI drafts an entry in `audit-exceptions.json`; the hook refuses an AI running it |
 | `leak-scan` | Private files tracked in git, home paths inside tracked files | Every commit (husky pre-commit) |
 | `handoff` | The session holding uncommitted build-policy work declares it complete | End of a policy change made from an app session |
 | `mirror-sync` | Copies `scripts/`, `templates/` and `tests/` to the public mirror and bumps its headers | From a build-policy session, before writing the public history row |
@@ -65,6 +65,7 @@ Each step names its enforcement. **Human judgment** steps are deliberately human
 | Fix FAIL items before feature work (`policy scaffold` + manual fixes) | `policy check` re-run; gaps reappear every session until fixed |
 | Every project has a filled-in `CLAUDE.md` | `check` FAILs when it is missing, still carrying the scaffold placeholder, or under 25 lines. `scaffold` writes the skeleton; the placeholder keeps it failing until the content is real |
 | New project: spec in `.claude/specs/` before building | Human judgment (AI drafts, developer reviews the spec) |
+| New repo: the developer makes the root commit (the scaffold) before any feature work, so the review gate, `/security-review` and the pre-commit marker have a HEAD to diff against | `check` FAILs a git repo with no commits, at session start; the pre-commit hook allows that one commit |
 
 ### Phase 2 — Planning
 

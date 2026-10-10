@@ -13,7 +13,7 @@
  *   doctor              Machine-level setup checks (tools, npmrc, hooks, agents)
  *   check [dir]         Project compliance check (structure, scripts, drift, staleness)
  *                         --all           every project beside build-policy, as a table
- *   sync-templates [dir] Overwrite the drift-checked files (ci.yml, dependabot.yml,
+ *   sync-templates [dir] Overwrite the drift-checked files and secret-scan scripts (ci.yml, dependabot.yml,
  *                         .husky/pre-commit, AGENTS.md, .nvmrc) from the templates;
  *                         one project at a time, and the change still needs its gates
  *   gates [dir]         Run quality gates in order; writes .policy/gates.json marker
@@ -33,7 +33,7 @@
  *   upgrade <pkg>       Ground a MAJOR dependency upgrade: pull real peer-dep constraints
  *                         + migration source from npm, scaffold a decision record under
  *                         .claude/specs/deps/. check/verify-ready FAIL on an un-recorded major.
- *   approve-exception <GHSA-id>  Developer's approval of an advisory exception
+ *   approve-exception <GHSA-id>  Prints a drafted advisory exception; --confirm records the developer's approval
  *                         (records a hash of the entry in audit-approvals.json)
  *   scaffold [dir]      Create missing standard files/scripts (never overwrites)
  *   leak-scan [dir]     Pre-commit: private files tracked, home paths in tracked files
@@ -346,6 +346,17 @@ function currentHead(dir) {
   const r = sh('git rev-parse HEAD', dir);
   return r.ok ? r.out : null;
 }
+
+// A git repo with nothing committed. The review gate, /security-review and
+// verify-marker all diff against HEAD, so until the root commit exists none of
+// them can run: a new site reached its sign-in code with no commit to review
+// against (2026-10-10). The standard has always been "root commit first, the
+// pre-commit hook allows it", but only `gates` said so, at the end of the work.
+function repoHasNoCommits(dir) {
+  return !!sh('git rev-parse --is-inside-work-tree', dir).ok && !currentHead(dir);
+}
+const ROOT_COMMIT_HINT =
+  'the developer makes the root commit before any feature work (the pre-commit hook allows it): git add -A && git commit -m "initial scaffold"';
 
 /** Files changed between two commits (null when git cannot say). */
 function filesBetween(dir, from, to = 'HEAD') {
@@ -1886,9 +1897,30 @@ function auditEntryHash(e) {
 function loadAuditApprovals(dir) {
   return readJSON(path.join(dir, AUDIT_APPROVALS)) || {};
 }
+// An approval is bound to the project as well as to the entry's content. The
+// hash alone let a copied approval travel: the site starter commits its
+// exception and approval files, so a site made from it arrived already
+// "approved" for a reason written about the starter, which the developer had
+// never checked against the new site (seen 2026-10-10; the standard says each
+// site carries its own approval, checked against that site). The project is
+// the package.json name, falling back to the directory name.
+function auditProjectId(dir) {
+  const pkg = readJSON(path.join(dir, 'package.json'));
+  return (pkg && pkg.name) || path.basename(path.resolve(dir));
+}
 function auditExceptionApproved(dir, id, e) {
   const a = loadAuditApprovals(dir)[id];
-  return Boolean(a && e && a.hash === auditEntryHash(e));
+  return Boolean(a && e && a.hash === auditEntryHash(e) && a.project === auditProjectId(dir));
+}
+// Why an approval that exists does not count, for the message.
+function auditApprovalMismatch(dir, id, e) {
+  const a = loadAuditApprovals(dir)[id];
+  if (!a) return '';
+  if (a.hash !== auditEntryHash(e)) return ' (changed since it was approved)';
+  if (!a.project) return ' (approved before approvals were bound to a project — approve it again here)';
+  if (a.project !== auditProjectId(dir))
+    return ` (approved for "${a.project}", not this one — a copied approval; check the reason against this project)`;
+  return '';
 }
 
 /** Problems with the exception file itself: missing fields, too long, expired. */
@@ -1912,8 +1944,9 @@ function auditExceptionProblems(
     if (e.expires < today) problems.push(`${id}: expired on ${e.expires} — re-decide or remove it`);
     if (dir && !auditExceptionApproved(dir, id, e))
       problems.push(
-        `${id}: not approved${loadAuditApprovals(dir)[id] ? ' (changed since it was approved)' : ''} — the developer runs: ` +
-          `node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} approve-exception ${id}`,
+        `${id}: not approved${auditApprovalMismatch(dir, id, e)} — show the developer the entry's reason in your reply, then the developer records the approval with: ` +
+          `node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} approve-exception ${id} --confirm ` +
+          `(without --confirm the command only prints the entry and records nothing)`,
       );
   }
   return problems;
@@ -2373,6 +2406,13 @@ const NO_SAMPLING_MODEL_RE = /['"`](claude-(?:sonnet-5-5|opus-5-5|haiku-5-5|fabl
 // --validation does the same in 1.x. Matched on the flag as a whole word so
 // `--no-verbose` or a path containing `-v` cannot trip it.
 const SECRET_SCAN_LEAKY_FLAG_RE = /(?:^|\s)(-v|-a|--verbose|--validate|--validation|--analyze)(?=\s|$)/;
+
+// The one fix for template drift and a drifted secret-scan script. The
+// messages used to spell out `cp` and `rm` per file; a site session read those
+// as destructive overwrites needing the developer's confirmation and stopped
+// with the gates still failing (2026-10-10). `sync-templates` is the sanctioned
+// command, gated like any change, so the messages name it and nothing else.
+const TEMPLATE_SYNC_HINT = 'run: policy sync-templates . (gated like any change: CHANGELOG, gates, developer commit)';
 const SAMPLING_PARAM_RE = /\b(temperature|top_p|top_k)\s*[:=]\s*[0-9.]/;
 
 /** The registry's smart and fast tier IDs, for check messages that name where an app is heading. */
@@ -2644,7 +2684,7 @@ function cmdCheck(dir, flags = []) {
     const m = scripts[name].match(SECRET_SCAN_LEAKY_FLAG_RE);
     if (m)
       fail(
-        `${name} script is "${scripts[name]}" — ${m[1]} prints the secret (betterleaks 1.x --verbose) or sends it to the provider (betterleaks 2 --validate / --analyze). Drop the flag; the exit code is the gate. Standard: "${STANDARD_SCRIPTS[name]}"`,
+        `${name} script is "${scripts[name]}" — ${m[1]} prints the secret (betterleaks 1.x --verbose) or sends it to the provider (betterleaks 2 --validate / --analyze). Drop the flag; the exit code is the gate. Standard: "${STANDARD_SCRIPTS[name]}" — ${TEMPLATE_SYNC_HINT}`,
       );
     if (/\bbetterleaks\b/.test(scripts[name]) && !/(?:^|\s)--redact(?:=\d+)?(?=\s|$)/.test(scripts[name]))
       fail(
@@ -3065,6 +3105,14 @@ function cmdCheck(dir, flags = []) {
     else ok(`.nvmrc matches the pinned Node (${have})`);
   }
 
+  // FAIL: the review gate, /security-review and verify-marker all need a
+  // HEAD to diff against, and "fix FAIL items before feature work" is the rule
+  // that gets the root commit made first instead of after the sign-in code.
+  if (proj.isGit && repoHasNoCommits(dir))
+    fail(
+      `git repo has no commits — the review gate, /security-review and the pre-commit marker all diff against HEAD and cannot run until one exists; ${ROOT_COMMIT_HINT}`,
+    );
+
   // WARN, not FAIL: only /security-review needs it, and the Stop hook repeats
   // the fix at the moment a security review is required. scaffold sets it.
   const originHead = proj.isGit ? missingOriginHead(dir) : null;
@@ -3093,7 +3141,7 @@ function cmdCheck(dir, flags = []) {
       norm(readFile(path.join(TEMPLATES, 'ci.yml')))
     ) {
       fail(
-        `ci.yml differs from the shared template — sync it: cp ${policyRel(dir)}/templates/ci.yml .github/workflows/ci.yml (deviations belong in the template, not the project)`,
+        `ci.yml differs from the shared template (deviations belong in the template, not the project) — ${TEMPLATE_SYNC_HINT}`,
       );
     } else ok('CI workflow matches shared template');
   }
@@ -3107,7 +3155,7 @@ function cmdCheck(dir, flags = []) {
       norm(readFile(path.join(TEMPLATES, 'pre-commit')))
     ) {
       fail(
-        `.husky/pre-commit differs from the shared template — THIS PROJECT IS UNENFORCED (no verify-marker). Sync: delete .husky/pre-commit, then policy scaffold (writes this project's path to build-policy, ${policyRel(dir)})`,
+        `.husky/pre-commit differs from the shared template — THIS PROJECT IS UNENFORCED (no verify-marker) — ${TEMPLATE_SYNC_HINT}`,
       );
     } else ok('Pre-commit hook matches shared template');
   }
@@ -3122,7 +3170,7 @@ function cmdCheck(dir, flags = []) {
       norm(readFile(path.join(TEMPLATES, 'dependabot.yml')))
     ) {
       fail(
-        `dependabot.yml differs from the shared template — sync: cp ${policyRel(dir)}/templates/dependabot.yml .github/dependabot.yml (deviations belong in the template)`,
+        `dependabot.yml differs from the shared template (deviations belong in the template) — ${TEMPLATE_SYNC_HINT}`,
       );
     } else ok('Dependabot config matches shared template');
   }
@@ -3136,7 +3184,7 @@ function cmdCheck(dir, flags = []) {
       norm(readFile(path.join(TEMPLATES, 'AGENTS.md')))
     ) {
       fail(
-        `AGENTS.md differs from the shared template — sync: delete AGENTS.md, then policy scaffold (writes this project's path to build-policy, ${policyRel(dir)})`,
+        `AGENTS.md differs from the shared template — ${TEMPLATE_SYNC_HINT}`,
       );
     } else ok('AGENTS.md matches shared template');
   }
@@ -4894,7 +4942,21 @@ function cmdScaffold(dir) {
  * file per project, and the pre-commit hook and AGENTS.md carry a localized
  * path that a plain copy gets wrong. One project per run: the change is
  * gated like any other (changelog, gates, the developer's commit).
+ *
+ * The two secret-scan scripts are synced the same way: `scaffold` never
+ * rewrites an existing script, so a leaky `-v` or a pre-betterleaks `gitleaks
+ * detect` line stayed until someone edited package.json by hand, and an
+ * editing tool refused that edit in auto mode (2026-10-10). The gate is only
+ * as good as the command it runs, so these two are not per-project choices.
  */
+const SECRET_SCAN_SCRIPTS = ['secrets', 'secrets:staged'];
+function secretScriptSyncs(scripts) {
+  const out = {};
+  for (const name of SECRET_SCAN_SCRIPTS)
+    if ((scripts || {})[name] !== STANDARD_SCRIPTS[name]) out[name] = STANDARD_SCRIPTS[name];
+  return out;
+}
+
 function cmdSyncTemplates(dir) {
   guardLocalPath(dir);
   if (path.resolve(dir) === POLICY_ROOT) {
@@ -4925,6 +4987,19 @@ function cmdSyncTemplates(dir) {
     }
     changed.push(dest);
     console.log(`  ${GREEN}written${RESET} ${dest}`);
+  }
+  const pkgPath = path.join(dir, 'package.json');
+  const pkg = readJSON(pkgPath);
+  if (pkg) {
+    const syncs = secretScriptSyncs(pkg.scripts);
+    for (const [name, cmd] of Object.entries(syncs)) {
+      pkg.scripts = pkg.scripts || {};
+      pkg.scripts[name] = cmd;
+      changed.push(`package.json scripts.${name}`);
+      console.log(`  ${GREEN}written${RESET} package.json scripts.${name} = "${cmd}"`);
+    }
+    if (Object.keys(syncs).length)
+      fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
   }
   const nodePin = (loadRegistry().entries || {})['node-lts'];
   if (nodePin && nodePin.value && readFile(path.join(dir, '.nvmrc')).trim() !== nodePin.value) {
@@ -5692,7 +5767,9 @@ function cmdHookPosttool() {
  * Measured against the real transcript: the accurate table scored 14 real / 0
  * absent, the fabricated one 1 real / 13 absent.
  */
-function fabricatedContentIds(transcriptPath, dir) {
+// The last text the session wrote to the developer, from the transcript. What
+// the developer sees is this text, not tool output.
+function lastAssistantText(transcriptPath) {
   let finalText = '';
   try {
     for (const line of fs.readFileSync(transcriptPath, 'utf8').split('\n')) {
@@ -5710,6 +5787,28 @@ function fabricatedContentIds(transcriptPath, dir) {
   } catch {
     return null;
   }
+  return finalText || null;
+}
+
+// Drafted advisory exceptions the developer has been asked to approve without
+// being shown what they would approve. An entry counts as presented when the
+// reply carries its reason, whitespace aside. The approval is a decision about
+// that reason, so the reply must show it; the command alone is a request for a
+// signature on text the developer has not read (asked for 2026-10-10).
+function unpresentedExceptions(dir, replyText) {
+  const exceptions = loadAuditExceptions(dir);
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const reply = norm(replyText);
+  const out = [];
+  for (const [id, e] of Object.entries(exceptions)) {
+    if (!e || !e.reason || auditExceptionApproved(dir, id, e)) continue;
+    if (!reply.includes(norm(e.reason))) out.push(id);
+  }
+  return out;
+}
+
+function fabricatedContentIds(transcriptPath, dir) {
+  const finalText = lastAssistantText(transcriptPath);
   if (!finalText) return null;
 
   // Vocabulary: every `id` in every JSON data file the project ships.
@@ -5825,6 +5924,31 @@ function cmdHookStop() {
   }
 
   const changed = changedFiles(dir);
+
+  // An exception the session drafted this turn must be shown to the developer
+  // in the reply, not only named with the command. Checked only while the
+  // exception file is uncommitted: once committed, the entry was presented
+  // (or approved) in an earlier turn.
+  if (input.transcript_path && changed.includes(AUDIT_EXCEPTIONS)) {
+    const pending = unpresentedExceptions(dir, lastAssistantText(input.transcript_path));
+    if (pending.length) {
+      const exceptions = loadAuditExceptions(dir);
+      const project = auditProjectId(dir);
+      const plain = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+      console.log(
+        JSON.stringify({
+          decision: 'block',
+          reason:
+            `BUILD-POLICY: the developer approves an advisory exception by reading its reason, and your reply does not show it. ` +
+            `Put the following in your reply to the developer, word for word, then this exact command, --confirm included (without it the command only prints the entry again and records nothing, and the developer is sent round in a circle):\n\n` +
+            pending.map((id) => plain(formatAuditEntry(id, exceptions[id], project))).join('\n\n') +
+            `\n\n! node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} approve-exception ${pending.join(' ')} --confirm`,
+        }),
+      );
+      process.exit(0);
+    }
+  }
+
   const sourceChanged = changed.filter(isGatedFile);
   if (sourceChanged.length === 0) process.exit(0);
 
@@ -5862,7 +5986,9 @@ function cmdHookStop() {
       reasons.push(
         `Security-sensitive files changed without a recorded review: ${sensitive.join(', ')}. ` +
           `These touch auth, secrets, crypto, CORS, payment or data deletion, where a missed bug is not a bug report — it is an incident. ` +
-          (proj.isGit && missingOriginHead(dir) !== null
+          (proj.isGit && repoHasNoCommits(dir)
+            ? `This repo has no commits, so /security-review has nothing to diff against: review these files directly, record the ack, and tell the developer ${ROOT_COMMIT_HINT}. `
+            : proj.isGit && missingOriginHead(dir) !== null
             ? `First make /security-review runnable (this repo has no origin/HEAD, which git creates only on clone): ` +
               `${missingOriginHead(dir) ? `git remote set-head origin ${missingOriginHead(dir)}` : 'git fetch origin, then policy scaffold'}. `
             : '') +
@@ -6232,7 +6358,8 @@ function cmdHookPretool() {
       refuse(
         "BUILD-POLICY: approving an advisory exception is the developer's decision. Write or update the entry in " +
           'audit-exceptions.json, show the developer the full entry and what you checked in this project, then give them ' +
-          'the command to run themselves: ! node <build-policy>/scripts/policy.js approve-exception <GHSA-id>',
+          'the command to run themselves: ! node <build-policy>/scripts/policy.js approve-exception <GHSA-id> --confirm ' +
+          '(without --confirm it only prints the entry)',
       );
     if (input.tool_name === 'Bash' && /--min-release-age(=|\s+)\d/.test(cmd))
       refuse(
@@ -6596,9 +6723,39 @@ For each ⚠ peer above where the project is below the required major: what has 
  * content) in audit-approvals.json. Run by the developer, never the AI: the
  * PreToolUse hook refuses it, as it refuses --ack-manual.
  */
-function cmdApproveException(ids) {
+// The entry as the approver reads it: the reason wrapped as prose, the facts
+// on one line, no JSON. What is being approved is the reason, so it leads.
+function wrapText(text, width, indent) {
+  const words = String(text || '').split(/\s+/).filter(Boolean);
+  const lines = [];
+  let line = '';
+  for (const w of words) {
+    if (line && (line + ' ' + w).length > width) {
+      lines.push(line);
+      line = w;
+    } else line = line ? `${line} ${w}` : w;
+  }
+  if (line) lines.push(line);
+  return lines.map((l) => indent + l).join('\n');
+}
+function formatAuditEntry(id, e, project) {
+  return [
+    `${BOLD}${id}${RESET}  ${e.package}${e.via ? ` (reached through ${e.via})` : ''}`,
+    `  The reason this advisory is held not to apply to ${project}:`,
+    wrapText(e.reason, 78, '    '),
+    `  Decided ${e.decided}, expires ${e.expires}.`,
+  ].join('\n');
+}
+
+// Two steps, so the approver reads before anything is written: the first run
+// prints each entry as prose and the command to confirm; only --confirm
+// records. One step printed the same text and recorded in the same breath,
+// which is a receipt, not a review (asked for 2026-10-10 after a site session
+// drafted its entry from the starter's reason).
+function cmdApproveException(ids, flags = []) {
   const dir = process.cwd();
-  section('Approve advisory exception');
+  const confirm = flags.includes('--confirm');
+  section(confirm ? 'Approve advisory exception' : 'Advisory exception: read before approving');
   const exceptions = loadAuditExceptions(dir);
   const targets = ids.length
     ? ids
@@ -6608,24 +6765,44 @@ function cmdApproveException(ids) {
     return finish();
   }
   const approvals = loadAuditApprovals(dir);
+  const project = auditProjectId(dir);
+  const approvable = [];
   for (const id of targets) {
     const e = exceptions[id];
     if (!e) {
       fail(`${id} is not in ${path.join(dir, AUDIT_EXCEPTIONS)}`);
       continue;
     }
-    console.log(`\n${BOLD}${id}${RESET}`);
-    for (const k of ['package', 'via', 'reason', 'decided', 'expires'])
-      console.log(`  ${k.padEnd(8)} ${e[k] || ''}`);
+    console.log(`\n${formatAuditEntry(id, e, project)}`);
     const problems = auditExceptionProblems({ [id]: e });
     if (problems.length) {
       fail(`${id} cannot be approved: ${problems.join('; ')}`);
       continue;
     }
-    approvals[id] = { hash: auditEntryHash(e), approvedAt: new Date().toISOString() };
-    ok(`${id} approved (until ${e.expires}; changing the entry needs approval again)`);
+    approvable.push(id);
   }
-  fs.writeFileSync(path.join(dir, AUDIT_APPROVALS), JSON.stringify(approvals, null, 2) + '\n');
+  if (!confirm) {
+    if (approvable.length)
+      console.log(
+        `\nIf the reason above is true for ${project} as it is today, record the approval:\n` +
+          `  node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} approve-exception ${approvable.join(' ')} --confirm\n` +
+          `If it is not, have the session rewrite the entry; nothing has been recorded.`,
+      );
+    return finish();
+  }
+  for (const id of approvable) {
+    const e = exceptions[id];
+    approvals[id] = {
+      hash: auditEntryHash(e),
+      project: auditProjectId(dir),
+      approvedAt: new Date().toISOString(),
+    };
+    ok(
+      `${id} approved for ${auditProjectId(dir)} (until ${e.expires}; changing the entry, or copying it to another project, needs approval again)`,
+    );
+  }
+  if (approvable.length)
+    fs.writeFileSync(path.join(dir, AUDIT_APPROVALS), JSON.stringify(approvals, null, 2) + '\n');
   console.log(`\nCommit ${AUDIT_EXCEPTIONS} and ${AUDIT_APPROVALS} together.`);
   return finish();
 }
@@ -6662,7 +6839,10 @@ function main() {
     case 'upgrade':
       return cmdUpgrade(dir, rest);
     case 'approve-exception':
-      return cmdApproveException(rest.filter((a) => !a.startsWith('--')));
+      return cmdApproveException(
+        rest.filter((a) => !a.startsWith('--')),
+        flags,
+      );
     case 'scaffold':
       return cmdScaffold(dir);
     case 'handoff':
@@ -6711,6 +6891,17 @@ module.exports = {
   BASE_SCRIPTS,
   STANDARD_SCRIPTS,
   SECRET_SCAN_LEAKY_FLAG_RE,
+  TEMPLATE_SYNC_HINT,
+  secretScriptSyncs,
+  repoHasNoCommits,
+  auditProjectId,
+  auditEntryHash,
+  auditExceptionApproved,
+  auditApprovalMismatch,
+  formatAuditEntry,
+  wrapText,
+  lastAssistantText,
+  unpresentedExceptions,
   secretReportLocations,
   footerBannerFindings,
   DISMISS_PER_VERSION_RE,

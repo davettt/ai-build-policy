@@ -307,3 +307,111 @@ test('DISMISS_PER_VERSION_RE: the shapes the apps use, not a bare dismiss', () =
   for (const bad of ['onClick={dismiss}', 'const [dismissed, setDismissed] = useState(false)', 'x === y'])
     assert.doesNotMatch(bad, policy.DISMISS_PER_VERSION_RE, bad);
 });
+
+test('template drift and leaky-script fixes name sync-templates, never a cp or rm', () => {
+  assert.match(policy.TEMPLATE_SYNC_HINT, /policy sync-templates \./);
+  assert.doesNotMatch(policy.TEMPLATE_SYNC_HINT, /\b(cp|rm|delete)\b/);
+  const src = fs.readFileSync(path.join(ROOT, 'scripts', 'policy.js'), 'utf8');
+  for (const m of src.match(/`[^`]*differs from the shared template[^`]*`/g) || [])
+    assert.match(m, /TEMPLATE_SYNC_HINT/, m);
+});
+
+test('secretScriptSyncs: rewrites a drifted or missing secret-scan script, leaves the standard alone', () => {
+  const std = policy.STANDARD_SCRIPTS;
+  assert.deepEqual(policy.secretScriptSyncs({ secrets: std.secrets, 'secrets:staged': std['secrets:staged'] }), {});
+  assert.deepEqual(policy.secretScriptSyncs({ secrets: 'gitleaks detect --source . --verbose', 'secrets:staged': std['secrets:staged'] }), {
+    secrets: std.secrets,
+  });
+  assert.deepEqual(policy.secretScriptSyncs({ secrets: 'betterleaks git . --redact -v' }), {
+    secrets: std.secrets,
+    'secrets:staged': std['secrets:staged'],
+  });
+  assert.deepEqual(policy.secretScriptSyncs(undefined), { secrets: std.secrets, 'secrets:staged': std['secrets:staged'] });
+});
+
+test('repoHasNoCommits: true after git init, false after the root commit, false outside git', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-root-'));
+  const git = (args) => require('child_process').execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
+  assert.equal(policy.repoHasNoCommits(dir), false);
+  git(['init', '-q']);
+  assert.equal(policy.repoHasNoCommits(dir), true);
+  git(['-c', 'user.name=t', '-c', 'user.email=t@localhost', 'commit', '-q', '--allow-empty', '-m', 'root']);
+  assert.equal(policy.repoHasNoCommits(dir), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('audit approvals: bound to the project, so a copied approval does not count', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-audit-'));
+  const e = { package: 'p', via: 'q', reason: 'r', decided: '2026-10-01', expires: '2026-12-01' };
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'this-site' }));
+  fs.writeFileSync(path.join(dir, 'audit-exceptions.json'), JSON.stringify({ 'GHSA-x': e }));
+  // Test fixture only: writes the approvals file in a temp dir to exercise the predicate.
+  const approve = (rec) => fs.writeFileSync(path.join(dir, 'audit-approvals.json'), JSON.stringify({ 'GHSA-x': rec }));
+  const hash = policy.auditEntryHash(e);
+  assert.equal(policy.auditProjectId(dir), 'this-site');
+  // Legacy (no project) or copied from another project: not approved here.
+  for (const [rec, why] of [
+    [{ hash }, /approve it again/],
+    [{ hash, project: 'starter' }, /not this one/],
+  ]) {
+    approve(rec);
+    assert.equal(policy.auditExceptionApproved(dir, 'GHSA-x', e), false);
+    assert.match(policy.auditApprovalMismatch(dir, 'GHSA-x', e), why);
+  }
+  approve({ hash: 'stale', project: 'this-site' });
+  assert.equal(policy.auditExceptionApproved(dir, 'GHSA-x', e), false);
+  assert.match(policy.auditApprovalMismatch(dir, 'GHSA-x', e), /changed since/);
+  approve({ hash, project: 'this-site' });
+  assert.equal(policy.auditExceptionApproved(dir, 'GHSA-x', e), true);
+  assert.equal(policy.auditApprovalMismatch(dir, 'GHSA-x', e), '');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('formatAuditEntry: the reason reads as wrapped prose with the facts beside it', () => {
+  const e = {
+    package: 'http-cache-semantics',
+    via: 'astro',
+    reason: 'word '.repeat(40).trim(),
+    decided: '2026-10-10',
+    expires: '2026-12-31',
+  };
+  const out = policy.formatAuditEntry('GHSA-x', e, 'this-site').replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(out, /^GHSA-x  http-cache-semantics \(reached through astro\)/);
+  assert.match(out, /not to apply to this-site/);
+  assert.match(out, /Decided 2026-10-10, expires 2026-12-31\./);
+  for (const line of out.split('\n')) assert.ok(line.length <= 82, line);
+  assert.equal(policy.wrapText('a b c', 3, '> '), '> a b\n> c');
+});
+
+test('unpresentedExceptions: an unapproved entry counts as presented only when the reply carries its reason', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-present-'));
+  const e = { package: 'p', via: 'q', reason: 'Only reached when remote  images are configured; none are.', decided: '2026-10-01', expires: '2026-12-01' };
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'site' }));
+  fs.writeFileSync(path.join(dir, 'audit-exceptions.json'), JSON.stringify({ 'GHSA-x': e }));
+  assert.deepEqual(policy.unpresentedExceptions(dir, 'Run the approve command.'), ['GHSA-x']);
+  assert.deepEqual(policy.unpresentedExceptions(dir, null), ['GHSA-x']);
+  // Whitespace and wrapping in the reply do not matter.
+  assert.deepEqual(policy.unpresentedExceptions(dir, 'Here it is:\n  Only reached when remote images are\n  configured; none are.\nThen run it.'), []);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('lastAssistantText: the final assistant text block in a transcript', () => {
+  const f = path.join(os.tmpdir(), `policy-transcript-${process.pid}.jsonl`);
+  fs.writeFileSync(f, [
+    JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: 'hi' }] } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'first' }] } }),
+    'not json',
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use' }, { type: 'text', text: 'last' }] } }),
+  ].join('\n'));
+  assert.equal(policy.lastAssistantText(f), 'last');
+  assert.equal(policy.lastAssistantText(f + '.missing'), null);
+  fs.rmSync(f, { force: true });
+});
+
+test('every message that hands the developer the approve command names --confirm', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'scripts', 'policy.js'), 'utf8');
+  const sites = src.match(/approve-exception \$\{[^}]+\}[^`'\n]*/g) || [];
+  assert.ok(sites.length >= 3, `expected the check, Stop hook and first-step sites, found ${sites.length}`);
+  for (const s of sites) assert.match(s, /--confirm/, s);
+  assert.match(src, /approve-exception <GHSA-id> --confirm/);
+});
