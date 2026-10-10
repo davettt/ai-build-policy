@@ -1,6 +1,6 @@
 # Build & Development Policy
 
-**Version:** 2.67
+**Version:** 2.70
 **Last updated:** 2026-10-10
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
@@ -74,7 +74,6 @@ Each step names its enforcement. **Human judgment** steps are deliberately human
 | Assess scope: major (feature/architecture/multi-file) vs minor (bug fix/config) | Human judgment |
 | Minor work: state intent in one sentence before starting | Human judgment |
 | Major work: written plan — files affected, approach, risks — approved by developer before implementation | Human judgment (the developer is the gate) |
-| Optional: import phases as Linear epics | Per-project |
 
 ### Phase 3 — Implementation
 
@@ -104,7 +103,7 @@ Root commit exception: CodeRabbit cannot review before HEAD exists, so the initi
 | Step | Enforced by |
 |---|---|
 | CodeRabbit findings addressed — all critical/high fixed before commit | `policy gates` includes `npm run review`; findings block the gate |
-| Review allowance spent on code, not packaging: the review gate is skipped when the diff contains no source file, and is unconditional at release | `policy gates` skips it on a source-free diff (`--with-review` forces it); `verify-ready --release` FAILs unless the marker records a CodeRabbit pass |
+| Review allowance spent on code, not packaging: the review gate is skipped when the diff contains no source file, and is unconditional at release | `policy gates` skips it on a source-free diff (`--with-review` forces it); `verify-ready --release` FAILs unless the marker records a CodeRabbit pass; the review is the last gate and a pass is kept in `.policy/review.json` across a later gate failure |
 | Security review for auth/data/payment/CORS/secret changes | `/security-review` (Claude Code; no CodeRabbit allowance), recorded with `policy security-ack`. Checked in **both** layers, like the gates marker: the Stop hook blocks turn-end when a sensitive file changed without a matching record, and `verify-ready` FAILs on the same condition. The review itself stays human judgment — the machinery checks that it happened, and against the current content (see Security Exclusions below) |
 | Developer verifies the change locally in the UI | Human judgment — **the developer is the reviewer** |
 
@@ -118,7 +117,7 @@ Root commit exception: CodeRabbit cannot review before HEAD exists, so the initi
 | A shipped version is frozen — new source work bumps the version and opens a new CHANGELOG section, never amends a shipped entry | A built DMG in `release/` marks its version shipped: Stop hook blocks turn-end, `check` fails, `verify-ready` fails while source changes sit on a shipped version |
 | README updated when setup/features/config change | Human judgment (delegate to `readme-updater` agent) |
 | Semver bump checked against last git tag | `verify-ready --release` fails if commits exist after the last tag without a bump (tag-at-HEAD = correctly tagged release) |
-| Conventional commit on a feature branch | Human judgment — **the developer commits, never the AI** |
+| Conventional commit on `main` | Human judgment — **the developer commits, never the AI**; `verify-ready --release` and the DMG build hook refuse any other branch |
 
 ### Phase 7 — Release & deploy
 
@@ -141,6 +140,7 @@ Root commit exception: CodeRabbit cannot review before HEAD exists, so the initi
 | With `"distribution": "none"` the DMGs in `release/` are test builds for the developer's own machine, so they freeze nothing: the version is not frozen, no tag is owed and no update banner is required. Those rules start when the project switches to a real distribution such as `gumroad`, which is the first real release. Before switching, bump the version or remove the test DMGs from `release/`, otherwise a leftover test build for the current version reads as a release that was never tagged. A project declared `gumroad` must have the update check before its first DMG, so the gap is caught before the launch build | `check`, `verify-ready` and the Stop hook read the shipped set through `shippedDmgVersions`, which is empty under `none`; `check` FAILs a declared-gumroad app with no update check even with no DMG built |
 | `verify-ready --release` runs **twice**, either side of the build. Pre-flight (before the DMG exists) checks version bump, CHANGELOG, attribution and the gates marker; the manual checklist is performed after the build; the second run records the sign-off | Pre-flight PASSes with `Pre-build checks passed — build the DMG next` and prints the checklist as pending. Once a DMG exists for the version, an unacknowledged checklist FAILs |
 | Tag the release commit once the DMG builds and verifies, before the store upload: `git tag v<version> && git push origin v<version>`. The tag is the durable record of what shipped, once `release/` is cleaned and DMGs are rebuilt. Tagging after the build, not before, keeps a tag off a version that failed notarization or was abandoned | `verify-ready --release` prints the command at pre-flight and **refuses to record the sign-off** for an untagged release; the developer creates the tag, as with commits |
+| Help pages are the help site session's work, never the app session's. The app's release reads the pages' own record (`verifiedVersion` at the app's minor, no source in the app repo changed after `lastVerified`, the help site's drift rule). Behind: the app session prints a hand-off for the developer to paste into a help site session; that session captures the screenshots, re-checks the pages, the developer commits, and `policy help-handback <app>` prints the message to paste back into the app session. The marketing drafts follow the hand-back, since they use the screenshots | `verify-ready --release` FAILs with the hand-off while pages pend and refuses the sign-off; the PreToolUse hook denies the capture script from any session but the help site's (`registry.json` `helpProject`); `help-handback` refuses while a page pends or the app's pages and screenshots are uncommitted |
 | Marketing site (version.json, changelog, listing) + release marketing drafts | Human judgment — release isn't complete until the site reflects it |
 
 ### Phase 8 — Maintenance & improvement
@@ -148,13 +148,15 @@ Root commit exception: CodeRabbit cannot review before HEAD exists, so the initi
 | Step | Enforced by |
 |---|---|
 | Dependency health: outdated, audit, a Socket score due for risk-flagged packages (dormant, deprecated, archived, under 1,000 weekly downloads) | `policy health`; `check` flags every session once >30 days overdue |
+| Every project is measured on a timeline, opened or not; retired projects are marked archived rather than failing forever | `policy health --all` sweeps every sibling project and records `.policy/health-sweep.json`; the launchd job from `setup-machine` runs it on the 1st of each month (`doctor` checks it is loaded); the policy repo's `check` WARNs on a stale sweep or failing projects; `"policy": {"archived": true}` skips maintenance checks and the sweep |
+| Dependencies refreshed before feature work, advisories a patch bump clears fixed the same day, Dependabot kept below its cap | `check` runs a cached daily probe: drift past the limit AND the window FAILs (blocks gates), either alone WARNs; fixable high/critical advisories WARN with `npm audit fix`; superseded Dependabot PRs WARN with the `gh pr close` command, and the open-PR cap WARNs |
 | Homebrew installs verify bottle attestations, refuse insecure redirects and require cask checksums | `~/.homebrew/brew.env` written by `setup-machine`; `doctor` FAILs a missing setting, `HOMEBREW_NO_VERIFY_ATTESTATIONS`, or a signed-out `gh`; PreToolUse refuses `brew install`/`upgrade`/`reinstall`/`bundle` while attestation checks are off |
 | Tooling currency: model IDs, action versions, tool choices re-verified on schedule | `registry.json` verified-dates; `check`/`health` flag stale entries — then web-search, update, propagate; `check` WARNs per project on AI model IDs that drift from the registry |
 | Claude responses read by content-block type, so a thinking-by-default model cannot break parsing | `check` FAILs `content[0].text` in a project that names a thinking-by-default model (Sonnet 5, Opus 5/5.5, Fable, Mythos) and WARNs on it anywhere else |
 | Thinking is turned off the way the model allows, so a smart-tier move cannot turn a quick task into a 400 | `check` FAILs `thinking: {type: 'disabled'}` in a project that names Sonnet 5.5, Opus 5.5, Fable or Mythos, and WARNs on it anywhere else (project-standards § AI Integration) |
 | Allowlist entries are re-verified on schedule (180 days, 90 for security-sensitive packages) | `deps:check` FAILs an entry past its window, in the fast gate and pre-commit |
 | The enforcement code is held to the policy: tested, security-reviewed, and its changelog closes every version | `check` on build-policy runs `tests/` (Node's built-in runner), FAILs a `scripts/`, `machine/` or `templates/` change without a `security-ack` bound to it, and FAILs when the CHANGELOG top section is not the current policy version. All three bind through the Stop hook and the policy repo's pre-commit |
-| Dependabot PRs: minor/patch only, signatures verified and any new direct package Socket-scored before merge | `dependabot-reviewer` agent per branch; allowlist gate passes version-only bumps |
+| Dependabot PRs: superseded ones closed, wanted-but-behind ones rebased by comment, the rest minor/patch only, signatures verified and any new direct package Socket-scored before merge | `dependabot-reviewer` agent per branch closes or rebases before reviewing; allowlist gate passes version-only bumps |
 | GitHub issues triage; Cloudflare PRs/alerts for cloud apps | Human judgment + AI assistance |
 | **Improvement loop:** when anything escapes — a user-reported bug, a regression, you catching yourself re-prompting — ask *"which check should have caught this?"* and add it to `policy.js`, a test, or a hook | Human judgment; the policy repo's git history is the record of the control system learning |
 | Cross-project learning: one project's fix becomes the shared template/standard | Template drift detection — every project self-reports divergence at session start |

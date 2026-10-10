@@ -28,7 +28,10 @@
  *   verify-ready [dir]  Confirm gates marker matches current diff + changelog updated
  *                         --release      add release checks (version, attribution, checklist)
  *                         --ack-manual   record that manual release checks were performed
+ *   help-handback <app> From the help site project: confirm an app's help pages are current
+ *                         and committed, then print the message to paste into the app session
  *   health [dir]        Maintenance run: outdated, audit, registry staleness; records timestamp
+ *                         --all      every sibling project in turn (the monthly launchd job runs this)
  *                         --socket   include a Socket supply-chain scan (uses quota)
  *   upgrade <pkg>       Ground a MAJOR dependency upgrade: pull real peer-dep constraints
  *                         + migration source from npm, scaffold a decision record under
@@ -48,6 +51,7 @@
  *   hook-stop           Stop hook: block turn-end if source changed without CHANGELOG entry
  *                         or without a full-gates pass on the current tree
  *   hook-pretool        PreToolUse hook: block electron:build on a dirty tree;
+ *                         deny docs:capture outside the help site session;
  *                         redirect raw `semgrep scan` to `npm run sast`;
  *                         nudge search/survey commands toward delegation
  *   hook-posttool       PostToolUse/PostToolUseFailure hook: when a DMG build's
@@ -354,6 +358,16 @@ function currentHead(dir) {
 // pre-commit hook allows it", but only `gates` said so, at the end of the work.
 function repoHasNoCommits(dir) {
   return !!sh('git rev-parse --is-inside-work-tree', dir).ok && !currentHead(dir);
+}
+/** The checked-out branch when it is not the trunk, else null. Work and
+ *  releases happen on main: the standard once described feature branches and
+ *  PRs, a practice never adopted for the solo apps, and a session that read it
+ *  branched an app and then could not build. Detached HEAD reports as 'HEAD'. */
+function offTrunkBranch(dir) {
+  const r = sh('git rev-parse --abbrev-ref HEAD', dir);
+  if (!r.ok) return null;
+  const branch = r.out.trim();
+  return branch && branch !== 'main' && branch !== 'master' ? branch : null;
 }
 const ROOT_COMMIT_HINT =
   'the developer makes the root commit before any feature work (the pre-commit hook allows it): git add -A && git commit -m "initial scaffold"';
@@ -2641,6 +2655,7 @@ function cmdCheck(dir, flags = []) {
   if (path.resolve(dir) === POLICY_ROOT) {
     auditPolicyRepo(POLICY_ROOT);
     checkStaleness(dir, reg);
+    reportHealthSweep(reg);
     return finish();
   }
 
@@ -3249,6 +3264,10 @@ function cmdCheck(dir, flags = []) {
 }
 
 function checkStaleness(dir, reg) {
+  if (isArchived(dir)) {
+    ok('Archived project (package.json policy.archived): maintenance checks skipped');
+    return;
+  }
   const state = loadState(dir);
   // Enforce the verdict health recorded, at no cost here. This is the half that
   // makes staleness bite: health does the network work and writes what it
@@ -3281,34 +3300,62 @@ function checkStaleness(dir, reg) {
     );
   }
 
-  // Dependency drift inside the declared ranges. Warns rather than fails: a
-  // routine refresh should not block unrelated work. Visible every session so
-  // it cannot accumulate quietly — Dependabot raises one PR per package, and
-  // those queue faster than they get merged.
-  // `npm outdated` is a network call taking seconds, and this runs inside the
-  // SessionStart hook's 10s budget — so the result is cached and re-measured at
-  // most once a day. Offline, the probe simply fails and reports nothing rather
-  // than stalling the session.
+  // Dependency drift inside the declared ranges, advisories a patch bump
+  // clears, and open Dependabot PRs: one cached daily probe (sessionRefresh).
+  // Drift over the package limit OR past the refresh window is a WARN; both
+  // together is a FAIL, which blocks gates, so the standards' "refresh before
+  // feature work, not in the middle of it" is a check rather than a sentence.
+  // It was a WARN on both conditions, and across the projects 24 had never
+  // refreshed and one sat at 31 packages behind on the day this was written.
   if (exists(path.join(dir, 'package.json'))) {
     const driftLimit = (reg.staleness && reg.staleness.depsDriftPackages) || 10;
     const refreshDays = (reg.staleness && reg.staleness.depsRefreshDays) || 30;
     const daysStale = state.lastDepsUpdate ? daysSince(state.lastDepsUpdate) : null;
-    if (daysStale === null || daysStale > refreshDays) {
-      const probeAgeHours = state.lastDriftProbe
-        ? (Date.now() - Date.parse(state.lastDriftProbe)) / 3600000
-        : Infinity;
-      let drift = state.driftCount;
-      if (probeAgeHours > 24) {
-        drift = outdatedSplit(dir).inRange.length;
-        state.lastDriftProbe = new Date().toISOString();
-        state.driftCount = drift;
-        saveState(dir, state);
-      }
-      if (drift > driftLimit) {
+    const refresh = sessionRefresh(dir, state);
+    const drift = refresh.driftCount || 0;
+    const overLimit = drift > driftLimit;
+    const overAge = drift > 0 && (daysStale === null || daysStale > refreshDays);
+    const ageText = daysStale === null ? 'never refreshed here' : `last refresh ${daysStale} days ago`;
+    if (overLimit && overAge) {
+      fail(
+        `${drift} dependencies behind their allowed range (${ageText}) — refresh before feature work: ` +
+          `policy deps-update, then gates`,
+      );
+    } else if (overLimit || (overAge && daysStale !== null)) {
+      warn(`${drift} dependencies behind their allowed range (${ageText}) — run: policy deps-update`);
+    }
+
+    if (refresh.fixable && refresh.fixable.length) {
+      const names = refresh.fixable.map((f) => `${f.name} (${f.severity})`);
+      warn(
+        `${refresh.fixable.length} high/critical advisor${refresh.fixable.length === 1 ? 'y' : 'ies'} with an in-range fix: ` +
+          `${names.slice(0, 5).join(', ')}${names.length > 5 ? ', …' : ''} — run: npm audit fix, then gates`,
+      );
+    }
+
+    const prs = refresh.prs;
+    if (prs) {
+      if (prs.superseded.length) {
+        const list = prs.superseded
+          .slice(0, 4)
+          .map((p) => `#${p.number} ${p.name} ${p.to} (installed ${p.installed})`)
+          .join(', ');
         warn(
-          `${drift} dependencies behind their allowed range` +
-            (daysStale === null ? '' : ` (last refresh ${daysStale} days ago)`) +
-            ` — run: policy deps-update`,
+          `${prs.superseded.length} open Dependabot PR(s) already superseded by the lockfile: ${list}` +
+            `${prs.superseded.length > 4 ? ', …' : ''} — close them: ` +
+            `gh pr close ${prs.superseded.map((p) => p.number).join(' ')} --comment "Superseded by a local dependency refresh on main"`,
+        );
+      }
+      if (prs.open.length) {
+        warn(
+          `${prs.open.length} open Dependabot PR(s) awaiting review (#${prs.open.map((p) => p.number).join(', #')}) — ` +
+            `launch the dependabot-reviewer agent per branch`,
+        );
+      }
+      const total = prs.superseded.length + prs.open.length;
+      if (total >= prs.limit) {
+        warn(
+          `Dependabot is at its open-PR cap (${total} of ${prs.limit}): it raises nothing new, security PRs included, until these clear`,
         );
       }
     }
@@ -3410,8 +3457,12 @@ const GATE_ORDER = [
   // an hour. Skipped only when there ARE changes and none of them are source: a
   // clean tree still runs the gate, so the review_skipped FAIL below keeps
   // catching already-committed work that was never reviewed. Force it back on
-  // with `gates --with-review`.
-  { name: 'CodeRabbit review', script: 'review', whenSourceChanges: true },
+  // with `gates --with-review`. The gate itself sits LAST (after Flow tests
+  // below): a review spent before a build or test failure is a review spent
+  // on code about to change, and the rerun spends another on the same diff.
+  // Running it after everything else means a failing build costs no review,
+  // and a pass is written to .policy/review.json the moment it happens so a
+  // later failure in the same run cannot throw it away either.
   { name: 'Build', script: 'build' },
   { name: 'Unit tests', script: 'test:unit' },
   { name: 'Smoke tests', script: 'test:smoke' },
@@ -3423,7 +3474,9 @@ const GATE_ORDER = [
   // pre-commit subset. The script rebuilds before running, which repeats the
   // Build gate's work; accepted, it costs seconds.
   { name: 'Flow tests', script: 'test:flows' },
+  { name: 'CodeRabbit review', script: 'review', whenSourceChanges: true },
 ];
+const REVIEW_RECORD = path.join('.policy', 'review.json');
 
 /**
  * Run the compliance audit in-process and return its FAIL lines.
@@ -3478,16 +3531,7 @@ function complianceFailures(dir) {
  */
 function cmdCheckAll() {
   const parent = path.dirname(POLICY_ROOT);
-  const isProject = (d) =>
-    ['package.json', 'AGENTS.md', '.github/workflows/ci.yml', 'CLAUDE.md'].some((f) =>
-      exists(path.join(d, f)),
-    );
-  const dirs = fs
-    .readdirSync(parent, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && !e.name.startsWith('.') && e.name !== 'build-policy-public')
-    .map((e) => path.join(parent, e.name))
-    .filter((d) => d === POLICY_ROOT || isProject(d))
-    .sort();
+  const dirs = siblingProjects();
   section(`Compliance across ${dirs.length} projects in ${parent}`);
   const rows = dirs.map((d) => ({ name: path.basename(d), ...complianceSummary(d) }));
   const w = Math.max(...rows.map((r) => r.name.length), 7);
@@ -3677,13 +3721,20 @@ function cmdGates(dir, flags) {
   // Only carries forward a review that actually happened: the previous marker
   // must record the gate AND the source must be byte-identical. Anything else
   // re-runs it, so this can shorten the path but never skip a first review.
+  // The marker is written only when every gate passes, so a review that passed
+  // and was followed by a failing gate used to leave no trace, and the rerun
+  // spent a second review on byte-identical source. The review gate now writes
+  // .policy/review.json as soon as it passes; that record counts the same as a
+  // marker, under the same byte-identical condition.
+  const reviewRecord = readJSON(path.join(dir, REVIEW_RECORD));
   const alreadyReviewed =
     !withReview &&
     srcHash !== null &&
-    prevMarker &&
-    prevMarker.reviewedSourceHash === srcHash &&
-    Array.isArray(prevMarker.gates) &&
-    prevMarker.gates.includes('CodeRabbit review');
+    ((prevMarker &&
+      prevMarker.reviewedSourceHash === srcHash &&
+      Array.isArray(prevMarker.gates) &&
+      prevMarker.gates.includes('CodeRabbit review')) ||
+      (reviewRecord && reviewRecord.reviewedSourceHash === srcHash));
   // Committed since a reviewed pass with no source among it (a lockfile fix):
   // the review still describes every line of source, so it carries forward.
   // Without this the new marker would record no review and verify-ready
@@ -3856,6 +3907,18 @@ function cmdGates(dir, flags) {
     if (r.ok && !reviewSkipped) {
       console.log(`${GREEN}pass${RESET} ${DIM}${secs}s${RESET}`);
       report.push({ gate: g.name, pass: true });
+      // Keep the review the moment it passes (see alreadyReviewed above).
+      if (g.script === 'review' && srcHash !== null) {
+        fs.mkdirSync(path.join(dir, '.policy'), { recursive: true });
+        fs.writeFileSync(
+          path.join(dir, REVIEW_RECORD),
+          JSON.stringify(
+            { reviewedSourceHash: srcHash, head: currentHead(dir), timestamp: new Date().toISOString() },
+            null,
+            2,
+          ) + '\n',
+        );
+      }
     } else if (reviewSkipped) {
       console.log(`${RED}FAIL${RESET} ${DIM}${secs}s${RESET}\n`);
       console.log(
@@ -4058,6 +4121,17 @@ function cmdVerifyReady(dir, flags) {
     return finish();
   }
 
+  // 0. Releases are built from main. A branch is not where a shipped version
+  // comes from, and the DMG build hook refuses one for the same reason.
+  if (release) {
+    const branch = offTrunkBranch(dir);
+    if (branch)
+      fail(
+        `On branch '${branch}' — releases are built from main (project-standards § Git Workflow). Merge or fast-forward main and release from there`,
+      );
+    else ok('On main');
+  }
+
   // 1. Gates marker matches the current diff
   const marker = readJSON(path.join(dir, '.policy', 'gates.json'));
   if (!marker) fail(`No gates marker — run 'policy gates' first`);
@@ -4199,6 +4273,217 @@ const RELEASE_CHECKLISTS = {
     'If the project is published (site, npm, GitHub release): listing and changelog updated',
   ],
 };
+
+// ------------------------------------------------------------ help pages
+
+/**
+ * Front matter of a help page: just the fields the hand-back needs (app,
+ * verifiedVersion, lastVerified, sources). Mirrors the help site's own drift
+ * check, which stays the authority for the whole site; this reads one app's
+ * pages from the app's side.
+ */
+function helpPageFrontMatter(file) {
+  const match = readFile(file).match(/^---\n([\s\S]*?)\n---/);
+  if (!match) return {};
+  const data = {};
+  let list = null;
+  for (const line of match[1].split('\n')) {
+    const item = line.match(/^\s+-\s+(.+)$/);
+    if (list && item) {
+      data[list].push(item[1].trim());
+      continue;
+    }
+    list = null;
+    const field = line.match(/^(\w+):\s*(.*)$/);
+    if (!field) continue;
+    const [, key, value] = field;
+    if (value === '') {
+      data[key] = [];
+      list = key;
+    } else data[key] = value.trim() === '[]' ? [] : value.trim();
+  }
+  return data;
+}
+
+function minorOf(version) {
+  const [major, minor] = String(version || '0.0').split('.').map(Number);
+  return (major || 0) * 1000 + (minor || 0);
+}
+
+/**
+ * The help site project beside this one, named by registry.json `helpProject`
+ * (so the mirrored script names no folder). Null when the registry names none
+ * or the folder is not beside the project.
+ */
+function helpSiteDir(dir, helpProject = loadRegistry().helpProject) {
+  if (!helpProject) return null;
+  const candidate = path.join(path.dirname(path.resolve(dir)), helpProject);
+  return exists(path.join(candidate, 'package.json')) ? candidate : null;
+}
+
+/**
+ * Where an app's help pages stand against the app's current version.
+ *
+ * Help pages and screenshots are the help site session's work (that session
+ * owns the flows and fixtures in the app repos too). The app session used to
+ * carry a checklist step telling it to capture screenshots and re-check the
+ * help pages itself, which pulled that work into the wrong session. Now the
+ * app's release reads the pages' own record: a page is current when its
+ * verifiedVersion is at the app's minor and none of its sources in this repo
+ * changed after lastVerified, the same rule the help site's drift check
+ * applies. Pages for the app are matched by their `app` slug (the folder or
+ * package name) or by a source path under this repo's folder, since a product
+ * slug can differ from the repo folder.
+ *
+ * Returns null when no help site is beside the project; otherwise
+ * { helpDir, pages, pending: [reasons], verified: [versions] }.
+ */
+function helpPagesStatus(dir, opts = {}) {
+  const helpDir = opts.helpDir || helpSiteDir(dir, opts.helpProject);
+  if (!helpDir) return null;
+  const docs = path.join(helpDir, 'src', 'content', 'docs');
+  if (!exists(docs)) return { helpDir, pages: [], pending: [], verified: [] };
+  const folder = path.basename(path.resolve(dir));
+  const pkg = readJSON(path.join(dir, 'package.json')) || {};
+  const current = pkg.version || '0.0.0';
+  const walk = (d) =>
+    fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) return walk(p);
+      return /\.mdx?$/.test(e.name) ? [p] : [];
+    });
+  const pages = [];
+  const pending = [];
+  const verified = new Set();
+  for (const file of walk(docs)) {
+    const fm = helpPageFrontMatter(file);
+    const sources = Array.isArray(fm.sources) ? fm.sources : [];
+    const mine =
+      fm.app === folder ||
+      (pkg.name && fm.app === pkg.name) ||
+      sources.some((s) => s.startsWith(`${folder}/`));
+    if (!mine || fm.app === 'home') continue;
+    const page = path.relative(helpDir, file);
+    pages.push(page);
+    if (fm.verifiedVersion) verified.add(String(fm.verifiedVersion));
+    if (minorOf(current) > minorOf(fm.verifiedVersion)) {
+      pending.push(
+        `${page}: checked against ${fm.verifiedVersion || 'nothing'}, app is now ${current}`,
+      );
+    }
+    for (const source of sources) {
+      if (!source.startsWith(`${folder}/`)) continue;
+      const rel = source.slice(folder.length + 1);
+      if (!exists(path.join(dir, rel))) {
+        pending.push(`${page}: source ${source} no longer exists`);
+        continue;
+      }
+      if (!fm.lastVerified) continue;
+      const since = safeToken(String(fm.lastVerified), 'lastVerified');
+      const newer = sh(
+        `git log --format=%cs\\ %h\\ %s --since=${since}T23:59:59 -- ${safeToken(rel, 'source path')}`,
+        dir,
+      ).out;
+      if (newer) {
+        pending.push(`${page}: ${source} changed after ${fm.lastVerified} (${newer.split('\n')[0]})`);
+      }
+    }
+  }
+  return { helpDir, pages, pending, verified: [...verified] };
+}
+
+/** The prompt the developer pastes into a help site session to bring an app's pages up to date. */
+function helpHandoffMessage(dir, proj, status) {
+  const folder = path.basename(path.resolve(dir));
+  const helpProject = path.basename(status.helpDir);
+  return (
+    `Update the help pages for ${folder} ${proj.pkg.version} (${status.pending.length} page problem(s) from the app's side):\n` +
+    status.pending.map((p) => `  - ${p}`).join('\n') +
+    `\n  Capture screenshots from the app repo (npm run docs:capture in ../${folder}), re-check each flagged page against the app, ` +
+    `set verifiedVersion and lastVerified, run gates, I commit, then run\n` +
+    `  node ../build-policy/scripts/policy.js help-handback ${folder}\n` +
+    `  from ${helpProject} and give me its message to paste into the app session.`
+  );
+}
+
+/**
+ * help-handback <app>: run from the help site project once an app's pages are
+ * current and committed. Prints the message the developer pastes back into the
+ * app session, where `verify-ready --release` re-reads the same pages, so the
+ * paste is the signal and the pages are the proof. Refuses while any page is
+ * still pending or the help site's pages for the app are uncommitted, so the
+ * message can never say "ready" ahead of the work.
+ */
+function cmdHelpHandback(dir, app) {
+  const helpProject = loadRegistry().helpProject;
+  const here = path.resolve(dir);
+  section(`Help hand-back: ${app || '(no app given)'}`);
+  if (!helpProject) {
+    fail('registry.json names no helpProject, so there is no help site to hand back from');
+    return finish();
+  }
+  if (path.basename(here) !== helpProject) {
+    fail(
+      `Run this from the ${helpProject} project (the help site session), not from ${path.basename(here)}`,
+    );
+    return finish();
+  }
+  if (!app) {
+    fail('Name the app folder: policy help-handback <app>');
+    return finish();
+  }
+  const appDir = path.join(path.dirname(here), app);
+  const proj = detectProject(appDir);
+  if (!proj.pkg) {
+    fail(`No package.json at ${appDir}: the app folder must sit beside the help site`);
+    return finish();
+  }
+  const status = helpPagesStatus(appDir, { helpDir: here });
+  if (status.pages.length === 0) {
+    fail(`No help pages found for ${app} (matched by app slug or a source under ${app}/)`);
+    return finish();
+  }
+  for (const p of status.pending) fail(p);
+  // Only this app's pages and screenshot folders: another app's half-done
+  // pages in the same site are that app's hand-back, not this one's.
+  const slugs = new Set(
+    status.pages.map((p) => helpPageFrontMatter(path.join(here, p)).app).filter(Boolean),
+  );
+  const own = [
+    ...status.pages,
+    ...[...slugs].map((slug) => path.join('src', 'assets', slug)).filter((d) => exists(path.join(here, d))),
+  ];
+  const dirty = sh(
+    `git status --porcelain -- ${own.map((f) => safeToken(f, 'help path')).join(' ')}`,
+    here,
+  ).out;
+  if (dirty) {
+    fail(
+      `${dirty.split('\n').length} of ${app}'s help pages or screenshots are uncommitted. The developer commits, then re-run the hand-back:\n` +
+        dirty,
+    );
+  }
+  if (results.fail) return finish();
+  const commit = sh('git rev-parse --short HEAD', here).out || 'unknown';
+  const dates = status.pages
+    .map((p) => helpPageFrontMatter(path.join(here, p)).lastVerified)
+    .filter(Boolean)
+    .sort();
+  ok(`${status.pages.length} page(s) for ${app} are current against ${proj.pkg.version}`);
+  console.log(`\n${BOLD}Paste this into the ${app} session:${RESET}\n`);
+  console.log(helpHandbackMessage(app, proj.pkg.version, status, dates[dates.length - 1], helpProject, commit) + '\n');
+  return finish();
+}
+
+/** The message the help site session hands back to the app session. */
+function helpHandbackMessage(app, version, status, lastVerified, helpProject, commit) {
+  return (
+    `Help pages ready for ${app} ${version}: ${status.pages.length} page(s) verified against ` +
+    `${status.verified.join(', ')} (last verified ${lastVerified || 'n/a'}), pages and screenshots committed in ` +
+    `${helpProject} at ${commit}. The help step of the release checklist now passes: run ` +
+    `node ../build-policy/scripts/policy.js verify-ready --release, then prep the release marketing drafts in app-marketing.`
+  );
+}
 
 /**
  * How this project reaches its users, which decides the release checklist.
@@ -4379,17 +4664,31 @@ function verifyRelease(dir, proj, flags) {
   // version was cut from. Enforced at sign-off rather than earlier, because the
   // developer creates the tag, and only once the release is real.
   const profile = releaseProfile(proj);
-  // Apps with help pages capture their screenshots from the flow tests
-  // (docs:capture). A release is when a documented screen can change, so the
-  // capture and the help site's drift check are part of signing it off.
-  const checklist = [
-    ...RELEASE_CHECKLISTS[profile],
-    ...(proj.pkg && proj.pkg.scripts && proj.pkg.scripts['docs:capture']
-      ? [
-          "Ran npm run docs:capture, then rechecked the help pages the help site's drift check flags (npm run drift in the help site project)",
-        ]
-      : []),
-  ];
+  // Apps with help pages: the pages are the help site session's work, not this
+  // session's. The release reads the pages' own record (helpPagesStatus) and
+  // the checklist carries the hand-back as a step placed before the marketing
+  // drafts, since the drafts use the screenshots. A pending page refuses the
+  // sign-off below, and the hand-off message printed there is what the
+  // developer pastes into a help site session.
+  const help = helpPagesStatus(dir);
+  const helpPending = !!(help && help.pending.length);
+  const checklist = [...RELEASE_CHECKLISTS[profile]];
+  if (help && help.pages.length) {
+    const step = helpPending
+      ? `Help pages brought up to date in the help site session (${help.pending.length} pending; paste its hand-back message here before the marketing drafts)`
+      : `Help pages current for ${proj.pkg.version} (${help.pages.length} page(s), verified against ${help.verified.join(', ')})`;
+    const marketing = checklist.findIndex((c) => /marketing/i.test(c));
+    checklist.splice(marketing === -1 ? checklist.length : marketing, 0, step);
+  }
+  if (helpPending) {
+    fail(
+      `Help pages are behind ${proj.pkg.version} (${help.pending.length} page problem(s)). ` +
+        `Open a session in ${path.basename(help.helpDir)} and paste:`,
+    );
+    console.log(`\n${helpHandoffMessage(dir, proj, help)}\n`);
+  } else if (help && help.pages.length) {
+    ok(`Help pages current (${help.pages.length} page(s) verified against ${help.verified.join(', ')})`);
+  }
   // Only the DMG-producing profiles have an artifact to stage the checklist on.
   const buildsArtifact = profile === 'gumroad' || profile === 'none';
 
@@ -4413,6 +4712,14 @@ function verifyRelease(dir, proj, flags) {
     fail(
       `Gatekeeper rejects the ${proj.pkg.version} DMG (see above) — the ack was not recorded. ` +
         `Fix the container signing and rebuild, then re-run the sign-off.`,
+    );
+  } else if (flags.includes('--ack-manual') && helpPending) {
+    // The marketing drafts use the help screenshots and the hand-back is the
+    // step before them, so an ack over stale pages signs an order that did
+    // not happen.
+    fail(
+      `Help pages are behind ${proj.pkg.version} — the ack was not recorded. Bring them up to date in the help site session ` +
+        `(hand-off above), paste its hand-back message here, then re-run the sign-off.`,
     );
   } else if (flags.includes('--ack-manual') && !tagExists) {
     // Refuse the signature rather than record a release with no durable marker.
@@ -4491,6 +4798,144 @@ function outdatedSplit(dir) {
     // They are an install problem, not a drift problem.
     missing: entries.filter(([, v]) => !v.current),
   };
+}
+
+// ------------------------------------------------------- session refresh
+
+/** Numeric semver compare, prerelease and build tags ignored: a >= b. */
+function semverGte(a, b) {
+  const num = (v) =>
+    String(v || '0')
+      .replace(/^v/, '')
+      .split(/[-+]/)[0]
+      .split('.')
+      .map((n) => parseInt(n, 10) || 0);
+  const [x, y] = [num(a), num(b)];
+  for (let i = 0; i < 3; i++) {
+    if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0);
+  }
+  return true;
+}
+
+/**
+ * Advisories at high or critical that an in-range `npm audit fix` resolves,
+ * from `npm audit --json`. `fixAvailable: true` is npm's word for a fix inside
+ * the declared ranges; an object there names a major (or a downgrade), which
+ * goes through `policy upgrade` or waits for upstream and is not counted.
+ * Dev chain included: the `security` gate omits dev deps because they do not
+ * ship, which is right for blocking, but a patch bump that removes a critical
+ * from the build tooling is worth one line at session start.
+ */
+function fixableAdvisories(audit) {
+  const out = [];
+  for (const [name, v] of Object.entries((audit && audit.vulnerabilities) || {})) {
+    if (!/^(high|critical)$/.test(v.severity)) continue;
+    if (v.fixAvailable !== true) continue;
+    out.push({ name, severity: v.severity, direct: !!v.isDirect });
+  }
+  return out.sort((a, b) => (a.severity === b.severity ? a.name.localeCompare(b.name) : a.severity === 'critical' ? -1 : 1));
+}
+
+/** "Bump x from 1.2.3 to 1.2.4" -> { name, from, to }; null for group PRs and anything else. */
+function parseDependabotTitle(title) {
+  const m = /^(?:build\(deps(?:-dev)?\):\s*)?[Bb]ump (\S+) from (\S+) to (\S+)/.exec(title || '');
+  return m ? { name: m[1], from: m[2], to: m[3] } : null;
+}
+
+/**
+ * Sort open Dependabot PRs against the lockfile. A PR is superseded when main
+ * already holds the version it offers or a newer one, which is what a local
+ * `deps-update` leaves behind. The standards used to say those PRs close
+ * themselves; one app had ten of them open for four weeks after the refresh
+ * that superseded them, sitting at the open-PR cap so nothing new was raised.
+ */
+function supersededDependabotPrs(prs, lockPackages) {
+  const superseded = [];
+  const open = [];
+  for (const pr of prs || []) {
+    const bump = parseDependabotTitle(pr.title);
+    const installed =
+      bump && lockPackages && lockPackages[`node_modules/${bump.name}`]
+        ? lockPackages[`node_modules/${bump.name}`].version
+        : null;
+    if (bump && installed && semverGte(installed, bump.to)) {
+      superseded.push({ number: pr.number, name: bump.name, to: bump.to, installed });
+    } else open.push({ number: pr.number, title: pr.title, name: bump ? bump.name : null });
+  }
+  return { superseded, open };
+}
+
+/** The open-PR cap from .github/dependabot.yml (Dependabot's default is 5). */
+function dependabotPrLimit(dir) {
+  const m = /open-pull-requests-limit:\s*(\d+)/.exec(readFile(path.join(dir, '.github', 'dependabot.yml')));
+  return m ? parseInt(m[1], 10) : 5;
+}
+
+/**
+ * A project the developer has retired: `"policy": {"archived": true}` in
+ * package.json. Still checked for structure, never for maintenance, and left
+ * out of the health sweep. Without this, a project nobody opens fails its
+ * health check forever and the sweep's FAIL count says nothing.
+ */
+function isArchived(dir) {
+  const pkg = readJSON(path.join(dir, 'package.json'));
+  return !!(pkg && pkg.policy && pkg.policy.archived === true);
+}
+
+/** Every project beside the policy repo, the policy repo included, sorted. */
+function siblingProjects() {
+  const parent = path.dirname(POLICY_ROOT);
+  const isProject = (d) =>
+    ['package.json', 'AGENTS.md', '.github/workflows/ci.yml', 'CLAUDE.md'].some((f) =>
+      exists(path.join(d, f)),
+    );
+  return fs
+    .readdirSync(parent, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && !e.name.startsWith('.') && e.name !== 'build-policy-public')
+    .map((e) => path.join(parent, e.name))
+    .filter((d) => d === POLICY_ROOT || isProject(d))
+    .sort();
+}
+
+/**
+ * Once a day per project, measure what needs a network call: dependencies
+ * behind their range, advisories a patch bump would clear, and open
+ * Dependabot PRs. Cached in .policy/state.json because this runs inside the
+ * SessionStart hook's 10 second budget; offline, each probe fails on its own
+ * and reports nothing rather than stalling the session.
+ */
+function sessionRefresh(dir, state) {
+  const ageHours = state.lastRefreshProbe
+    ? (Date.now() - Date.parse(state.lastRefreshProbe)) / 3600000
+    : Infinity;
+  if (ageHours <= 24 && state.refresh) return state.refresh;
+  const refresh = { driftCount: outdatedSplit(dir).inRange.length, fixable: [], prs: null };
+  const audit = sh('npm audit --json', dir);
+  try {
+    refresh.fixable = fixableAdvisories(JSON.parse(audit.out));
+  } catch {
+    /* offline or non-JSON: no advisory data this time */
+  }
+  const gh = sh(
+    'gh pr list --state open --author app/dependabot --json number,title,headRefName --limit 50',
+    dir,
+  );
+  if (gh.ok) {
+    try {
+      const lock = readJSON(path.join(dir, 'package-lock.json'));
+      const sorted = supersededDependabotPrs(JSON.parse(gh.out), lock && lock.packages);
+      refresh.prs = { ...sorted, limit: dependabotPrLimit(dir) };
+    } catch {
+      /* not a GitHub repo, gh missing or not signed in: no PR data */
+    }
+  }
+  state.lastRefreshProbe = new Date().toISOString();
+  state.refresh = refresh;
+  // Kept for readers of the older fields.
+  state.lastDriftProbe = state.lastRefreshProbe;
+  state.driftCount = refresh.driftCount;
+  saveState(dir, state);
+  return refresh;
 }
 
 /**
@@ -4716,6 +5161,92 @@ function cmdHealth(dir, flags) {
   checkStaleness(dir, reg);
   console.log(`\n${DIM}Recorded health run in .policy/state.json${RESET}`);
   return finish();
+}
+
+// ----------------------------------------------------------- health sweep
+
+const HEALTH_SWEEP = path.join(POLICY_ROOT, '.policy', 'health-sweep.json');
+const SWEEP_LABEL = 'com.build-policy.health-sweep';
+
+/**
+ * `health --all`: every sibling project in turn, each in its own process so
+ * one project's failure cannot stop the sweep, with a summary written to
+ * .policy/health-sweep.json in the policy repo. The per-project health check
+ * fires only when a session opens the project, so a project nobody opens is
+ * never measured: 15 projects had never run health and 10 more were past the
+ * window when this was written. The sweep is what reaches them. It is run by
+ * the monthly launchd job that setup-machine installs, or by hand.
+ */
+function cmdHealthAll() {
+  const dirs = siblingProjects().filter((d) => d !== POLICY_ROOT);
+  section(`Health sweep across ${dirs.length} projects`);
+  const strip = (t) => t.replace(/\x1b\[[0-9;]*m/g, '');
+  const rows = [];
+  for (const d of dirs) {
+    const name = path.basename(d);
+    if (isArchived(d)) {
+      rows.push({ name, archived: true });
+      console.log(`  ${DIM}${name.padEnd(24)} archived${RESET}`);
+      continue;
+    }
+    const r = sh(`"${process.execPath}" "${__filename}" health "${d}"`, d);
+    const m = /(PASS|FAIL) — (\d+) ok, (\d+) warnings, (\d+) failures/.exec(strip(r.out));
+    const row = m
+      ? { name, pass: +m[2], warn: +m[3], fail: +m[4] }
+      : { name, pass: 0, warn: 0, fail: 1, error: strip(r.out).split('\n').slice(-3).join(' ').slice(0, 200) };
+    row.fails = strip(r.out)
+      .split('\n')
+      .filter((l) => /^\s*✗ /.test(l))
+      .map((l) => l.replace(/^\s*✗ /, '').slice(0, 160));
+    rows.push(row);
+    console.log(
+      `  ${row.fail ? RED : GREEN}${name.padEnd(24)}${RESET} ${String(row.pass).padStart(3)} ok ${String(row.warn).padStart(3)} warn ${String(row.fail).padStart(3)} fail`,
+    );
+  }
+  fs.mkdirSync(path.dirname(HEALTH_SWEEP), { recursive: true });
+  fs.writeFileSync(HEALTH_SWEEP, JSON.stringify({ time: new Date().toISOString(), rows }, null, 2) + '\n');
+  const failing = rows.filter((r) => r.fail);
+  for (const r of failing) {
+    console.log(`\n${BOLD}${r.name}${RESET}`);
+    for (const l of r.fails) console.log(`  ${RED}✗${RESET} ${l}`);
+    if (r.error) console.log(`  ${RED}✗${RESET} ${r.error}`);
+  }
+  const archived = rows.filter((r) => r.archived).length;
+  console.log(
+    `\n${BOLD}${failing.length ? RED + 'FAIL' : GREEN + 'PASS'}${RESET} — ${rows.length - failing.length - archived} of ${rows.length - archived} projects pass` +
+      `${archived ? `, ${archived} archived` : ''}; recorded in ${path.relative(POLICY_ROOT, HEALTH_SWEEP)}\n`,
+  );
+  process.exit(failing.length ? 1 : 0);
+}
+
+/** In the policy repo's own check: when the sweep last ran and what it found. */
+function reportHealthSweep(reg) {
+  const sweep = readJSON(HEALTH_SWEEP);
+  const windowDays = ((reg.staleness && reg.staleness.healthRunDays) || 30) + 7;
+  if (!sweep || !sweep.time) {
+    warn('No health sweep recorded — run: policy health --all (setup-machine installs the monthly launchd job)');
+    return;
+  }
+  const days = daysSince(sweep.time);
+  const failing = (sweep.rows || []).filter((r) => r.fail);
+  if (days > windowDays) {
+    warn(`Health sweep ${days} days old — the launchd job is not running (policy doctor), or run: policy health --all`);
+  } else if (failing.length) {
+    warn(
+      `Health sweep ${days} days ago: ${failing.length} project(s) failing — ${failing
+        .slice(0, 8)
+        .map((r) => r.name)
+        .join(', ')}${failing.length > 8 ? ', …' : ''}`,
+    );
+  } else ok(`Health sweep ${days} days ago: every project passed`);
+}
+
+/** The launchd agent that runs the sweep monthly, from machine/health-sweep.plist. */
+function sweepPlistPath() {
+  return path.join(os.homedir(), 'Library', 'LaunchAgents', `${SWEEP_LABEL}.plist`);
+}
+function sweepLoaded() {
+  return sh(`launchctl print gui/${process.getuid()}/${SWEEP_LABEL}`, os.homedir()).ok;
 }
 
 // ---------------------------------------------------------------- scaffold
@@ -5026,7 +5557,11 @@ function cmdSyncTemplates(dir) {
     fs.mkdirSync(path.dirname(destPath), { recursive: true });
     fs.writeFileSync(destPath, next);
     try {
-      fs.chmodSync(destPath, fs.statSync(path.join(TEMPLATES, tpl)).mode);
+      // The hook must stay executable or git silently skips it (found 2026-10-10 in
+      // one app: the template was 644 and the sync turned a 755 hook into 644).
+      const mode =
+        dest === '.husky/pre-commit' ? 0o755 : fs.statSync(path.join(TEMPLATES, tpl)).mode;
+      fs.chmodSync(destPath, mode);
     } catch {
       /* mode is cosmetic for non-executables */
     }
@@ -5557,6 +6092,20 @@ function cmdDoctor() {
       'Claude Code hooks configured in ~/.claude/settings.json (every canonical event and matcher)',
     );
 
+  if (process.platform === 'darwin') {
+    if (!exists(sweepPlistPath())) warn(`Monthly health sweep not installed (${SWEEP_LABEL}) — run: policy setup-machine`);
+    else if (!sweepLoaded()) warn(`Monthly health sweep written but not loaded in launchd — run: policy setup-machine`);
+    else {
+      // The plist pins the node binary that ran setup-machine (under nvm, a
+      // versioned path), so a Node upgrade leaves the job pointing at nothing
+      // and launchd reports it loaded all the same.
+      const prog = /<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]+)<\/string>/.exec(readFile(sweepPlistPath()));
+      if (prog && !exists(prog[1]))
+        warn(`Monthly health sweep points at ${prog[1]}, which no longer exists — run: policy setup-machine`);
+      else ok(`Monthly health sweep scheduled (${SWEEP_LABEL})`);
+    }
+  }
+
   const agentsDir = path.join(os.homedir(), '.claude', 'agents');
   const agents = exists(agentsDir)
     ? fs.readdirSync(agentsDir).filter((f) => f.endsWith('.md'))
@@ -5636,6 +6185,34 @@ function cmdSetupMachine() {
     fs.copyFileSync(path.join(agentsSrc, f), path.join(agentsDest, f));
   }
   ok(`Installed agents to ${agentsDest}`);
+
+  // 2b. Monthly health sweep. A user launch agent, with the node that runs
+  // this command and a PATH that reaches npm, git and gh: launchd starts jobs
+  // with almost no environment. StartCalendarInterval jobs missed while the
+  // Mac slept run at the next wake.
+  if (process.platform === 'darwin') {
+    const log = path.join(POLICY_ROOT, '.policy', 'health-sweep.log');
+    fs.mkdirSync(path.dirname(log), { recursive: true });
+    const plist = readFile(path.join(MACHINE, 'health-sweep.plist'))
+      .replace(/__LABEL__/g, SWEEP_LABEL)
+      .replace(/__NODE__/g, process.execPath)
+      .replace(/__POLICY__/g, __filename)
+      .replace(/__LOG__/g, log)
+      .replace(
+        /__PATH__/g,
+        [path.dirname(process.execPath), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin']
+          .filter((p, i, a) => a.indexOf(p) === i)
+          .join(':'),
+      );
+    const dest = sweepPlistPath();
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, plist);
+    const domain = `gui/${process.getuid()}`;
+    sh(`launchctl bootout ${domain} "${dest}"`, os.homedir());
+    const load = sh(`launchctl bootstrap ${domain} "${dest}"`, os.homedir());
+    if (load.ok || sweepLoaded()) ok(`Installed monthly health sweep (${SWEEP_LABEL}, 1st of the month 09:00)`);
+    else warn(`Wrote ${dest} but launchctl did not load it: ${load.out.slice(0, 200)}`);
+  }
 
   // 3. build-policy pre-commit guard. This repo has no package.json/Husky gate,
   // so the native hook runs the policy repo checks that matter before commit.
@@ -5741,6 +6318,13 @@ function cmdSetupMachine() {
 // guard is worth.
 const BUILD_INVOCATION =
   /(?:^|[;&|(]|&&|\|\||\bnpm\s+run\s+|\bnpx\s+|\byarn\s+|\bpnpm\s+(?:run\s+)?)\s*(?:electron:build\b|electron-builder\b)/;
+
+// The capture script invoked through a package manager. Unlike the DMG build,
+// which is also a binary on PATH, an npm script runs only through npm, yarn or
+// pnpm, so the bare-word positions BUILD_INVOCATION accepts would only ever
+// match a grep or an echo that names it (and did, twice, on the day it landed).
+const HELP_CAPTURE_INVOCATION =
+  /\b(?:npm\s+(?:--prefix\s+\S+\s+)?run|yarn|pnpm(?:\s+run)?)\s+docs:capture\b/;
 
 function readStdinJSON() {
   try {
@@ -6513,6 +7097,29 @@ function cmdHookPretool() {
     );
     process.exit(0);
   }
+  // Screenshot capture belongs to the help site session (it owns the pages,
+  // flows and fixtures). An app session that runs it is doing the other
+  // session's work, and the result lands in a help site nobody is editing.
+  if (input.tool_name === 'Bash' && HELP_CAPTURE_INVOCATION.test(cmd)) {
+    const helpProject = loadRegistry().helpProject;
+    const here = path.basename(path.resolve(input.cwd || process.cwd()));
+    if (helpProject && here !== helpProject) {
+      console.log(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason:
+              `BUILD-POLICY: help screenshots and pages are the ${helpProject} session's work, not this session's. ` +
+              'Do not run docs:capture here. Run `node ../build-policy/scripts/policy.js verify-ready --release`: it prints the ' +
+              `hand-off for the developer to paste into a ${helpProject} session, and that session hands back a message ` +
+              'to paste here when the pages are current. Then the marketing drafts follow.',
+          },
+        }),
+      );
+      process.exit(0);
+    }
+  }
   if (input.tool_name === 'Bash' && BUILD_INVOCATION.test(cmd)) {
     const dir = process.cwd();
     const deny = (reason) => {
@@ -6533,6 +7140,13 @@ function cmdHookPretool() {
         'BUILD-POLICY: never build a DMG with uncommitted changes. ' +
           'The build order is gates -> review -> developer commits -> THEN build. ' +
           'Commit (developer) or stash first, then rebuild.',
+      );
+    }
+    const branch = offTrunkBranch(dir);
+    if (branch) {
+      deny(
+        `BUILD-POLICY: never build a DMG from branch '${branch}'. Work and releases happen on main ` +
+          '(project-standards § Git Workflow). Switch to main, bring the commits over, then rebuild.',
       );
     }
     // Version consistency: the DMG bakes in package.json's version — building
@@ -6877,8 +7491,10 @@ function main() {
       return cmdVerifyReady(dir, flags);
     case 'security-ack':
       return cmdSecurityAck(dir);
+    case 'help-handback':
+      return cmdHelpHandback('.', rest.find((a) => !a.startsWith('--')));
     case 'health':
-      return cmdHealth(dir, flags);
+      return flags.includes('--all') ? cmdHealthAll() : cmdHealth(dir, flags);
     case 'deps-update':
       return cmdDepsUpdate(dir);
     case 'upgrade':
@@ -6939,6 +7555,18 @@ module.exports = {
   TEMPLATE_SYNC_HINT,
   secretScriptSyncs,
   repoHasNoCommits,
+  offTrunkBranch,
+  semverGte,
+  fixableAdvisories,
+  parseDependabotTitle,
+  supersededDependabotPrs,
+  dependabotPrLimit,
+  isArchived,
+  helpPageFrontMatter,
+  helpPagesStatus,
+  helpHandoffMessage,
+  helpHandbackMessage,
+  HELP_CAPTURE_INVOCATION,
   auditProjectId,
   auditEntryHash,
   auditExceptionApproved,

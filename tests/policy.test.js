@@ -357,6 +357,29 @@ test('secretScriptSyncs: rewrites a drifted or missing secret-scan script, leave
   assert.deepEqual(policy.secretScriptSyncs(undefined), { secrets: std.secrets, 'secrets:staged': std['secrets:staged'] });
 });
 
+test('GATE_ORDER: the CodeRabbit review is the last gate, after build and every test tier', () => {
+  const { GATE_ORDER } = policy;
+  const scripts = GATE_ORDER.map((g) => g.script);
+  assert.equal(scripts[scripts.length - 1], 'review');
+  for (const s of ['build', 'test:unit', 'test:smoke', 'test:integration', 'test:flows'])
+    assert.ok(scripts.indexOf(s) < scripts.indexOf('review'), `${s} runs before the review`);
+});
+
+test('offTrunkBranch: null on main or master or outside git, the branch name otherwise', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-branch-'));
+  assert.equal(policy.offTrunkBranch(dir), null);
+  const git = (args) =>
+    require('child_process').execSync(`git ${args}`, { cwd: dir, stdio: 'pipe' }).toString();
+  git('init -q -b main');
+  git('-c user.email=t -c user.name=t commit -q --allow-empty -m root');
+  assert.equal(policy.offTrunkBranch(dir), null);
+  git('switch -q -c dev-fonts');
+  assert.equal(policy.offTrunkBranch(dir), 'dev-fonts');
+  git('switch -q -c master');
+  assert.equal(policy.offTrunkBranch(dir), null);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('repoHasNoCommits: true after git init, false after the root commit, false outside git', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-root-'));
   const git = (args) => require('child_process').execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
@@ -442,4 +465,149 @@ test('every message that hands the developer the approve command names --confirm
   assert.ok(sites.length >= 3, `expected the check, Stop hook and first-step sites, found ${sites.length}`);
   for (const s of sites) assert.match(s, /--confirm/, s);
   assert.match(src, /approve-exception <GHSA-id> --confirm/);
+});
+
+test('helpPagesStatus: pages are read from the app side by slug or source, pending by minor or newer source', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-help-'));
+  const app = path.join(parent, 'app-one');
+  const help = path.join(parent, 'helpsite');
+  const docs = path.join(help, 'src', 'content', 'docs', 'product');
+  fs.mkdirSync(path.join(app, 'src'), { recursive: true });
+  fs.mkdirSync(docs, { recursive: true });
+  fs.writeFileSync(path.join(help, 'package.json'), '{"name":"helpsite"}');
+  fs.writeFileSync(path.join(app, 'package.json'), '{"name":"app-one","version":"2.1.0"}');
+  fs.writeFileSync(path.join(app, 'src', 'App.tsx'), 'export {}');
+  const git = (args) =>
+    require('child_process').execFileSync('git', args, { cwd: app, stdio: 'ignore' });
+  git(['init', '-q', '-b', 'main']);
+  git(['add', '.']);
+  git(['-c', 'user.name=t', '-c', 'user.email=t@localhost', 'commit', '-q', '-m', 'root']);
+  // Local date, as git's %cs prints it: the UTC date can be a day behind.
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const page = (name, fm) =>
+    fs.writeFileSync(path.join(docs, name), `---\n${fm}\n---\n# ${name}\n`);
+  // Matched by a source path under the repo folder; the slug differs from the folder.
+  page(
+    'current.mdx',
+    `app: product\nverifiedVersion: 2.1.0\nlastVerified: ${today}\nsources:\n  - app-one/src/App.tsx`,
+  );
+  page('old-minor.mdx', `app: app-one\nverifiedVersion: 2.0.4\nlastVerified: ${today}\nsources: []`);
+  page(
+    'stale-source.mdx',
+    `app: app-one\nverifiedVersion: 2.1.0\nlastVerified: 2020-01-01\nsources:\n  - app-one/src/App.tsx`,
+  );
+  page(
+    'gone-source.mdx',
+    `app: app-one\nverifiedVersion: 2.1.0\nlastVerified: ${today}\nsources:\n  - app-one/src/Gone.tsx`,
+  );
+  page(
+    'other-app.mdx',
+    `app: other\nverifiedVersion: 1.0.0\nlastVerified: ${today}\nsources:\n  - other/src/App.tsx`,
+  );
+
+  const fm = policy.helpPageFrontMatter(path.join(docs, 'current.mdx'));
+  assert.deepEqual(fm, {
+    app: 'product',
+    verifiedVersion: '2.1.0',
+    lastVerified: today,
+    sources: ['app-one/src/App.tsx'],
+  });
+
+  assert.equal(policy.helpPagesStatus(app, { helpProject: 'missing' }), null);
+  const s = policy.helpPagesStatus(app, { helpProject: 'helpsite' });
+  assert.equal(s.pages.length, 4, s.pages.join(','));
+  assert.deepEqual(s.verified.sort(), ['2.0.4', '2.1.0']);
+  assert.equal(s.pending.length, 3, s.pending.join('\n'));
+  const pending = s.pending.join('\n');
+  assert.match(pending, /old-minor\.mdx: checked against 2\.0\.4, app is now 2\.1\.0/);
+  assert.match(pending, /stale-source\.mdx: app-one\/src\/App\.tsx changed after 2020-01-01/);
+  assert.match(pending, /gone-source\.mdx: source app-one\/src\/Gone\.tsx no longer exists/);
+
+  const handoff = policy.helpHandoffMessage(app, { pkg: { version: '2.1.0' } }, s);
+  assert.match(handoff, /help-handback app-one/);
+  assert.match(handoff, /docs:capture in \.\.\/app-one/);
+  const back = policy.helpHandbackMessage('app-one', '2.1.0', s, today, 'helpsite', 'abc1234');
+  assert.match(back, /^Help pages ready for app-one 2\.1\.0/);
+  assert.match(back, /verify-ready --release, then prep the release marketing drafts/);
+  fs.rmSync(parent, { recursive: true, force: true });
+});
+
+test('HELP_CAPTURE_INVOCATION: a capture as a command word, not a mention', () => {
+  const re = policy.HELP_CAPTURE_INVOCATION;
+  for (const cmd of [
+    'npm run docs:capture',
+    'cd ../app-one && npm run docs:capture',
+    'npm --prefix ../app-one run docs:capture',
+    'npm run build; yarn docs:capture',
+  ])
+    assert.ok(re.test(cmd), cmd);
+  for (const cmd of ['grep docs:capture package.json', 'cat docs/capture.md', 'npm run test:flows'])
+    assert.ok(!re.test(cmd), cmd);
+});
+
+test('fixableAdvisories: high/critical with an in-range fix only; majors and moderates are left out', () => {
+  const audit = {
+    vulnerabilities: {
+      concurrently: { severity: 'critical', isDirect: true, fixAvailable: true },
+      'shell-quote': { severity: 'critical', isDirect: false, fixAvailable: true },
+      'electron-builder': {
+        severity: 'high',
+        isDirect: true,
+        fixAvailable: { name: 'electron-builder', version: '26.5.0', isSemVerMajor: true },
+      },
+      'fast-uri': { severity: 'moderate', isDirect: false, fixAvailable: true },
+      braces: { severity: 'high', isDirect: false, fixAvailable: false },
+      'brace-expansion': { severity: 'high', isDirect: false, fixAvailable: true },
+    },
+  };
+  assert.deepEqual(
+    policy.fixableAdvisories(audit).map((f) => `${f.name}:${f.severity}`),
+    ['concurrently:critical', 'shell-quote:critical', 'brace-expansion:high'],
+  );
+  assert.deepEqual(policy.fixableAdvisories({}), []);
+  assert.deepEqual(policy.fixableAdvisories(null), []);
+});
+
+test('supersededDependabotPrs: the lockfile at or past the offered version supersedes the PR', () => {
+  const prs = [
+    { number: 22, title: 'Bump @radix-ui/react-tooltip from 1.2.14 to 1.2.15' },
+    { number: 9, title: 'Bump eslint-plugin-react-refresh from 0.5.2 to 0.5.3' },
+    { number: 30, title: 'Bump lucide-react from 1.16.0 to 1.25.0' },
+    { number: 31, title: 'Bump the radix group with 4 updates' },
+    { number: 32, title: 'Bump unknown-pkg from 1.0.0 to 1.0.1' },
+  ];
+  const lock = {
+    'node_modules/@radix-ui/react-tooltip': { version: '1.2.16' },
+    'node_modules/eslint-plugin-react-refresh': { version: '0.5.3' },
+    'node_modules/lucide-react': { version: '1.16.0' },
+  };
+  const r = policy.supersededDependabotPrs(prs, lock);
+  assert.deepEqual(
+    r.superseded.map((p) => [p.number, p.installed]),
+    [
+      [22, '1.2.16'],
+      [9, '0.5.3'],
+    ],
+  );
+  assert.deepEqual(
+    r.open.map((p) => p.number),
+    [30, 31, 32],
+  );
+  assert.equal(policy.parseDependabotTitle('build(deps-dev): bump vite from 7.1.0 to 7.1.2').name, 'vite');
+  assert.equal(policy.parseDependabotTitle('Bump the radix group with 4 updates'), null);
+  assert.ok(policy.semverGte('2.0.0-beta.1', '1.9.9'));
+  assert.ok(!policy.semverGte('1.2.9', '1.10.0'));
+});
+
+test('isArchived and dependabotPrLimit: read from package.json and dependabot.yml, with defaults', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-archived-'));
+  assert.equal(policy.isArchived(dir), false);
+  assert.equal(policy.dependabotPrLimit(dir), 5);
+  fs.writeFileSync(path.join(dir, 'package.json'), '{"name":"x","policy":{"archived":true}}');
+  fs.mkdirSync(path.join(dir, '.github'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.github', 'dependabot.yml'), 'updates:\n  - open-pull-requests-limit: 10\n');
+  assert.equal(policy.isArchived(dir), true);
+  assert.equal(policy.dependabotPrLimit(dir), 10);
+  fs.rmSync(dir, { recursive: true, force: true });
 });

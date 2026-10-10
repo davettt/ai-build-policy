@@ -1,7 +1,7 @@
 # Project Standards
 
 The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
-**Version:** 2.67
+**Version:** 2.70
 **Last updated:** 2026-10-10
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
@@ -60,7 +60,6 @@ Create a spec in .claude/specs/ following project-standards.md, then we'll revie
 Before starting Claude Code:
 - [ ] Create project folder with `.claude/specs/` subfolder
 - [ ] Create GitHub repo (public or private as needed)
-- [ ] **Ask user**: use Linear for this project? (not required for personal/small tools)
 - [ ] Have project concept ready to describe
 
 ---
@@ -133,7 +132,6 @@ JSON schemas or SQL schemas for all stored data.
 ## Implementation Phases
 Break into logical phases. Each phase should be testable.
 DO NOT include time estimates - just logical groupings.
-Document as Linear epics with sub-issues using issue-tracker-cli.
 
 ## Success Criteria
 Checklist of what "done" looks like.
@@ -623,11 +621,11 @@ Before modifying or removing any code that enforces a constraint, cap, guard, or
 
 ### Code Reviews
 
-- All PRs reviewed by **CodeRabbit** before merge
+- Every source change is reviewed by **CodeRabbit** locally, inside `policy gates`, before the developer commits (there are no PRs to review; § Git Workflow)
 - Address all critical and high-severity findings
 - **The enforced path is the CLI, not the plugin:** `policy gates` runs `npm run review` (`coderabbit review --agent --include-untracked`) as a blocking gate, and the pre-commit verify-marker refuses commits without it. Do not substitute a plugin or skill invocation for that gate: a skill runs only when invoked, the gate blocks.
 - **`--include-untracked` is mandatory** (`check` FAILs without it). The CLI default reviews tracked changes only, and gates run before staging, so new files would pass the gate unreviewed.
-- **The gate is conditional on source, and unconditional at release.** **A review is not repeated for source it has already read.** The gates marker hashes the whole tree, so adding the CHANGELOG entry the Stop hook requires invalidates it, and the next run re-reviewed the same code plus one prose line at full cost against a small rolling allowance. The review decision is now keyed on a hash of the changed source alone: an unchanged codebase is not re-reviewed however many times the changelog, docs or config move. A carried-forward review is still recorded in the marker as a pass, because the code was genuinely reviewed, so `verify-ready --release` is neither weakened nor tripped by it. It carries forward only when the previous marker records the gate AND the source is byte-identical, so it can shorten the path and never skip a first review. The CLI allowance is a few reviews per rolling window, so `policy gates` skips the review when the diff contains only config, docs, or changelog files — there is nothing in it for a code reviewer to read, and spending the review there leaves nothing for the next real change. Any source file in the diff brings it back, `gates --with-review` forces it, and `verify-ready --release` FAILs unless the marker records a CodeRabbit pass, so nothing ships unreviewed. A clean tree is not treated as source-free: the gate still runs, which is what keeps the review_skipped FAIL below catching already-committed work.
+- **The gate is conditional on source, and unconditional at release.** **A review is not repeated for source it has already read.** **The review runs last, after the build and every test tier, and a pass is kept even when a later gate fails.** It used to run before the build, so a build or test failure meant the review had been spent on code about to change and the rerun spent another on the same diff; with the CLI allowance at a few reviews per rolling window, reruns emptied it. Now a failing build costs no review, and the gate writes `.policy/review.json` the moment it passes, which `policy gates` honours on the rerun under the same byte-identical-source condition as the marker (2.68). The gates marker hashes the whole tree, so adding the CHANGELOG entry the Stop hook requires invalidates it, and the next run re-reviewed the same code plus one prose line at full cost against a small rolling allowance. The review decision is now keyed on a hash of the changed source alone: an unchanged codebase is not re-reviewed however many times the changelog, docs or config move. A carried-forward review is still recorded in the marker as a pass, because the code was genuinely reviewed, so `verify-ready --release` is neither weakened nor tripped by it. It carries forward only when the previous marker records the gate AND the source is byte-identical, so it can shorten the path and never skip a first review. The CLI allowance is a few reviews per rolling window, so `policy gates` skips the review when the diff contains only config, docs, or changelog files — there is nothing in it for a code reviewer to read, and spending the review there leaves nothing for the next real change. Any source file in the diff brings it back, `gates --with-review` forces it, and `verify-ready --release` FAILs unless the marker records a CodeRabbit pass, so nothing ships unreviewed. A clean tree is not treated as source-free: the gate still runs, which is what keeps the review_skipped FAIL below catching already-committed work.
 - **A skipped review is a failed gate.** On a clean tree with the branch equal to its base, CodeRabbit reports `"status":"review_skipped"` and exits 0. `policy gates` reads the `--agent` output rather than the exit code and FAILs, since no code was examined. To review committed work, diff against the preceding commit (`--base-commit <sha>`). For a root commit, review it as a PR on the remote, or in a scratch repo: copy the files out, `git init`, empty root commit, leave the files untracked, `--include-untracked`.
 - **New repos need two one-time steps before the review gate can run**, both surfaced by `policy gates` with the exact command:
   1. **A commit must exist.** CodeRabbit resolves the current branch (`git rev-parse --abbrev-ref HEAD`), so it cannot run in a repo with no commits, and `/security-review` has nothing to diff against. `check` FAILs a repo with no commits at session start, so the root commit comes before the feature work rather than after it (2.66). `verify-marker` waives itself when there is no HEAD, allowing the root commit; every commit after it is gated normally. Do not use `--no-verify`.
@@ -645,38 +643,13 @@ Before modifying or removing any code that enforces a constraint, cap, guard, or
 
 ## Git Workflow
 
-- Feature branches: `yourname/{issue-id}-{short-description}`
-- Conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`
-- PR per feature/issue
-- CodeRabbit review required on all PRs
-- Comment on Linear issue with implementation summary before PR
+Work happens on `main`, where gates pass, the review runs, the developer commits, and the commit goes straight in, because the pre-commit hook and CI are the review on these solo projects and a pull request would add a second copy of the same checks with nobody else to read it. The earlier text here described feature branches named per issue, a PR per feature and CodeRabbit on PRs, which was never the practice; a session that read it branched an app for a one-file change and then found the build refused. Until 2.68 nothing read that text, so no check caught it.
 
----
-
-## Linear Workflow (optional — confirm with user per project)
-
-Use `issue-tracker-cli` for all Linear issue management. Run `issue-tracker-cli --help` for full reference.
-
-### Issue Structure
-- **Epics** = implementation phases (labelled `epic`)
-- **Sub-issues** = individual tasks within each phase
-- Import phases as epics with children using `issue-tracker-cli import issues.json`
-
-### Common Commands
-```bash
-# List open issues for a project
-issue-tracker-cli list issues TC --project "My Project"
-
-# List current cycle issues
-issue-tracker-cli list issues TC --cycle current
-
-# View issue details
-issue-tracker-cli get TC-109 --children
-
-# Update status and comment
-issue-tracker-cli status TC-109 "In Progress"
-issue-tracker-cli comment TC-109 "Implementation summary here"
-```
+- **Conventional commits** on `main`: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`. One change per commit, scoped the way § No feature creep describes.
+- **CodeRabbit runs locally** as the review gate (§ Code Review), not on a PR.
+- **Pull requests exist for one thing:** Dependabot (§ Dependency Maintenance). A GitHub ruleset that requires a PR on `main` blocks the normal push, so the ruleset gets disabled rather than the work moved to a branch.
+- **Releases come from `main`.** `verify-ready --release` FAILs on any other branch, and the DMG build hook refuses to build from one, the same way it refuses a dirty tree.
+- **Issue tracking** is the spec in `.claude/specs/` plus the CHANGELOG. There is no external tracker; the Linear section that used to follow this one described a tool the projects never adopted.
 
 ---
 
@@ -1126,9 +1099,9 @@ Guardrails, all automatic: `min-release-age=2` quarantines anything published in
 
 Run it when `check` reports drift, and before starting feature work rather than in the middle of it.
 
-**Dependabot** remains the safety net for anything the local lane misses, and the notification channel for advisories. It raises one PR per package, which is why it cannot be the primary lane: the PRs accumulate faster than the review-scan-merge cycle clears them. Once a local refresh lands on main, superseded PRs close themselves.
+**Dependabot** remains the safety net for anything the local lane misses, and the notification channel for advisories. It raises one PR per package, which is why it cannot be the primary lane: the PRs accumulate faster than the review-scan-merge cycle clears them. A local refresh does not close the PRs it supersedes, and at the open-PR cap Dependabot raises nothing new, security PRs included. `check` names superseded PRs with the `gh pr close` command, and the `dependabot-reviewer` agent closes a superseded PR or comments `@dependabot rebase` on one that is wanted but behind main before it reviews anything (rebase and recreate are the only comment commands left; merge and close by comment were retired in January 2026).
 
-`check` warns at session start when more than 10 packages sit behind their allowed range and the last refresh is over 30 days old. It warns rather than fails, since a routine refresh should not block unrelated work. The count is cached and re-measured at most once a day, because `npm outdated` is a network call and the session-start hook has a 10 second budget.
+`check` runs one cached daily probe per project at session start (`npm outdated`, `npm audit`, `gh pr list`, a few seconds against the hook's 10 second budget) and reports from it: drift over 10 packages or a refresh over 30 days old is a WARN, and both together is a FAIL, which blocks gates, so the rule above is a check rather than a sentence; high or critical advisories that an in-range `npm audit fix` clears, dev chain included, since a patch bump that removes a critical from the build tooling is one line of work; and the open Dependabot PRs, superseded ones named with the close command, with a WARN when the count sits at the cap. Advisories with no in-range fix stay with `policy health`, which runs when a session opens a project past the 30-day window, and with the monthly sweep: `policy health --all` runs every sibling project, records the result in the policy repo's `.policy/health-sweep.json`, and is scheduled by the launchd job `setup-machine` installs (`doctor` checks it is loaded; the policy repo's `check` reports the last sweep). A retired project sets `"policy": {"archived": true}` in package.json: still checked for structure, skipped by the maintenance checks and the sweep.
 
 **Dependabot PR Flow (minor and patch only):** the `dependabot-reviewer` agent runs it, one agent per branch.
 1. Review the Dependabot PR on GitHub and confirm it is a minor or patch bump
@@ -1349,12 +1322,10 @@ These rules apply to every Express app, local or cloud. The threat model differs
 ### User Setup (before Claude Code)
 - [ ] Create GitHub repo (public or private as needed)
 - [ ] Define project concept
-- [ ] Confirm with user: use Linear for this project?
 
 ### Claude Code Setup
 - [ ] Create `.claude/specs/{project}-spec.md`
 - [ ] Review and refine spec with user
-- [ ] If using Linear: import implementation phases as Linear epics with sub-issues (`issue-tracker-cli import`)
 - [ ] `node ../build-policy/scripts/policy.js scaffold` — gitignore, CI, dependabot, husky, standard scripts, CHANGELOG
 - [ ] Install quality devDependencies (eslint + plugins, prettier, husky, license-checker, html-validate/stylelint as applicable)
 - [ ] Bootstrap the allowlist: `node ../build-policy/scripts/bootstrap-allowlist.js .`
