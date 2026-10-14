@@ -13,10 +13,6 @@ const https = require('https');
 const { execFileSync } = require('child_process');
 
 const pkg = process.argv[2];
-if (!pkg) {
-  console.error('Usage: node verify-package.js <package-name>');
-  process.exit(1);
-}
 
 const RED = '\x1b[31m';
 const YELLOW = '\x1b[33m';
@@ -57,6 +53,82 @@ function fetch(url) {
 function daysSince(dateStr) {
   if (!dateStr) return null;
   return Math.floor((Date.now() - new Date(dateStr)) / 86400000);
+}
+
+/** owner/repo from a GitHub repository URL in any of npm's spellings, or null. */
+function parseGithubRepo(repoUrl) {
+  const m = String(repoUrl || '').match(/github\.com[/:]([^/]+)\/([^/#?]+)/);
+  if (!m) return null;
+  const owner = m[1];
+  const repo = m[2].replace(/\.git$/, '');
+  // Both land in a URL path; the registry doc that supplies them is written by
+  // the package's publisher, so only GitHub's own name alphabet is accepted.
+  if (!/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repo) || owner === '..' || repo === '..')
+    return null;
+  return { owner, repo };
+}
+
+/**
+ * A monorepo `repository.directory` safe to put in a raw.githubusercontent.com
+ * path: plain path segments only, no `..`, so a publisher cannot steer the
+ * package.json read to another repository and pass the name check.
+ */
+function safeDirectory(directory) {
+  if (typeof directory !== 'string') return null;
+  const clean = directory.replace(/^\/+|\/+$/g, '');
+  if (!clean) return null;
+  const segments = clean.split('/');
+  if (!segments.every((seg) => /^[A-Za-z0-9_.@-]+$/.test(seg) && seg !== '.' && seg !== '..')) return null;
+  return clean;
+}
+
+/**
+ * Does the linked repository publish this package? A name-squat can set its
+ * `repository` field to the genuine upstream's GitHub, so the repo looks
+ * right, is active and has stars, while publishing something else. The repo's
+ * own package.json (at the root, or at `repository.directory` in a monorepo)
+ * has to carry the npm name.
+ *   match     — a package.json in the repo names this package
+ *   mismatch  — the package.json found names a different package (the squat case,
+ *               unless the two packages share an npm maintainer: then 'sibling')
+ *   monorepo  — the root is a workspace root and no directory was given, so unconfirmed
+ *   unknown   — nothing readable (not GitHub, no package.json, network)
+ */
+function repoNameMatch(pkg, rootPkg, dirPkg) {
+  const names = [dirPkg && dirPkg.name, rootPkg && rootPkg.name].filter(Boolean);
+  if (names.includes(pkg)) return 'match';
+  if (dirPkg && dirPkg.name) return 'mismatch';
+  if (rootPkg && rootPkg.workspaces) return 'monorepo';
+  if (rootPkg && rootPkg.name) return 'mismatch';
+  return 'unknown';
+}
+
+/**
+ * Do two npm packages share a maintainer? A squat cannot be maintained by the
+ * genuine package's maintainers, so a shared maintainer between the package
+ * under review and the one its repo really publishes (lodash-es and lodash)
+ * means the same publisher, not a squat.
+ */
+function sharesMaintainer(a, b) {
+  const names = (doc) => new Set(((doc && doc.maintainers) || []).map((m) => m && m.name).filter(Boolean));
+  const left = names(a);
+  for (const n of names(b)) if (left.has(n)) return true;
+  return false;
+}
+
+/** npm provenance: the version was published from CI with a signed build attestation. */
+function hasProvenance(versionDoc) {
+  const att = versionDoc && versionDoc.dist && versionDoc.dist.attestations;
+  return !!(att && att.provenance);
+}
+
+async function fetchRepoPackageJson(owner, repo, directory) {
+  const sub = directory ? `${directory}/` : '';
+  try {
+    return await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/HEAD/${sub}package.json`);
+  } catch {
+    return null;
+  }
 }
 
 function assessMaintenance(lastPublished, deprecated, repoArchived) {
@@ -174,13 +246,54 @@ async function main() {
     pass(`${weeklyDownloads.toLocaleString()} weekly downloads`);
   }
 
-  // Repository check
+  // Repository check: the URL exists, and the repo actually publishes this name
+  let repoMatch = 'unknown';
+  let foundName = null;
   if (repoUrl === '(none)') {
     flag('No repository URL — cannot verify upstream source');
     flags++;
   } else {
     pass(`Repository: ${repoUrl}`);
+    const gh = parseGithubRepo(repoUrl);
+    const directory = safeDirectory(registry.repository && registry.repository.directory);
+    if (gh) {
+      const [rootPkg, dirPkg] = await Promise.all([
+        fetchRepoPackageJson(gh.owner, gh.repo),
+        directory ? fetchRepoPackageJson(gh.owner, gh.repo, directory) : null,
+      ]);
+      repoMatch = repoNameMatch(pkg, rootPkg, dirPkg);
+      foundName = (dirPkg && dirPkg.name) || (rootPkg && rootPkg.name) || null;
+    }
+    if (repoMatch === 'match') {
+      pass(`Repository publishes "${pkg}"${directory ? ` from ${directory}` : ''}`);
+    } else if (repoMatch === 'mismatch') {
+      let sibling = null;
+      try {
+        sibling = foundName ? await fetch(`https://registry.npmjs.org/${encodeURIComponent(foundName)}`) : null;
+      } catch {
+        sibling = null;
+      }
+      if (sharesMaintainer(registry, sibling)) {
+        repoMatch = 'sibling';
+        warn(`Repository publishes "${foundName}", not "${pkg}", but both share an npm maintainer — a variant build of the same project`);
+      } else {
+        flag(
+          `Repository does not publish "${pkg}" (its package.json is named "${foundName || '?'}") — ` +
+            'a name-squat points at a real project\'s repo; confirm the upstream by hand',
+        );
+        flags++;
+      }
+    } else if (repoMatch === 'monorepo') {
+      warn('Repository is a workspace root and npm gives no directory — confirm the package lives in it');
+    } else {
+      warn(gh ? 'Could not read the repository\'s package.json — confirm it publishes this package' : 'Repository is not on GitHub — confirm it publishes this package by hand');
+    }
   }
+
+  // Provenance: published from CI with a signed attestation (npm --provenance)
+  const provenance = hasProvenance(registry.versions && registry.versions[latest]);
+  if (provenance) pass('Provenance attestation on the latest version');
+  else warn('No provenance attestation — the publish cannot be tied to the repository\'s CI');
 
   // Description check
   if (!description || description === '(none)' || description.startsWith('>')) {
@@ -340,6 +453,8 @@ async function main() {
     verified: new Date().toISOString().split('T')[0],
     lastPublished: lastPubDate,
     repoArchived: repoArchived !== null ? repoArchived : false,
+    repoMatch,
+    provenance,
     maintenance,
     successor: deprecated || null,
     socket,
@@ -356,7 +471,15 @@ async function main() {
   if (flags > 0) process.exit(1);
 }
 
-main().catch((err) => {
-  console.error(`Error: ${err.message}`);
-  process.exit(1);
-});
+module.exports = { parseGithubRepo, repoNameMatch, hasProvenance, sharesMaintainer, safeDirectory };
+
+if (require.main === module) {
+  if (!pkg) {
+    console.error('Usage: node verify-package.js <package-name>');
+    process.exit(1);
+  }
+  main().catch((err) => {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  });
+}

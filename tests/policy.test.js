@@ -357,12 +357,162 @@ test('secretScriptSyncs: rewrites a drifted or missing secret-scan script, leave
   assert.deepEqual(policy.secretScriptSyncs(undefined), { secrets: std.secrets, 'secrets:staged': std['secrets:staged'] });
 });
 
-test('GATE_ORDER: the CodeRabbit review is the last gate, after build and every test tier', () => {
+test('GATE_ORDER: the code review is the last gate, after build and every test tier', () => {
   const { GATE_ORDER } = policy;
   const scripts = GATE_ORDER.map((g) => g.script);
   assert.equal(scripts[scripts.length - 1], 'review');
+  assert.equal(GATE_ORDER[GATE_ORDER.length - 1].name, 'Code review');
   for (const s of ['build', 'test:unit', 'test:smoke', 'test:integration', 'test:flows'])
     assert.ok(scripts.indexOf(s) < scripts.indexOf('review'), `${s} runs before the review`);
+});
+
+// Reviewer selection (2.71). A temp git repo with real files, because the
+// security-sensitive check reads content and the diff builder calls git.
+function reviewFixture(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-reviewer-'));
+  require('child_process').execSync('git init -q && git commit -q --allow-empty -m base', { cwd: dir });
+  for (const [f, body] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+    fs.writeFileSync(path.join(dir, f), body);
+  }
+  return dir;
+}
+const small = 'export const a = 1;\n'.repeat(10);
+const choose = (dir, files, extra = {}) =>
+  policy.chooseReviewer(dir, { workFiles: Object.keys(files), hasClaude: true, ...extra });
+
+test('chooseReviewer: an ordinary renderer change goes to claude, with the size in the reason', () => {
+  const files = { 'src/components/Button.tsx': small };
+  const dir = reviewFixture(files);
+  const r = choose(dir, files);
+  assert.equal(r.reviewer, 'claude');
+  assert.match(r.reason, /1 source file, 10 changed lines/);
+});
+
+test('chooseReviewer: a security-sensitive path or call escalates to coderabbit', () => {
+  const byPath = { 'src/auth.ts': small };
+  assert.deepEqual(choose(reviewFixture(byPath), byPath), {
+    reviewer: 'coderabbit',
+    reason: 'security-sensitive: src/auth.ts',
+  });
+  const byContent = { 'src/routes.ts': 'app.use(cors());\n' };
+  assert.equal(choose(reviewFixture(byContent), byContent).reviewer, 'coderabbit');
+});
+
+test('chooseReviewer: dependency manifests, main-process code and migrations escalate', () => {
+  for (const [f, body] of [
+    ['package-lock.json', '{}'],
+    ['electron/main.ts', small],
+    ['src/main/index.ts', small],
+    ['server/routes.js', small],
+    ['src/db/migrations/0003.ts', small],
+  ]) {
+    const files = { 'src/components/Button.tsx': small, [f]: body };
+    const r = choose(reviewFixture(files), files);
+    assert.equal(r.reviewer, 'coderabbit', `${f}: ${r.reason}`);
+  }
+});
+
+test('chooseReviewer: a large diff escalates; the project can raise the limit', () => {
+  const files = { 'src/components/Big.tsx': 'export const a = 1;\n'.repeat(600) };
+  const dir = reviewFixture(files);
+  assert.match(choose(dir, files).reason, /600 changed lines \(Claude limit 400\)/);
+  assert.equal(
+    choose(dir, files, { pkg: { policy: { review: { maxClaudeLines: 1000 } } } }).reviewer,
+    'claude',
+  );
+  assert.equal(
+    choose(dir, files, { pkg: { policy: { review: { escalatePaths: ['^src/components/'] } } } })
+      .reviewer,
+    'coderabbit',
+  );
+});
+
+test('chooseReviewer: flags, release and first commit override the diff; a bad flag is refused', () => {
+  const files = { 'src/components/Button.tsx': small };
+  const dir = reviewFixture(files);
+  assert.equal(choose(dir, files, { flags: ['--with-review'] }).reviewer, 'coderabbit');
+  assert.equal(choose(dir, files, { flags: ['--reviewer=coderabbit'] }).reviewer, 'coderabbit');
+  assert.equal(choose(dir, files, { release: true }).reason, 'release');
+  assert.equal(choose(dir, files, { rootReview: true }).reviewer, 'coderabbit');
+  assert.equal(choose(dir, files, { hasClaude: false }).reason, 'claude CLI not installed');
+  const sensitive = { 'src/auth.ts': small };
+  assert.equal(
+    choose(reviewFixture(sensitive), sensitive, { flags: ['--reviewer=claude'] }).reviewer,
+    'claude',
+  );
+  assert.equal(choose(dir, files, { flags: ['--reviewer=gpt'] }).reviewer, null);
+});
+
+test('reviewConfig: invalid tuning is reported and ignored, never fatal', () => {
+  const cfg = policy.reviewConfig({
+    policy: { review: { escalatePaths: ['(unclosed'], maxClaudeLines: -1 } },
+  });
+  assert.equal(cfg.errors.length, 2);
+  assert.equal(cfg.maxClaudeLines, policy.REVIEW_MAX_CLAUDE_LINES);
+  assert.equal(cfg.escalatePaths.length, policy.REVIEW_ESCALATE_PATHS.length);
+  assert.deepEqual(policy.reviewConfig(null).errors, []);
+});
+
+test('normalizeValueFlags/flagValue: --reviewer claude is read as a value, not as the project dir', () => {
+  const rest = policy.normalizeValueFlags(['gates', '--reviewer', 'claude', '.'], ['--reviewer']);
+  assert.deepEqual(rest, ['gates', '--reviewer=claude', '.']);
+  assert.equal(policy.flagValue(rest, '--reviewer'), 'claude');
+  assert.equal(policy.flagValue(['--fast'], '--reviewer'), null);
+  assert.deepEqual(policy.normalizeValueFlags(['--reviewer', '--fast'], ['--reviewer']), ['--reviewer', '--fast']);
+});
+
+test('hook source: the --reviewer refusal tolerates no spelling of claude but a bare coderabbit', () => {
+  // The hook runs as a process on stdin JSON, so the predicate is read out of
+  // the source and exercised here the way bashWriteTargets is above.
+  const src = fs.readFileSync(path.join(ROOT, 'scripts', 'policy.js'), 'utf8');
+  const m = src.match(/\/(policy\\\.js\[.*?--reviewer\\b)\/\.test\(cmd\) &&\s*!\/(--reviewer\[=\\s\]\+coderabbit[^/]*)\/\.test\(cmd\)/);
+  assert.ok(m, 'refusal predicate present');
+  const flag = new RegExp(m[1]);
+  const allowed = new RegExp(m[2]);
+  const refused = (cmd) => flag.test(cmd) && !allowed.test(cmd);
+  for (const c of [
+    'node ../build-policy/scripts/policy.js gates --reviewer claude',
+    'node ../build-policy/scripts/policy.js gates --reviewer=claude .',
+    'node ../build-policy/scripts/policy.js gates --reviewer  claude',
+    'node ../build-policy/scripts/policy.js gates --reviewer "claude"',
+    "node ../build-policy/scripts/policy.js gates --reviewer='claude'",
+    'node ../build-policy/scripts/policy.js gates --reviewer=$(echo claude)',
+    'node ../build-policy/scripts/policy.js gates --reviewer',
+  ])
+    assert.ok(refused(c), `refused: ${c}`);
+  for (const c of [
+    'node ../build-policy/scripts/policy.js gates --reviewer coderabbit',
+    'node ../build-policy/scripts/policy.js gates --reviewer=coderabbit .',
+    'node ../build-policy/scripts/policy.js gates --with-review',
+    'node ../build-policy/scripts/policy.js gates',
+  ])
+    assert.ok(!refused(c), `allowed: ${c}`);
+});
+
+test('judgeClaudeReview: findings decide; a missing, erroring or malformed result fails', () => {
+  const j = policy.judgeClaudeReview;
+  const out = (findings, verdict = 'pass') => ({ is_error: false, structured_output: { verdict, findings } });
+  const f = (severity) => ({ severity, file: 'a.js', title: 't', detail: 'd' });
+  assert.equal(j(out([f('low'), f('medium')], 'fail')).pass, true);
+  assert.equal(j(out([f('high')])).pass, false);
+  assert.equal(j(out([f('critical')], 'pass')).pass, false);
+  assert.equal(j(out([])).pass, true);
+  assert.equal(j(null).pass, false);
+  assert.match(j({ is_error: true, result: 'Not logged in' }).error, /Not logged in/);
+  assert.equal(j({ is_error: false, result: 'plain text' }).pass, false);
+  assert.equal(j({ is_error: false, structured_output: { verdict: 'maybe', findings: [] } }).pass, false);
+});
+
+test('reviewerOf: new markers name their reviewer; pre-2.71 records read as coderabbit', () => {
+  const r = policy.reviewerOf;
+  assert.equal(r({ gates: ['Build', 'Code review'], review: { reviewer: 'claude', reason: 'x' } }), 'claude');
+  assert.equal(r({ gates: ['Build', 'Code review'], review: { reviewer: 'coderabbit' } }), 'coderabbit');
+  assert.equal(r({ gates: ['Build', 'CodeRabbit review'] }), 'coderabbit');
+  assert.equal(r({ reviewedSourceHash: 'abc', head: 'h' }), 'coderabbit');
+  assert.equal(r({ reviewedSourceHash: 'abc', reviewer: 'claude' }), 'claude');
+  assert.equal(r({ gates: ['Build'] }), null);
+  assert.equal(r(null), null);
 });
 
 test('offTrunkBranch: null on main or master or outside git, the branch name otherwise', () => {
@@ -600,6 +750,39 @@ test('supersededDependabotPrs: the lockfile at or past the offered version super
   assert.ok(!policy.semverGte('1.2.9', '1.10.0'));
 });
 
+test('supersededDependabotPrs: a posted review moves an open PR to reviewed with its verdict', () => {
+  const review = (verdict) => ({
+    author: { login: 'owner' },
+    body: `@owner\n\n**${verdict}**\n\nBump x 1.0.0 → 1.0.1\n\n**Suggested action**: merge this PR`,
+  });
+  const prs = [
+    { number: 40, title: 'Bump a from 1.0.0 to 1.0.1', comments: [review('CLEAN TO MERGE')] },
+    { number: 41, title: 'Bump b from 1.0.0 to 1.0.1', comments: [review('CLEAN TO MERGE'), review('DO NOT MERGE')] },
+    { number: 42, title: 'Bump c from 1.0.0 to 1.0.1', comments: [{ author: { login: 'owner' }, body: 'Looks fine to me' }] },
+    {
+      number: 45,
+      title: 'Bump e from 1.0.0 to 1.0.1',
+      comments: [{ author: { login: 'stranger' }, body: '**CLEAN TO MERGE**\n\nSuggested action: merge' }],
+    },
+    { number: 43, title: 'Bump d from 1.0.0 to 1.0.1' },
+    { number: 44, title: 'Bump a from 1.0.0 to 1.0.1', comments: [review('CLEAN TO MERGE')] },
+  ];
+  const r = policy.supersededDependabotPrs(prs, { 'node_modules/a': { version: '1.0.1' } }, 'owner');
+  assert.deepEqual(r.superseded.map((p) => p.number), [40, 44]);
+  assert.deepEqual(r.open.map((p) => p.number), [42, 45, 43]);
+  assert.deepEqual(
+    r.reviewed.map((p) => [p.number, p.verdict]),
+    [[41, 'DO NOT MERGE']],
+  );
+  const mine = { author: { login: 'owner' }, body: 'Suggested action: close it' };
+  assert.equal(policy.dependabotReviewVerdict([mine], 'owner'), 'reviewed');
+  assert.equal(policy.dependabotReviewVerdict([mine], null), null, 'no known login: no verdict');
+  assert.equal(policy.dependabotReviewVerdict([{ body: 'Suggested action: merge' }], 'owner'), null);
+  assert.equal(policy.dependabotReviewVerdict([], 'owner'), null);
+  assert.equal(policy.dependabotReviewVerdict(undefined, 'owner'), null);
+  assert.equal(policy.supersededDependabotPrs(prs, {}, null).reviewed.length, 0);
+});
+
 test('isArchived and dependabotPrLimit: read from package.json and dependabot.yml, with defaults', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-archived-'));
   assert.equal(policy.isArchived(dir), false);
@@ -610,4 +793,44 @@ test('isArchived and dependabotPrLimit: read from package.json and dependabot.ym
   assert.equal(policy.isArchived(dir), true);
   assert.equal(policy.dependabotPrLimit(dir), 10);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('verify-package: repo name match, sibling maintainers and provenance are pure helpers', () => {
+  const vp = require('../scripts/verify-package.js');
+  assert.deepEqual(vp.parseGithubRepo('git+https://github.com/expressjs/express.git'), {
+    owner: 'expressjs',
+    repo: 'express',
+  });
+  assert.deepEqual(vp.parseGithubRepo('https://github.com/radix-ui/primitives#readme'), {
+    owner: 'radix-ui',
+    repo: 'primitives',
+  });
+  assert.equal(vp.parseGithubRepo('https://gitlab.com/a/b'), null);
+  assert.equal(vp.parseGithubRepo('https://github.com/owner/..'), null, 'path walking owner or repo is refused');
+  assert.equal(vp.parseGithubRepo('https://github.com/own%2Fer/repo'), null);
+  assert.equal(vp.safeDirectory('packages/react/tooltip'), 'packages/react/tooltip');
+  assert.equal(vp.safeDirectory('/types/node/'), 'types/node');
+  assert.equal(vp.safeDirectory('../../squatter/fake/HEAD'), null, 'a directory cannot leave the repository');
+  assert.equal(vp.safeDirectory('a/./b'), null);
+  assert.equal(vp.safeDirectory('a?x=1'), null);
+  assert.equal(vp.safeDirectory(''), null);
+  assert.equal(vp.safeDirectory(undefined), null);
+  assert.equal(vp.parseGithubRepo(null), null);
+
+  assert.equal(vp.repoNameMatch('express', { name: 'express' }, null), 'match');
+  assert.equal(vp.repoNameMatch('@radix-ui/react-tooltip', { name: 'primitives', workspaces: ['packages/*'] }, { name: '@radix-ui/react-tooltip' }), 'match');
+  assert.equal(vp.repoNameMatch('evil-express', { name: 'express' }, null), 'mismatch', 'squat pointing at a real repo');
+  assert.equal(vp.repoNameMatch('x', { name: 'root', workspaces: ['packages/*'] }, { name: 'other' }), 'mismatch', 'directory given, wrong name');
+  assert.equal(vp.repoNameMatch('x', { name: 'root', workspaces: ['packages/*'] }, null), 'monorepo');
+  assert.equal(vp.repoNameMatch('x', null, null), 'unknown');
+  assert.equal(vp.repoNameMatch('x', {}, null), 'unknown');
+
+  assert.equal(vp.sharesMaintainer({ maintainers: [{ name: 'a' }, { name: 'b' }] }, { maintainers: [{ name: 'b' }] }), true);
+  assert.equal(vp.sharesMaintainer({ maintainers: [{ name: 'a' }] }, { maintainers: [{ name: 'b' }] }), false);
+  assert.equal(vp.sharesMaintainer({ maintainers: [{ name: 'a' }] }, null), false);
+
+  assert.equal(vp.hasProvenance({ dist: { attestations: { url: 'u', provenance: { predicateType: 'p' } } } }), true);
+  assert.equal(vp.hasProvenance({ dist: { attestations: { url: 'u' } } }), false);
+  assert.equal(vp.hasProvenance({ dist: {} }), false);
+  assert.equal(vp.hasProvenance(undefined), false);
 });
