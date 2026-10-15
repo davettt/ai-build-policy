@@ -1,8 +1,8 @@
 # Project Standards
 
 The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
-**Version:** 2.71
-**Last updated:** 2026-10-14
+**Version:** 2.72
+**Last updated:** 2026-10-15
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -539,6 +539,7 @@ These are the ONLY sanctioned global exclusions (`check` FAILs any other). Anyth
 - `strict: true` in `tsconfig.json`
 - `noUncheckedIndexedAccess: true`
 - No `any` types — use `unknown` and narrow
+- A Vite-style solution `tsconfig.json` (`"files": []` plus `references` to `tsconfig.app.json`/`tsconfig.node.json`) holds no sources, so bare `tsc --noEmit` against it compiles nothing and exits 0. The type-check script must be `tsc -b --noEmit` (or one `tsc -p <ref> --noEmit` per reference). `policy check` FAILs a solution config paired with bare `tsc`, and `policy scaffold` writes the `-b` form for one
 
 **Standard package.json scripts** (`policy scaffold` adds missing ones — adjust the HTML/CSS globs to where the project actually keeps those files):
 ```json
@@ -549,7 +550,7 @@ These are the ONLY sanctioned global exclusions (`check` FAILs any other). Anyth
   "lint:css": "stylelint \"styles/*.css\"",
   "format": "prettier --write .",
   "format:check": "prettier --check .",
-  "type-check": "tsc --noEmit",
+  "type-check": "tsc --noEmit",   // "tsc -b --noEmit" when tsconfig.json is a solution config (files: [] + references)
   "security": "npm audit --audit-level=high --omit=dev",
   "sast": "semgrep scan --config auto --error --quiet --exclude-rule javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal --exclude-rule javascript.express.security.audit.express-res-sendfile.express-res-sendfile --exclude-rule javascript.express.security.audit.remote-property-injection.remote-property-injection",
   "secrets": "betterleaks git . --redact",
@@ -572,6 +573,8 @@ These are the ONLY sanctioned global exclusions (`check` FAILs any other). Anyth
 `validate` is the canonical fast-check name (husky and BUILD-POLICY reference it). Projects that historically used `check` should keep it as an alias: `"check": "npm run validate"`.
 
 ### Testing tiers
+
+**A gate must prove it examined something.** A script that exits 0 on empty input proves nothing: `policy check` FAILs a stub (`echo`, `exit 0`, `true`), `--passWithNoTests`, `--allow-empty-input`, `--no-error-on-unmatched-pattern` and a trailing `|| true` in any gate script, a `node --test` pattern that matches no file, and eslint without a TypeScript parser in a TypeScript project; `policy gates` FAILs a test gate whose runner reports 0 tests and a SAST run that scanned 0 files, and prints every gate it skipped for lack of a script. Every project with source runs at least one tier, and `policy check` FAILs one that has none: a server project needs `test:smoke` (already required), a static site needs a `test:smoke` that builds and checks the output (`npm run build && html-validate 'dist/**/*.html'`), and an Electron app without a server needs `test:unit` or `test:integration` over its data layer. Further tiers a project has no tests for yet are left out, and `policy gates` prints them as skipped, rather than stubbed.
 
 | Tier | Script | What it covers | Required |
 |---|---|---|---|

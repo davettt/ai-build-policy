@@ -1,7 +1,7 @@
 # Build & Development Policy
 
-**Version:** 2.71
-**Last updated:** 2026-10-14
+**Version:** 2.72
+**Last updated:** 2026-10-15
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
 
@@ -88,7 +88,7 @@ Each step names its enforcement. **Human judgment** steps are deliberately human
 
 | Step | Enforced by |
 |---|---|
-| Full gate sequence: type-check → lint → HTML/CSS → format → secrets → allowlist → SAST → audit → licenses → build → unit → smoke → integration → flows (where defined) → code review | `policy gates` runs them in order, stops at first failure, writes diff-hashed marker. Registry signatures (`npm audit signatures`) are verified on every full run. The review gate runs last and only when the diff contains source (or the tree is clean, or a reviewer is forced); it picks its reviewer from the diff (project-standards § Code Reviews) and prints the choice with its reason |
+| Full gate sequence: type-check → lint → HTML/CSS → format → secrets → allowlist → SAST → audit → licenses → build → unit → smoke → integration → flows (where defined) → code review | `policy gates` runs them in order, stops at first failure, writes diff-hashed marker. Registry signatures (`npm audit signatures`) are verified on every full run. The review gate runs last and only when the diff contains source (or the tree is clean, or a reviewer is forced); it picks its reviewer from the diff (project-standards § Code Reviews) and prints the choice with its reason Every gate skipped for lack of a script is printed and counted; a test gate whose runner reports 0 tests, and a SAST run that scanned 0 files, FAIL as "examined nothing" (2.72) |
 | Fast subset on every commit (type-check, lint, HTML/CSS, format, secrets, allowlist) | Husky pre-commit runs `policy gates --fast` — **commit is impossible if it fails** |
 | Gates re-run on GitHub: static checks, SAST, audit, licenses, **build, and every test tier** (+ gitleaks-action). `deps:check`, CodeRabbit and Socket stay local: `deps:check` resolves a sibling repo absent from a CI checkout, CodeRabbit is covered by its own GitHub app on PRs, and registry signatures plus a Socket score for each new package are checked locally before a dependency is approved (project-standards § Supply Chain Security) | GitHub Actions CI on every push/PR — **the durable evidence record** |
 | Gates match the *current* diff (no edit-after-gates) | `verify-ready` compares marker hash to working tree |

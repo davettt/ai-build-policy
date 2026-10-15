@@ -834,3 +834,85 @@ test('verify-package: repo name match, sibling maintainers and provenance are pu
   assert.equal(vp.hasProvenance({ dist: {} }), false);
   assert.equal(vp.hasProvenance(undefined), false);
 });
+
+test('solution tsconfig: bare tsc --noEmit checks zero files there, -b or -p walks the references', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-tsconfig-'));
+  const write = (json) => fs.writeFileSync(path.join(dir, 'tsconfig.json'), json);
+  // Vite's template shape, with the comments tsconfig files are allowed to carry.
+  write('{\n  // solution\n  "files": [],\n  "references": [{ "path": "./tsconfig.app.json" }]\n}');
+  assert.equal(policy.tsconfigIsSolution(dir), true);
+  write('{"compilerOptions":{"strict":true},"include":["src"]}');
+  assert.equal(policy.tsconfigIsSolution(dir), false);
+  write(
+    '{"compilerOptions":{"strict":true},"include":["src"],"references":[{"path":"./tsconfig.node.json"}]}',
+  );
+  assert.equal(
+    policy.tsconfigIsSolution(dir),
+    false,
+    'own sources plus references is checked by bare tsc',
+  );
+  write('{"files":[]}');
+  assert.equal(policy.tsconfigIsSolution(dir), false, 'no references means nothing to walk');
+  write('not json');
+  assert.equal(policy.tsconfigIsSolution(dir), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+
+  const walks = policy.typeCheckWalksReferences;
+  assert.equal(walks('tsc --noEmit'), false);
+  assert.equal(walks('tsc'), false);
+  assert.equal(walks(''), false);
+  assert.equal(walks('tsc -b --noEmit'), true);
+  assert.equal(walks('tsc --build'), true);
+  assert.equal(
+    walks('tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit'),
+    true,
+  );
+  assert.equal(walks('tsc --noEmit -p tsconfig.node.json'), true);
+  assert.equal(walks('astro check'), true, 'a non-tsc checker is not judged here');
+  assert.equal(walks('vue-tsc -b'), true);
+});
+
+test('coverage proofs: a gate that examined nothing is not a pass', () => {
+  const zero = policy.zeroInputReason;
+  assert.equal(zero('test:unit', 'ℹ tests 0\nℹ pass 0\nℹ fail 0'), 'the test runner found 0 tests');
+  assert.equal(zero('test:integration', '# tests 0\n# pass 0'), 'the test runner found 0 tests');
+  assert.equal(
+    zero('test:unit', 'No test files found, exiting with code 1'),
+    'the test runner found no test files',
+  );
+  assert.equal(zero('test:unit', 'ℹ tests 12\nℹ pass 12\nℹ fail 0'), null);
+  assert.equal(zero('test:unit', '✓ 10 tests passed'), null, 'a count of 10 is not 0');
+  assert.equal(zero('lint', 'ℹ tests 0'), null, 'only test gates are judged by test counts');
+
+  const why = policy.emptyPassScriptReason;
+  assert.match(why('echo "no tests yet"'), /stub/);
+  assert.match(why('exit 0'), /stub/);
+  assert.match(why('vitest run --passWithNoTests'), /passWithNoTests/);
+  assert.match(why('stylelint "src/**/*.css" --allow-empty-input'), /allow-empty-input/);
+  assert.match(why('eslint . --no-error-on-unmatched-pattern'), /unmatched-pattern/);
+  assert.match(why('node --test tests/*.test.js || true'), /\|\| true/);
+  assert.equal(why('vitest run src/utils --pool=threads'), null);
+  assert.equal(why('node --test "shared/**/*.test.js"'), null);
+  assert.equal(why(''), null);
+
+  const covers = policy.eslintCoversTypeScript;
+  assert.equal(covers({ devDependencies: { 'typescript-eslint': '^8' } }), true);
+  assert.equal(covers({ devDependencies: { '@typescript-eslint/parser': '^8' } }), true);
+  assert.equal(covers({ devDependencies: { eslint: '^9', 'eslint-plugin-astro': '^1' } }), false);
+  assert.equal(covers({}), false);
+
+  const pats = policy.nodeTestPatterns;
+  assert.deepEqual(pats("node --test 'shared/**/*.test.js'"), ['shared/**/*.test.js']);
+  assert.deepEqual(
+    pats('node --test "packages/*/dist/test/**/*.test.js" "apps/*/dist/test/**/*.test.js"'),
+    ['packages/*/dist/test/**/*.test.js', 'apps/*/dist/test/**/*.test.js'],
+  );
+  assert.deepEqual(pats('node --import ./tests/support/register.mjs --test tests/*.test.ts'), [
+    'tests/*.test.ts',
+  ]);
+  assert.deepEqual(pats('node --test --test-reporter spec tests/a.test.js'), ['tests/a.test.js']);
+  assert.deepEqual(pats('vitest run'), []);
+  assert.deepEqual(pats('node tests/unit.js'), [], 'a custom runner names no --test patterns');
+  assert.deepEqual(pats('npm run build && node --test dist/test/*.js'), ['dist/test/*.js']);
+  assert.deepEqual(policy.TEST_GATE_SCRIPTS, ['test:unit', 'test:smoke', 'test:integration', 'test:flows']);
+});

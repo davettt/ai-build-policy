@@ -280,6 +280,89 @@ function guardLocalPath(dir) {
 
 // ------------------------------------------------------------ project model
 
+// A Vite-style "solution" tsconfig.json (`"files": []` plus `references`)
+// holds no sources of its own. Plain `tsc --noEmit` against it compiles an
+// empty file list and exits 0, so a type-check script written that way
+// checks nothing and the gate passes green. `tsc -b` (or per-project
+// `-p <ref>`) is what actually walks the references.
+function tsconfigIsSolution(dir) {
+  const p = path.join(dir, 'tsconfig.json');
+  if (!exists(p)) return false;
+  let t;
+  try {
+    t = JSON.parse(
+      fs
+        .readFileSync(p, 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/^\s*\/\/.*$/gm, ''),
+    );
+  } catch {
+    return false;
+  }
+  const noOwnFiles = Array.isArray(t.files) && t.files.length === 0 && !t.include;
+  return noOwnFiles && Array.isArray(t.references) && t.references.length > 0;
+}
+
+// Does a type-check script walk project references? `tsc -b`/`--build`, or
+// an explicit `-p`/`--project` per referenced config, does; bare `tsc` or
+// `tsc --noEmit` does not. Non-tsc checkers (astro check, vue-tsc -b) pass.
+function typeCheckWalksReferences(script) {
+  if (!script) return false;
+  if (!/(^|[\s&;|])tsc(\s|$)/.test(script)) return true;
+  return /(^|\s)(-b|--build|-p|--project)(\s|$|=)/.test(script);
+}
+
+// Coverage proofs (2.73). The tsc defect above was one instance of a class:
+// a gate that runs, examines nothing, and exits 0. Each gate below has a
+// known empty-input pass, and these helpers make the empty run visible.
+const TEST_GATE_SCRIPTS = ['test:unit', 'test:smoke', 'test:integration', 'test:flows'];
+
+// node --test exits 0 when its patterns match no file and prints "tests 0"
+// (spec reporter: "ℹ tests 0"; tap: "# tests 0"). vitest exits 1 on no
+// files unless passWithNoTests, and then prints "No test files found".
+// jest prints "No tests found". Returns the reason a passing run should be
+// read as a failure, or null.
+function zeroInputReason(script, out) {
+  if (!TEST_GATE_SCRIPTS.includes(script)) return null;
+  if (/(^|\n)\s*(ℹ|#)\s*tests\s+0\b/.test(out)) return 'the test runner found 0 tests';
+  if (/No test files found|No tests found/i.test(out)) return 'the test runner found no test files';
+  return null;
+}
+
+// A gate script that cannot fail on empty input: a stub, or a flag that turns
+// "nothing matched" from an error into a pass. `|| true` swallows any exit.
+const STUB_SCRIPT_RE = /^\s*(echo|exit\s+0|true)\b/;
+const PASS_ON_EMPTY_RE =
+  /--passWithNoTests\b|--allow-empty-input\b|--no-error-on-unmatched-pattern\b|\|\|\s*true\s*$/;
+function emptyPassScriptReason(cmd) {
+  if (!cmd) return null;
+  if (STUB_SCRIPT_RE.test(cmd)) return 'a stub that passes without running anything';
+  const m = cmd.match(PASS_ON_EMPTY_RE);
+  if (m) return `passes on empty input (${m[0].trim()})`;
+  return null;
+}
+
+// ESLint lints .ts/.tsx only with a TypeScript parser configured; without
+// one `eslint .` in a TypeScript project lints the handful of .js config
+// files and exits 0 (found: three Astro sites, 93 unlinted .ts files in one).
+function eslintCoversTypeScript(pkg) {
+  const deps = { ...((pkg && pkg.dependencies) || {}), ...((pkg && pkg.devDependencies) || {}) };
+  return 'typescript-eslint' in deps || '@typescript-eslint/parser' in deps;
+}
+
+// The file patterns a `node --test` script names: every non-flag token after
+// --test, quotes stripped. Flags that take a value (--test-reporter x) are
+// skipped by requiring a path-like token (a slash, a glob or a .js/.ts end).
+function nodeTestPatterns(cmd) {
+  if (!cmd || !/\bnode\b[^&|;]*--test\b/.test(cmd)) return [];
+  const seg = cmd.split(/&&|\|\||;/).find((p) => /--test\b/.test(p)) || '';
+  const after = seg.slice(seg.indexOf('--test') + '--test'.length);
+  const tokens = after.match(/"[^"]*"|'[^']*'|\S+/g) || [];
+  return tokens
+    .map((t) => t.replace(/^['"]|['"]$/g, ''))
+    .filter((t) => !t.startsWith('-') && (/[*\/]/.test(t) || /\.(m?js|c?js|ts|mts)$/.test(t)));
+}
+
 function detectProject(dir) {
   const pkg = readJSON(path.join(dir, 'package.json'));
   const p = {
@@ -2007,6 +2090,49 @@ function auditExceptionProblems(
  * advisory (the source behind a finding, not the parents that inherit it)
  * that no valid exception covers for that package.
  */
+// Semgrep with --quiet prints nothing on a clean run, including how many
+// files it scanned, and a scan of 0 files (a broad .semgrepignore, a wrong
+// cwd) exits 0. The gate asks for JSON into a temp file (the project's own
+// `sast` script, flags untouched, `-- --json -o` appended), reads
+// `paths.scanned`, and prints findings from the JSON so nothing is lost.
+function runSast(dir) {
+  let tmp = null;
+  try {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-sast-'));
+    const report = path.join(tmp, 'report.json');
+    const r = sh(`npm run sast -- --json -o "${report}"`, dir);
+    const json = readJSON(report);
+    if (!json)
+      return r.ok ? { ok: false, out: 'semgrep wrote no report — scan did not run\n' + r.out } : r;
+    const scanned = (json.paths && json.paths.scanned) || [];
+    const findings = (json.results || []).map(
+      (x) =>
+        `  ${x.path}:${(x.start && x.start.line) || '?'}  ${x.check_id}\n    ${((x.extra && x.extra.message) || '').split('\n')[0]}`,
+    );
+    const errors = (json.errors || []).map(
+      (e) => `  ${e.type || 'error'}: ${(e.message || '').split('\n')[0]}`,
+    );
+    const out = [
+      `Scanned ${scanned.length} file(s), ${findings.length} finding(s)`,
+      ...findings,
+      ...errors,
+      r.out,
+    ]
+      .filter(Boolean)
+      .join('\n');
+    if (r.ok && scanned.length === 0)
+      return {
+        ok: false,
+        out:
+          out +
+          '\nSAST scanned 0 files — nothing was examined, so the pass is empty. Check .semgrepignore and the cwd.',
+      };
+    return { ...r, out, scanned: scanned.length };
+  } finally {
+    if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 function auditWithExceptions(dir) {
   const exceptions = loadAuditExceptions(dir);
   const problems = auditExceptionProblems(exceptions, undefined, dir);
@@ -2709,6 +2835,59 @@ function cmdCheck(dir, flags = []) {
   const missing = required.filter((s) => !scripts[s]);
   if (missing.length === 0) ok(`All ${required.length} required npm scripts present`);
   else fail(`Missing npm scripts: ${missing.join(', ')} (run: policy scaffold)`);
+  if (proj.isTS && scripts['type-check'] && tsconfigIsSolution(dir)) {
+    if (typeCheckWalksReferences(scripts['type-check'])) {
+      ok('type-check walks the tsconfig project references');
+    } else {
+      fail(
+        `type-check script "${scripts['type-check']}" checks zero files: tsconfig.json is a solution config ("files": [] + references) and bare tsc never follows references — use "tsc -b --noEmit" (project-standards § TypeScript)`,
+      );
+    }
+  }
+  // Scripts that cannot fail on empty input (every gate, not only smoke).
+  for (const g of GATE_ORDER) {
+    if (g.script === 'review' || !scripts[g.script]) continue;
+    if (g.script === 'test:smoke' && proj.hasServer) continue; // the smoke block below owns that one
+    const why = emptyPassScriptReason(scripts[g.script]);
+    if (why)
+      fail(
+        `${g.script} script is ${why}: "${scripts[g.script]}" — the gate cannot fail, so it proves nothing`,
+      );
+  }
+  if (proj.isTS && /\beslint\b/.test(scripts.lint || '') && !eslintCoversTypeScript(proj.pkg)) {
+    fail(
+      'lint runs eslint with no TypeScript parser (typescript-eslint or @typescript-eslint/parser) — .ts/.tsx files are not linted and the gate passes on the .js config files alone',
+    );
+  }
+  for (const g of TEST_GATE_SCRIPTS) {
+    for (const pat of nodeTestPatterns(scripts[g] || '')) {
+      let n = 0;
+      try {
+        n = fs.globSync(pat, { cwd: dir }).length;
+      } catch {
+        n = -1;
+      }
+      if (n === 0) {
+        const msg = `${g}: node --test pattern "${pat}" matches no file — node exits 0 with "tests 0" on an empty match`;
+        if (/(^|\/)dist\//.test(pat)) warn(`${msg} (reads build output; run the build first)`);
+        else fail(msg);
+      }
+    }
+  }
+  // Every project with source runs at least one test tier; the type decides
+  // which. A WARN here was still a quiet pass (decided 2026-10-15).
+  if (!TEST_GATE_SCRIPTS.some((t) => scripts[t])) {
+    const deps = { ...(proj.pkg.dependencies || {}), ...(proj.pkg.devDependencies || {}) };
+    const staticSite = 'astro' in deps || '@11ty/eleventy' in deps;
+    const want = proj.hasServer
+      ? 'test:smoke hitting every API route against an isolated server (tests/smoke.js)'
+      : staticSite
+        ? `test:smoke that builds and checks the output, e.g. "npm run build && html-validate 'dist/**/*.html'"`
+        : 'test:unit or test:integration covering the data layer';
+    fail(
+      `No test tier (test:unit, test:smoke, test:integration, test:flows) — gates run no tests for this project. Add ${want} (project-standards § Testing tiers)`,
+    );
+  }
   if (scripts.sast && !scripts.sast.includes('--error')) {
     fail(
       `sast script missing --error — semgrep findings cannot fail the gate locally (CI will fail where local passed)`,
@@ -4226,6 +4405,16 @@ function cmdGates(dir, flags) {
   const depsChanged = workFiles.some((f) => DEPENDENCY_FILE.test(f));
 
   const report = [];
+  // A gate whose script the project lacks is dropped above; say so. Six
+  // projects ran no test tier at all and `All N gates passed` never said N
+  // was short (found 2026-10-15 in the audit that followed the tsc defect).
+  const absent = GATE_ORDER.filter((g) => (fast ? g.fast : !g.fastOnly)).filter(
+    (g) => !scripts[g.script] && g.script !== 'secrets:staged',
+  );
+  for (const g of absent)
+    console.log(
+      `  ${DIM}skipped${RESET} ${g.name} ${DIM}(no "${g.script}" script in package.json)${RESET}`,
+    );
   for (const g of gates) {
     if (g.whenDepsChange && !depsChanged) {
       console.log(
@@ -4268,6 +4457,7 @@ function cmdGates(dir, flags) {
     } else if (g.script === 'review') r = runCodeRabbit();
     else if (g.script === 'security' && exists(path.join(dir, AUDIT_EXCEPTIONS)))
       r = auditWithExceptions(dir);
+    else if (g.script === 'sast') r = runSast(dir);
     else r = sh(`npm run ${safeToken(g.script, 'script name')}`, dir);
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
     // A gate that ran but examined nothing is not a pass. CodeRabbit exits 0
@@ -4280,9 +4470,11 @@ function cmdGates(dir, flags) {
       g.script === 'review' &&
       (!review || review.reviewer === 'coderabbit') &&
       /"status"\s*:\s*"review_skipped"/.test(r.out);
-    if (r.ok && !reviewSkipped) {
-      const cost = typeof r.cost === 'number' ? ` $${r.cost.toFixed(4)}` : '';
-      console.log(`${GREEN}pass${RESET} ${DIM}${secs}s${cost}${RESET}`);
+    const zeroInput = r.ok ? zeroInputReason(g.script, r.out) : null;
+    if (r.ok && !reviewSkipped && !zeroInput) {
+      const cost = typeof r.cost === 'number' ? ` ${r.cost.toFixed(4)}` : '';
+      const count = typeof r.scanned === 'number' ? ` ${r.scanned} files` : '';
+      console.log(`${GREEN}pass${RESET} ${DIM}${secs}s${cost}${count}${RESET}`);
       if (r.judged && r.judged.findings.length > 0) console.log(formatFindings(r.judged.findings));
       report.push({ gate: g.name, pass: true });
       // Keep the review the moment it passes (see alreadyReviewed above).
@@ -4303,6 +4495,14 @@ function cmdGates(dir, flags) {
           ) + '\n',
         );
       }
+    } else if (zeroInput) {
+      console.log(`${RED}FAIL${RESET} ${DIM}${secs}s${RESET}\n`);
+      console.log(r.out.split('\n').slice(-12).join('\n'));
+      console.log(
+        `\n${RED}${BOLD}Gate failed: ${g.name} examined nothing.${RESET} The script exited 0 but ${zeroInput}. ` +
+          `A green gate with no input is not a pass: fix the file pattern in the "${g.script}" script (or build first if it reads build output), then re-run: policy gates\n`,
+      );
+      process.exit(1);
     } else if (reviewSkipped) {
       console.log(`${RED}FAIL${RESET} ${DIM}${secs}s${RESET}\n`);
       console.log(
@@ -4386,7 +4586,7 @@ function cmdGates(dir, flags) {
     );
   }
   console.log(
-    `\n${GREEN}${BOLD}All ${report.length} gates passed.${RESET}${fast ? '' : ' Marker written (.policy/gates.json).'}\n`,
+    `\n${GREEN}${BOLD}All ${report.length} gates passed.${RESET}${absent.length ? ` ${absent.length} skipped (no script): ${absent.map((g) => g.script).join(', ')}.` : ''}${fast ? '' : ' Marker written (.policy/gates.json).'}\n`,
   );
 }
 
@@ -5906,7 +6106,7 @@ function cmdScaffold(dir) {
     const add = Object.fromEntries(
       Object.entries(STANDARD_SCRIPTS).map(([k, v]) => [k, localizePolicyPath(v, dir)]),
     );
-    if (proj.isTS) add['type-check'] = 'tsc --noEmit';
+    if (proj.isTS) add['type-check'] = tsconfigIsSolution(dir) ? 'tsc -b --noEmit' : 'tsc --noEmit';
     if (proj.hasHTML) add['lint:html'] = 'html-validate *.html';
     if (proj.hasCSS) add['lint:css'] = 'stylelint "styles/*.css"';
     const fastParts = [
@@ -8010,6 +8210,14 @@ if (require.main === module) main();
 
 // For tests/ only: the pure predicates the hooks and gates decide on.
 module.exports = {
+  runSast,
+  TEST_GATE_SCRIPTS,
+  zeroInputReason,
+  emptyPassScriptReason,
+  eslintCoversTypeScript,
+  nodeTestPatterns,
+  tsconfigIsSolution,
+  typeCheckWalksReferences,
   bashWriteTargets,
   writesUnder,
   literalPathsUnder,
