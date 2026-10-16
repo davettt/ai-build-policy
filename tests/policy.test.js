@@ -1293,3 +1293,59 @@ test('siteCaptureWindow: registry value with a 1512x1045 default', () => {
     { width: 1600, height: 1000 },
   );
 });
+
+test('behindWanted: only a newer wanted counts; a current ahead of latest is not stale', () => {
+  const b = policy.behindWanted;
+  assert.equal(b('26.15.0', '26.15.3'), true);
+  assert.equal(b('26.15.3', '26.15.3'), false);
+  assert.equal(b('26.17.0', '26.15.3'), false, 'installed from a newer dist-tag');
+  assert.equal(b('25.9.0', '26.15.3'), false, 'major: not this rule');
+  assert.equal(b('', '1.0.0'), false);
+  assert.equal(
+    policy.staleRecordIsDowngrade('electron-builder 26.17.0 -> 26.15.3 (128d old)'),
+    true,
+  );
+  assert.equal(policy.staleRecordIsDowngrade('left-pad 1.2.0 -> 1.3.0 (40d old)'), false);
+  assert.equal(policy.staleRecordIsDowngrade('garbage'), false);
+});
+
+test('policy reports: append numbers entries, list parses them, close marks one', () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'policy-reports-')), 'REPORTS.md');
+  assert.equal(
+    policy.appendReport(file, {
+      project: 'app-one',
+      version: '2.80',
+      text: 'scaffold adds x\nsecond line',
+    }),
+    'R-1',
+  );
+  assert.equal(
+    policy.appendReport(file, {
+      project: 'app-two',
+      version: '2.80',
+      text: 'gate y passes on empty',
+    }),
+    'R-2',
+  );
+  let rs = policy.parseReports(fs.readFileSync(file, 'utf8'));
+  assert.deepEqual(
+    rs.map((r) => [r.id, r.project, r.status]),
+    [
+      ['R-1', 'app-one', 'open'],
+      ['R-2', 'app-two', 'open'],
+    ],
+  );
+  assert.equal(rs[0].body, 'scaffold adds x\nsecond line');
+  assert.equal(policy.closeReport(file, 'R-1', 'fixed in 2.81'), true);
+  assert.equal(policy.closeReport(file, 'R-1', 'again'), false, 'already closed');
+  assert.equal(policy.closeReport(file, 'R-9', 'nope'), false);
+  rs = policy.parseReports(fs.readFileSync(file, 'utf8'));
+  assert.equal(rs[0].status, 'closed');
+  assert.match(rs[0].closed, /fixed in 2.81/);
+  assert.equal(rs[1].status, 'open');
+  assert.equal(
+    policy.appendReport(file, { project: 'app-one', version: '2.80', text: 'z' }),
+    'R-3',
+    'numbering continues past closed',
+  );
+});

@@ -40,6 +40,8 @@
  *                         image folder and record the result in img/screenshots.json
  *                         --version <v>              record against this version instead of the app's
  *                         (sets SITE_CAPTURE=1, SITE_CAPTURE_DIR and the window from registry siteCaptureWindow)
+ *   report "<text>"     From any project: log a policy finding to build-policy/REPORTS.md and carry on
+ *                         (- reads stdin; --list; --close R-<n> "<done>" from a build-policy session)
  *   help-handback <app> From the help site project: confirm an app's help pages are current
  *                         and committed, then print the message to paste into the app session
  *   health [dir]        Maintenance run: outdated, audit, registry staleness; records timestamp
@@ -1565,8 +1567,138 @@ function cmdSiteCapture(dir, rest, flags) {
   return finish();
 }
 
+// ------------------------------------------------------------ policy reports
+//
+// An app session that finds a policy gap had two lanes: claim the policy repo
+// and edit it, or hand the developer a paste for a build-policy session. Both
+// cost a context switch for findings that are often small, and some clear on
+// their own. `policy report` is the third lane: append the finding to
+// REPORTS.md in the policy repo (committed, so it travels with the repo) and
+// carry on. The policy repo's own check lists open reports at session start,
+// and a build-policy session closes each with what was done.
+const REPORTS_FILE = path.join(POLICY_ROOT, 'REPORTS.md');
+const REPORTS_HEADER =
+  '# Policy reports\n\n' +
+  'Findings logged by app sessions with `policy report`, for the next build-policy session to review. ' +
+  'Open entries are listed by `policy check` in this repo; close one with `policy report --close R-<n> "<what was done>"`.\n';
+
+function parseReports(text) {
+  const reports = [];
+  const head = /^## (R-\d+) (\S+) (\S+) \(policy ([^)]+)\) — (open|closed.*)$/;
+  for (const block of String(text || '').split(/^(?=## R-)/m)) {
+    const nl = block.indexOf('\n');
+    const m = head.exec(nl === -1 ? block : block.slice(0, nl));
+    if (!m) continue;
+    reports.push({
+      id: m[1],
+      date: m[2],
+      project: m[3],
+      version: m[4],
+      status: m[5].startsWith('open') ? 'open' : 'closed',
+      closed: m[5].startsWith('closed') ? m[5].slice('closed'.length).trim() : null,
+      body: (nl === -1 ? '' : block.slice(nl + 1)).trim(),
+    });
+  }
+  return reports;
+}
+
+function openReports(file = REPORTS_FILE) {
+  return parseReports(readFile(file)).filter((r) => r.status === 'open');
+}
+
+function appendReport(file, { project, version, text }) {
+  const existing = exists(file) ? readFile(file) : REPORTS_HEADER;
+  const n = parseReports(existing).reduce((max, r) => Math.max(max, Number(r.id.slice(2))), 0) + 1;
+  const id = `R-${n}`;
+  const date = new Date().toISOString().slice(0, 10);
+  const entry = `\n## ${id} ${date} ${project} (policy ${version}) — open\n\n${text.trim()}\n`;
+  fs.writeFileSync(file, existing.replace(/\n*$/, '\n') + entry);
+  return id;
+}
+
+function closeReport(file, id, resolution) {
+  const text = readFile(file);
+  const re = new RegExp(`^(## ${id} \\S+ \\S+ \\(policy [^)]+\\)) — open$`, 'm');
+  if (!re.test(text)) return false;
+  const date = new Date().toISOString().slice(0, 10);
+  fs.writeFileSync(
+    text === '' ? file : file,
+    text.replace(re, (_, head) => `${head} — closed ${date}: ${resolution.trim()}`),
+  );
+  return true;
+}
+
+/**
+ * policy report "<finding>"            log a finding from any project
+ * policy report -                      read the finding from stdin (multi-line)
+ * policy report --list                 open reports
+ * policy report --close R-<n> "<done>" close one (from a build-policy session)
+ */
+function cmdReport(dir, rest, flags) {
+  const words = rest.filter((a) => !a.startsWith('--'));
+  if (flags.includes('--list')) {
+    section('Open policy reports');
+    const open = openReports();
+    if (open.length === 0) ok('No open reports');
+    for (const r of open) {
+      console.log(`  ${BOLD}${r.id}${RESET} ${r.date} ${r.project} (policy ${r.version})`);
+      console.log(`    ${r.body.split('\n').join('\n    ')}`);
+    }
+    return finish();
+  }
+  const closeId = flagValue(flags, '--close');
+  if (closeId !== null) {
+    const id = closeId || words.shift();
+    const resolution = words.join(' ');
+    if (!/^R-\d+$/.test(id || '') || !resolution) {
+      fail('Usage: policy report --close R-<n> "<what was done>"');
+      return finish();
+    }
+    if (!isUnderPolicyRoot(path.resolve(dir))) {
+      fail('Reports are closed from a build-policy session, which reviews and fixes them');
+      return finish();
+    }
+    if (closeReport(REPORTS_FILE, id, resolution)) ok(`${id} closed: ${resolution}`);
+    else fail(`${id} is not an open report (policy report --list)`);
+    return finish();
+  }
+  let text = words.join(' ');
+  if (text === '-') {
+    try {
+      text = fs.readFileSync(0, 'utf8');
+    } catch {
+      text = '';
+    }
+  }
+  if (!text.trim()) {
+    fail('Usage: policy report "<what you found>"   (or: policy report - <<EOF … EOF)');
+    return finish();
+  }
+  const project = path.basename(path.resolve(dir));
+  const version = historyRows(readFile(path.join(POLICY_ROOT, 'HISTORY.md')))[0] || 'unknown';
+  const id = appendReport(REPORTS_FILE, { project, version, text });
+  ok(
+    `${id} logged in ${path.relative(path.dirname(POLICY_ROOT), REPORTS_FILE)} for the next build-policy session`,
+  );
+  console.log(`  ${DIM}No need to edit build-policy for this: carry on with the task.${RESET}`);
+  return finish();
+}
+
 function auditPolicyRepo(root) {
   auditPolicyDocVersions(root, 'policy docs');
+  {
+    const open = openReports(path.join(root, 'REPORTS.md'));
+    if (open.length > 0)
+      warn(
+        `${open.length} open report(s) from app sessions: ${open
+          .slice(0, 4)
+          .map((r) => `${r.id} ${r.project}`)
+          .join(
+            ', ',
+          )}${open.length > 4 ? ', …' : ''} — review: policy report --list; close each with: policy report --close R-<n> "<what was done>"`,
+      );
+    else ok('No open reports from app sessions');
+  }
 
   // A change to the enforcement code is a policy change: it needs a changelog
   // entry like any other. An app session handed off a policy.js fix with none,
@@ -1742,6 +1874,29 @@ function historyRows(text) {
   return [...text.matchAll(/^\|\s*(\d+(?:\.\d+)*)\s*\|\s*\d{4}-\d{2}-\d{2}\s*\|/gm)].map(
     (m) => m[1],
   );
+}
+
+/**
+ * An installed version counts as behind only when the wanted one is newer.
+ * `npm outdated` reports wanted from the `latest` dist-tag, and a package
+ * whose newest release is published under another tag (electron-builder
+ * publishes 26.17 under `v26` while `latest` stays at 26.15) shows the
+ * installed version as "outdated" against an older one. health then
+ * recorded a downgrade as an overdue update and check blocked gates on it
+ * (found in an app session, 2026-10-17).
+ */
+function behindWanted(current, wanted) {
+  if (!current || !wanted) return false;
+  const cur = String(current).split('.');
+  const want = String(wanted).split('.');
+  if (cur[0] !== want[0]) return false; // major: not this rule
+  return cmpSemver(String(wanted), String(current)) > 0;
+}
+
+/** True for a recorded stale entry ("name a.b.c -> x.y.z (…)") that was in fact a downgrade. */
+function staleRecordIsDowngrade(entry) {
+  const m = /^\S+ (\S+) -> (\S+)/.exec(String(entry || ''));
+  return !!m && !behindWanted(m[1], m[2]);
 }
 
 function cmpSemver(a, b) {
@@ -4125,7 +4280,11 @@ function checkStaleness(dir, reg) {
   // makes staleness bite: health does the network work and writes what it
   // found, check blocks on it every time gates run. Without this the rule was
   // only as strong as remembering to run a maintenance command.
-  const recordedStale = (loadState(dir).staleDeps || []).filter(Boolean);
+  // Records written before 2.79 can hold a downgrade; drop those rather than
+  // wait for the next health run to recompute.
+  const recordedStale = (loadState(dir).staleDeps || [])
+    .filter(Boolean)
+    .filter((e) => !staleRecordIsDowngrade(e));
   if (recordedStale.length > 0) {
     fail(
       `${recordedStale.length} dependency update(s) overdue as of the last health run: ` +
@@ -6514,10 +6673,7 @@ function cmdHealth(dir, flags) {
   try {
     const list = JSON.parse(sh('npm outdated --json', dir).out || '{}');
     for (const [name, info] of Object.entries(list)) {
-      const cur = String(info.current || '').split('.');
-      const wanted = String(info.wanted || '').split('.');
-      if (!cur[0] || cur[0] !== wanted[0]) continue; // major: not this rule
-      if (info.current === info.wanted) continue;
+      if (!behindWanted(info.current, info.wanted)) continue;
       const times = sh(`npm view ${safeToken(name, 'package name')} time --json`, dir);
       let released = null;
       try {
@@ -9044,7 +9200,7 @@ function cmdApproveException(ids, flags = []) {
 
 function main() {
   const [, , command, ...rawRest] = process.argv;
-  const rest = normalizeValueFlags(rawRest, ['--reviewer', '--verify', '--version']);
+  const rest = normalizeValueFlags(rawRest, ['--reviewer', '--verify', '--version', '--close']);
   const flags = rest.filter((a) => a.startsWith('--'));
   const dir = rest.find((a) => !a.startsWith('--')) || '.';
   hookMode = flags.includes('--hook');
@@ -9088,6 +9244,8 @@ function main() {
       );
     case 'scaffold':
       return cmdScaffold(dir, { dryRun: flags.includes('--dry-run') });
+    case 'report':
+      return cmdReport('.', rest, flags);
     case 'handoff':
       return cmdHandoff();
     case 'mirror-sync':
@@ -9119,6 +9277,11 @@ module.exports = {
   auditSiteImages,
   imageBehind,
   siteCaptureWindow,
+  behindWanted,
+  staleRecordIsDowngrade,
+  parseReports,
+  appendReport,
+  closeReport,
   SITE_CAPTURE_INVOCATION,
   treeScanGaps,
   handlesByokKeys,
