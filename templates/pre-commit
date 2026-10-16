@@ -1,7 +1,15 @@
 # Private data must never reach a commit — security checks block, they do not report
 # The policy scripts live in the sibling build-policy repo, which only exists on the developer's
-# machines. Anyone else working on a handed-over project commits without these checks.
-[ -f ../build-policy/scripts/policy.js ] || exit 0
+# machines. Anyone else working on a handed-over project commits without the gates, but not
+# without the staged secret scan: a leaked key is a leak on any machine. betterleaks is a brew
+# install; where it is absent the scan is skipped rather than failed, so the hook never blocks
+# a machine that cannot run it.
+if [ ! -f ../build-policy/scripts/policy.js ]; then
+  if command -v betterleaks >/dev/null 2>&1 && grep -q '"secrets:staged"' package.json; then
+    npm run --silent secrets:staged || exit 1
+  fi
+  exit 0
+fi
 node ../build-policy/scripts/policy.js leak-scan || exit 1
 
 # Full gates must have passed on this exact tree before any source commit

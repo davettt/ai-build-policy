@@ -190,7 +190,10 @@ test('shippedDmgVersions: test builds under distribution none are not shipped', 
   fs.mkdirSync(path.join(dir, 'release'));
   fs.writeFileSync(path.join(dir, 'release', 'App-0.1.0-universal.dmg'), '');
   const none = { isElectron: true, pkg: { version: '0.1.0', policy: { distribution: 'none' } } };
-  const gumroad = { isElectron: true, pkg: { version: '0.1.0', policy: { distribution: 'gumroad' } } };
+  const gumroad = {
+    isElectron: true,
+    pkg: { version: '0.1.0', policy: { distribution: 'gumroad' } },
+  };
   const inferred = { isElectron: true, pkg: { version: '0.1.0' } };
   assert.equal(policy.releaseProfile(none), 'none');
   assert.equal(policy.releaseProfile(inferred), 'gumroad');
@@ -225,21 +228,33 @@ test('secret scans: staged diff at pre-commit, history in the full run', () => {
     'betterleaks git . --verbose',
   ])
     assert.ok(leaky.test(s), `leaky flag missed: ${s}`);
-  for (const s of ['betterleaks git . --redact', 'betterleaks git . --no-verbose', 'betterleaks git ./my-vault'])
+  for (const s of [
+    'betterleaks git . --redact',
+    'betterleaks git . --no-verbose',
+    'betterleaks git ./my-vault',
+  ])
     assert.ok(!leaky.test(s), `false positive: ${s}`);
 });
 
 test('secret report locations: file, line and rule, never the value', () => {
   const { secretReportLocations } = policy;
   const findings = [
-    { File: 'server/ai.js', StartLine: 12, RuleID: 'github-pat', Secret: 'REDACTED', Match: 'REDACTED' },
+    {
+      File: 'server/ai.js',
+      StartLine: 12,
+      RuleID: 'github-pat',
+      Secret: 'REDACTED',
+      Match: 'REDACTED',
+    },
     { File: '.env.local', StartLine: 3, RuleID: 'generic-api-key', Secret: 'REDACTED' },
     { Description: 'no File field' },
   ];
   const out = secretReportLocations(findings);
   assert.deepEqual(out, ['server/ai.js:12 (github-pat)', '.env.local:3 (generic-api-key)']);
   assert.ok(!out.join('\n').includes('REDACTED'), 'the value field is never echoed');
-  const hostile = secretReportLocations([{ File: 'a\x1b[2Kb\nc.js', StartLine: 1, RuleID: 'x\x07y' }]);
+  const hostile = secretReportLocations([
+    { File: 'a\x1b[2Kb\nc.js', StartLine: 1, RuleID: 'x\x07y' },
+  ]);
   assert.deepEqual(hostile, ['a\\x1b[2Kb\\x0ac.js:1 (x\\x07y)'], 'control characters are escaped');
   assert.deepEqual(secretReportLocations(null), []);
   assert.deepEqual(secretReportLocations({ not: 'an array' }), []);
@@ -255,7 +270,10 @@ test('footerBannerFindings: rights wording, Terms link and per-version dismissal
     policy.footerBannerFindings(dir, { termsUrl: 'https://example.com/terms/', ...opts });
 
   // Close button that only clears state: no remembered version, so it fails.
-  write('src/App.tsx', `<p>© 2026 Example. All rights reserved.</p>\n<button onClick={() => setUpdate(null)}>×</button>`);
+  write(
+    'src/App.tsx',
+    `<p>© 2026 Example. All rights reserved.</p>\n<button onClick={() => setUpdate(null)}>×</button>`,
+  );
   let f = run({ distributes: true, versionCheck: 'src/App.tsx' });
   assert.equal(f.length, 3);
   assert.match(f[0], /src\/App\.tsx: says "All rights reserved"/);
@@ -277,9 +295,15 @@ test('footerBannerFindings: rights wording, Terms link and per-version dismissal
   fs.rmSync(path.join(dir, 'index.html'));
 
   // No termsUrl in the registry (null, as in the public mirror): any /terms/ link counts.
-  assert.deepEqual(policy.footerBannerFindings(dir, { distributes: true, versionCheck: null, termsUrl: null }), []);
+  assert.deepEqual(
+    policy.footerBannerFindings(dir, { distributes: true, versionCheck: null, termsUrl: null }),
+    [],
+  );
   write('src/App.tsx', `<p>v1</p>`);
-  assert.match(policy.footerBannerFindings(dir, { distributes: true, versionCheck: null, termsUrl: null })[0], /the site's \/terms\/ page/);
+  assert.match(
+    policy.footerBannerFindings(dir, { distributes: true, versionCheck: null, termsUrl: null })[0],
+    /the site's \/terms\/ page/,
+  );
 
   // Terms owed only once the app distributes; dismissal only with a banner.
   fs.writeFileSync(path.join(dir, 'src/App.tsx'), `<p>v1</p>`);
@@ -311,13 +335,22 @@ test('remoteFontFindings: a Google Fonts link, @import or CSP allowance; bundled
   // test fixture, and an analyzer line that opts out.
   write('index.html', `<!-- fonts bundled; was fonts.googleapis.com -->\n<title>App</title>`);
   write('server/index.js', `// no fonts.gstatic.com: fonts are bundled\nfontSrc: ["'self'"],`);
-  write('src/index.css', `@font-face { font-family: 'Inter'; src: url('/fonts/inter-latin-wght-normal.woff2') format('woff2-variations'); }`);
+  write(
+    'src/index.css',
+    `@font-face { font-family: 'Inter'; src: url('/fonts/inter-latin-wght-normal.woff2') format('woff2-variations'); }`,
+  );
   write('tests/analyzer.test.js', `expect(hosts).toContain('fonts.googleapis.com')`);
-  write('src/analyzer.js', `const FONT_HOSTS = ['fonts.googleapis.com', 'fonts.gstatic.com']; // policy:names-font-host`);
+  write(
+    'src/analyzer.js',
+    `const FONT_HOSTS = ['fonts.googleapis.com', 'fonts.gstatic.com']; // policy:names-font-host`,
+  );
   assert.deepEqual(policy.remoteFontFindings(dir), []);
 
   // The opt-out covers its own line only.
-  write('src/analyzer.js', `// policy:names-font-host\nconst FONT_HOSTS = ['fonts.googleapis.com'];`);
+  write(
+    'src/analyzer.js',
+    `// policy:names-font-host\nconst FONT_HOSTS = ['fonts.googleapis.com'];`,
+  );
   assert.deepEqual(policy.remoteFontFindings(dir), ['src/analyzer.js (1 line)']);
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -332,7 +365,11 @@ test('DISMISS_PER_VERSION_RE: the shapes the apps use, not a bare dismiss', () =
     'updateVersion !== dismissedVersion',
   ])
     assert.match(ok, policy.DISMISS_PER_VERSION_RE, ok);
-  for (const bad of ['onClick={dismiss}', 'const [dismissed, setDismissed] = useState(false)', 'x === y'])
+  for (const bad of [
+    'onClick={dismiss}',
+    'const [dismissed, setDismissed] = useState(false)',
+    'x === y',
+  ])
     assert.doesNotMatch(bad, policy.DISMISS_PER_VERSION_RE, bad);
 });
 
@@ -346,15 +383,27 @@ test('template drift and leaky-script fixes name sync-templates, never a cp or r
 
 test('secretScriptSyncs: rewrites a drifted or missing secret-scan script, leaves the standard alone', () => {
   const std = policy.STANDARD_SCRIPTS;
-  assert.deepEqual(policy.secretScriptSyncs({ secrets: std.secrets, 'secrets:staged': std['secrets:staged'] }), {});
-  assert.deepEqual(policy.secretScriptSyncs({ secrets: 'gitleaks detect --source . --verbose', 'secrets:staged': std['secrets:staged'] }), {
-    secrets: std.secrets,
-  });
+  assert.deepEqual(
+    policy.secretScriptSyncs({ secrets: std.secrets, 'secrets:staged': std['secrets:staged'] }),
+    {},
+  );
+  assert.deepEqual(
+    policy.secretScriptSyncs({
+      secrets: 'gitleaks detect --source . --verbose',
+      'secrets:staged': std['secrets:staged'],
+    }),
+    {
+      secrets: std.secrets,
+    },
+  );
   assert.deepEqual(policy.secretScriptSyncs({ secrets: 'betterleaks git . --redact -v' }), {
     secrets: std.secrets,
     'secrets:staged': std['secrets:staged'],
   });
-  assert.deepEqual(policy.secretScriptSyncs(undefined), { secrets: std.secrets, 'secrets:staged': std['secrets:staged'] });
+  assert.deepEqual(policy.secretScriptSyncs(undefined), {
+    secrets: std.secrets,
+    'secrets:staged': std['secrets:staged'],
+  });
 });
 
 test('GATE_ORDER: the code review is the last gate, after build and every test tier', () => {
@@ -370,7 +419,9 @@ test('GATE_ORDER: the code review is the last gate, after build and every test t
 // security-sensitive check reads content and the diff builder calls git.
 function reviewFixture(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-reviewer-'));
-  require('child_process').execSync('git init -q && git commit -q --allow-empty -m base', { cwd: dir });
+  require('child_process').execSync('git init -q && git commit -q --allow-empty -m base', {
+    cwd: dir,
+  });
   for (const [f, body] of Object.entries(files)) {
     fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
     fs.writeFileSync(path.join(dir, f), body);
@@ -459,14 +510,19 @@ test('normalizeValueFlags/flagValue: --reviewer claude is read as a value, not a
   assert.deepEqual(rest, ['gates', '--reviewer=claude', '.']);
   assert.equal(policy.flagValue(rest, '--reviewer'), 'claude');
   assert.equal(policy.flagValue(['--fast'], '--reviewer'), null);
-  assert.deepEqual(policy.normalizeValueFlags(['--reviewer', '--fast'], ['--reviewer']), ['--reviewer', '--fast']);
+  assert.deepEqual(policy.normalizeValueFlags(['--reviewer', '--fast'], ['--reviewer']), [
+    '--reviewer',
+    '--fast',
+  ]);
 });
 
 test('hook source: the --reviewer refusal tolerates no spelling of claude but a bare coderabbit', () => {
   // The hook runs as a process on stdin JSON, so the predicate is read out of
   // the source and exercised here the way bashWriteTargets is above.
   const src = fs.readFileSync(path.join(ROOT, 'scripts', 'policy.js'), 'utf8');
-  const m = src.match(/\/(policy\\\.js\[.*?--reviewer\\b)\/\.test\(cmd\) &&\s*!\/(--reviewer\[=\\s\]\+coderabbit[^/]*)\/\.test\(cmd\)/);
+  const m = src.match(
+    /\/(policy\\\.js\[.*?--reviewer\\b)\/\.test\(cmd\) &&\s*!\/(--reviewer\[=\\s\]\+coderabbit[^/]*)\/\.test\(cmd\)/,
+  );
   assert.ok(m, 'refusal predicate present');
   const flag = new RegExp(m[1]);
   const allowed = new RegExp(m[2]);
@@ -492,7 +548,10 @@ test('hook source: the --reviewer refusal tolerates no spelling of claude but a 
 
 test('judgeClaudeReview: findings decide; a missing, erroring or malformed result fails', () => {
   const j = policy.judgeClaudeReview;
-  const out = (findings, verdict = 'pass') => ({ is_error: false, structured_output: { verdict, findings } });
+  const out = (findings, verdict = 'pass') => ({
+    is_error: false,
+    structured_output: { verdict, findings },
+  });
   const f = (severity) => ({ severity, file: 'a.js', title: 't', detail: 'd' });
   assert.equal(j(out([f('low'), f('medium')], 'fail')).pass, true);
   assert.equal(j(out([f('high')])).pass, false);
@@ -501,13 +560,22 @@ test('judgeClaudeReview: findings decide; a missing, erroring or malformed resul
   assert.equal(j(null).pass, false);
   assert.match(j({ is_error: true, result: 'Not logged in' }).error, /Not logged in/);
   assert.equal(j({ is_error: false, result: 'plain text' }).pass, false);
-  assert.equal(j({ is_error: false, structured_output: { verdict: 'maybe', findings: [] } }).pass, false);
+  assert.equal(
+    j({ is_error: false, structured_output: { verdict: 'maybe', findings: [] } }).pass,
+    false,
+  );
 });
 
 test('reviewerOf: new markers name their reviewer; pre-2.71 records read as coderabbit', () => {
   const r = policy.reviewerOf;
-  assert.equal(r({ gates: ['Build', 'Code review'], review: { reviewer: 'claude', reason: 'x' } }), 'claude');
-  assert.equal(r({ gates: ['Build', 'Code review'], review: { reviewer: 'coderabbit' } }), 'coderabbit');
+  assert.equal(
+    r({ gates: ['Build', 'Code review'], review: { reviewer: 'claude', reason: 'x' } }),
+    'claude',
+  );
+  assert.equal(
+    r({ gates: ['Build', 'Code review'], review: { reviewer: 'coderabbit' } }),
+    'coderabbit',
+  );
   assert.equal(r({ gates: ['Build', 'CodeRabbit review'] }), 'coderabbit');
   assert.equal(r({ reviewedSourceHash: 'abc', head: 'h' }), 'coderabbit');
   assert.equal(r({ reviewedSourceHash: 'abc', reviewer: 'claude' }), 'claude');
@@ -532,11 +600,22 @@ test('offTrunkBranch: null on main or master or outside git, the branch name oth
 
 test('repoHasNoCommits: true after git init, false after the root commit, false outside git', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-root-'));
-  const git = (args) => require('child_process').execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
+  const git = (args) =>
+    require('child_process').execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
   assert.equal(policy.repoHasNoCommits(dir), false);
   git(['init', '-q']);
   assert.equal(policy.repoHasNoCommits(dir), true);
-  git(['-c', 'user.name=t', '-c', 'user.email=t@localhost', 'commit', '-q', '--allow-empty', '-m', 'root']);
+  git([
+    '-c',
+    'user.name=t',
+    '-c',
+    'user.email=t@localhost',
+    'commit',
+    '-q',
+    '--allow-empty',
+    '-m',
+    'root',
+  ]);
   assert.equal(policy.repoHasNoCommits(dir), false);
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -547,7 +626,8 @@ test('audit approvals: bound to the project, so a copied approval does not count
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'this-site' }));
   fs.writeFileSync(path.join(dir, 'audit-exceptions.json'), JSON.stringify({ 'GHSA-x': e }));
   // Test fixture only: writes the approvals file in a temp dir to exercise the predicate.
-  const approve = (rec) => fs.writeFileSync(path.join(dir, 'audit-approvals.json'), JSON.stringify({ 'GHSA-x': rec }));
+  const approve = (rec) =>
+    fs.writeFileSync(path.join(dir, 'audit-approvals.json'), JSON.stringify({ 'GHSA-x': rec }));
   const hash = policy.auditEntryHash(e);
   assert.equal(policy.auditProjectId(dir), 'this-site');
   // Legacy (no project) or copied from another project: not approved here.
@@ -586,24 +666,45 @@ test('formatAuditEntry: the reason reads as wrapped prose with the facts beside 
 
 test('unpresentedExceptions: an unapproved entry counts as presented only when the reply carries its reason', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-present-'));
-  const e = { package: 'p', via: 'q', reason: 'Only reached when remote  images are configured; none are.', decided: '2026-10-01', expires: '2026-12-01' };
+  const e = {
+    package: 'p',
+    via: 'q',
+    reason: 'Only reached when remote  images are configured; none are.',
+    decided: '2026-10-01',
+    expires: '2026-12-01',
+  };
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'site' }));
   fs.writeFileSync(path.join(dir, 'audit-exceptions.json'), JSON.stringify({ 'GHSA-x': e }));
   assert.deepEqual(policy.unpresentedExceptions(dir, 'Run the approve command.'), ['GHSA-x']);
   assert.deepEqual(policy.unpresentedExceptions(dir, null), ['GHSA-x']);
   // Whitespace and wrapping in the reply do not matter.
-  assert.deepEqual(policy.unpresentedExceptions(dir, 'Here it is:\n  Only reached when remote images are\n  configured; none are.\nThen run it.'), []);
+  assert.deepEqual(
+    policy.unpresentedExceptions(
+      dir,
+      'Here it is:\n  Only reached when remote images are\n  configured; none are.\nThen run it.',
+    ),
+    [],
+  );
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test('lastAssistantText: the final assistant text block in a transcript', () => {
   const f = path.join(os.tmpdir(), `policy-transcript-${process.pid}.jsonl`);
-  fs.writeFileSync(f, [
-    JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: 'hi' }] } }),
-    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'first' }] } }),
-    'not json',
-    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use' }, { type: 'text', text: 'last' }] } }),
-  ].join('\n'));
+  fs.writeFileSync(
+    f,
+    [
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: 'hi' }] } }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'first' }] },
+      }),
+      'not json',
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use' }, { type: 'text', text: 'last' }] },
+      }),
+    ].join('\n'),
+  );
   assert.equal(policy.lastAssistantText(f), 'last');
   assert.equal(policy.lastAssistantText(f + '.missing'), null);
   fs.rmSync(f, { force: true });
@@ -612,7 +713,10 @@ test('lastAssistantText: the final assistant text block in a transcript', () => 
 test('every message that hands the developer the approve command names --confirm', () => {
   const src = fs.readFileSync(path.join(ROOT, 'scripts', 'policy.js'), 'utf8');
   const sites = src.match(/approve-exception \$\{[^}]+\}[^`'\n]*/g) || [];
-  assert.ok(sites.length >= 3, `expected the check, Stop hook and first-step sites, found ${sites.length}`);
+  assert.ok(
+    sites.length >= 3,
+    `expected the check, Stop hook and first-step sites, found ${sites.length}`,
+  );
   for (const s of sites) assert.match(s, /--confirm/, s);
   assert.match(src, /approve-exception <GHSA-id> --confirm/);
 });
@@ -642,7 +746,10 @@ test('helpPagesStatus: pages are read from the app side by slug or source, pendi
     'current.mdx',
     `app: product\nverifiedVersion: 2.1.0\nlastVerified: ${today}\nsources:\n  - app-one/src/App.tsx`,
   );
-  page('old-minor.mdx', `app: app-one\nverifiedVersion: 2.0.4\nlastVerified: ${today}\nsources: []`);
+  page(
+    'old-minor.mdx',
+    `app: app-one\nverifiedVersion: 2.0.4\nlastVerified: ${today}\nsources: []`,
+  );
   page(
     'stale-source.mdx',
     `app: app-one\nverifiedVersion: 2.1.0\nlastVerified: 2020-01-01\nsources:\n  - app-one/src/App.tsx`,
@@ -744,7 +851,10 @@ test('supersededDependabotPrs: the lockfile at or past the offered version super
     r.open.map((p) => p.number),
     [30, 31, 32],
   );
-  assert.equal(policy.parseDependabotTitle('build(deps-dev): bump vite from 7.1.0 to 7.1.2').name, 'vite');
+  assert.equal(
+    policy.parseDependabotTitle('build(deps-dev): bump vite from 7.1.0 to 7.1.2').name,
+    'vite',
+  );
   assert.equal(policy.parseDependabotTitle('Bump the radix group with 4 updates'), null);
   assert.ok(policy.semverGte('2.0.0-beta.1', '1.9.9'));
   assert.ok(!policy.semverGte('1.2.9', '1.10.0'));
@@ -757,19 +867,39 @@ test('supersededDependabotPrs: a posted review moves an open PR to reviewed with
   });
   const prs = [
     { number: 40, title: 'Bump a from 1.0.0 to 1.0.1', comments: [review('CLEAN TO MERGE')] },
-    { number: 41, title: 'Bump b from 1.0.0 to 1.0.1', comments: [review('CLEAN TO MERGE'), review('DO NOT MERGE')] },
-    { number: 42, title: 'Bump c from 1.0.0 to 1.0.1', comments: [{ author: { login: 'owner' }, body: 'Looks fine to me' }] },
+    {
+      number: 41,
+      title: 'Bump b from 1.0.0 to 1.0.1',
+      comments: [review('CLEAN TO MERGE'), review('DO NOT MERGE')],
+    },
+    {
+      number: 42,
+      title: 'Bump c from 1.0.0 to 1.0.1',
+      comments: [{ author: { login: 'owner' }, body: 'Looks fine to me' }],
+    },
     {
       number: 45,
       title: 'Bump e from 1.0.0 to 1.0.1',
-      comments: [{ author: { login: 'stranger' }, body: '**CLEAN TO MERGE**\n\nSuggested action: merge' }],
+      comments: [
+        { author: { login: 'stranger' }, body: '**CLEAN TO MERGE**\n\nSuggested action: merge' },
+      ],
     },
     { number: 43, title: 'Bump d from 1.0.0 to 1.0.1' },
     { number: 44, title: 'Bump a from 1.0.0 to 1.0.1', comments: [review('CLEAN TO MERGE')] },
   ];
-  const r = policy.supersededDependabotPrs(prs, { 'node_modules/a': { version: '1.0.1' } }, 'owner');
-  assert.deepEqual(r.superseded.map((p) => p.number), [40, 44]);
-  assert.deepEqual(r.open.map((p) => p.number), [42, 45, 43]);
+  const r = policy.supersededDependabotPrs(
+    prs,
+    { 'node_modules/a': { version: '1.0.1' } },
+    'owner',
+  );
+  assert.deepEqual(
+    r.superseded.map((p) => p.number),
+    [40, 44],
+  );
+  assert.deepEqual(
+    r.open.map((p) => p.number),
+    [42, 45, 43],
+  );
   assert.deepEqual(
     r.reviewed.map((p) => [p.number, p.verdict]),
     [[41, 'DO NOT MERGE']],
@@ -777,7 +907,10 @@ test('supersededDependabotPrs: a posted review moves an open PR to reviewed with
   const mine = { author: { login: 'owner' }, body: 'Suggested action: close it' };
   assert.equal(policy.dependabotReviewVerdict([mine], 'owner'), 'reviewed');
   assert.equal(policy.dependabotReviewVerdict([mine], null), null, 'no known login: no verdict');
-  assert.equal(policy.dependabotReviewVerdict([{ body: 'Suggested action: merge' }], 'owner'), null);
+  assert.equal(
+    policy.dependabotReviewVerdict([{ body: 'Suggested action: merge' }], 'owner'),
+    null,
+  );
   assert.equal(policy.dependabotReviewVerdict([], 'owner'), null);
   assert.equal(policy.dependabotReviewVerdict(undefined, 'owner'), null);
   assert.equal(policy.supersededDependabotPrs(prs, {}, null).reviewed.length, 0);
@@ -789,7 +922,10 @@ test('isArchived and dependabotPrLimit: read from package.json and dependabot.ym
   assert.equal(policy.dependabotPrLimit(dir), 5);
   fs.writeFileSync(path.join(dir, 'package.json'), '{"name":"x","policy":{"archived":true}}');
   fs.mkdirSync(path.join(dir, '.github'), { recursive: true });
-  fs.writeFileSync(path.join(dir, '.github', 'dependabot.yml'), 'updates:\n  - open-pull-requests-limit: 10\n');
+  fs.writeFileSync(
+    path.join(dir, '.github', 'dependabot.yml'),
+    'updates:\n  - open-pull-requests-limit: 10\n',
+  );
   assert.equal(policy.isArchived(dir), true);
   assert.equal(policy.dependabotPrLimit(dir), 10);
   fs.rmSync(dir, { recursive: true, force: true });
@@ -806,11 +942,19 @@ test('verify-package: repo name match, sibling maintainers and provenance are pu
     repo: 'primitives',
   });
   assert.equal(vp.parseGithubRepo('https://gitlab.com/a/b'), null);
-  assert.equal(vp.parseGithubRepo('https://github.com/owner/..'), null, 'path walking owner or repo is refused');
+  assert.equal(
+    vp.parseGithubRepo('https://github.com/owner/..'),
+    null,
+    'path walking owner or repo is refused',
+  );
   assert.equal(vp.parseGithubRepo('https://github.com/own%2Fer/repo'), null);
   assert.equal(vp.safeDirectory('packages/react/tooltip'), 'packages/react/tooltip');
   assert.equal(vp.safeDirectory('/types/node/'), 'types/node');
-  assert.equal(vp.safeDirectory('../../squatter/fake/HEAD'), null, 'a directory cannot leave the repository');
+  assert.equal(
+    vp.safeDirectory('../../squatter/fake/HEAD'),
+    null,
+    'a directory cannot leave the repository',
+  );
   assert.equal(vp.safeDirectory('a/./b'), null);
   assert.equal(vp.safeDirectory('a?x=1'), null);
   assert.equal(vp.safeDirectory(''), null);
@@ -818,18 +962,48 @@ test('verify-package: repo name match, sibling maintainers and provenance are pu
   assert.equal(vp.parseGithubRepo(null), null);
 
   assert.equal(vp.repoNameMatch('express', { name: 'express' }, null), 'match');
-  assert.equal(vp.repoNameMatch('@radix-ui/react-tooltip', { name: 'primitives', workspaces: ['packages/*'] }, { name: '@radix-ui/react-tooltip' }), 'match');
-  assert.equal(vp.repoNameMatch('evil-express', { name: 'express' }, null), 'mismatch', 'squat pointing at a real repo');
-  assert.equal(vp.repoNameMatch('x', { name: 'root', workspaces: ['packages/*'] }, { name: 'other' }), 'mismatch', 'directory given, wrong name');
-  assert.equal(vp.repoNameMatch('x', { name: 'root', workspaces: ['packages/*'] }, null), 'monorepo');
+  assert.equal(
+    vp.repoNameMatch(
+      '@radix-ui/react-tooltip',
+      { name: 'primitives', workspaces: ['packages/*'] },
+      { name: '@radix-ui/react-tooltip' },
+    ),
+    'match',
+  );
+  assert.equal(
+    vp.repoNameMatch('evil-express', { name: 'express' }, null),
+    'mismatch',
+    'squat pointing at a real repo',
+  );
+  assert.equal(
+    vp.repoNameMatch('x', { name: 'root', workspaces: ['packages/*'] }, { name: 'other' }),
+    'mismatch',
+    'directory given, wrong name',
+  );
+  assert.equal(
+    vp.repoNameMatch('x', { name: 'root', workspaces: ['packages/*'] }, null),
+    'monorepo',
+  );
   assert.equal(vp.repoNameMatch('x', null, null), 'unknown');
   assert.equal(vp.repoNameMatch('x', {}, null), 'unknown');
 
-  assert.equal(vp.sharesMaintainer({ maintainers: [{ name: 'a' }, { name: 'b' }] }, { maintainers: [{ name: 'b' }] }), true);
-  assert.equal(vp.sharesMaintainer({ maintainers: [{ name: 'a' }] }, { maintainers: [{ name: 'b' }] }), false);
+  assert.equal(
+    vp.sharesMaintainer(
+      { maintainers: [{ name: 'a' }, { name: 'b' }] },
+      { maintainers: [{ name: 'b' }] },
+    ),
+    true,
+  );
+  assert.equal(
+    vp.sharesMaintainer({ maintainers: [{ name: 'a' }] }, { maintainers: [{ name: 'b' }] }),
+    false,
+  );
   assert.equal(vp.sharesMaintainer({ maintainers: [{ name: 'a' }] }, null), false);
 
-  assert.equal(vp.hasProvenance({ dist: { attestations: { url: 'u', provenance: { predicateType: 'p' } } } }), true);
+  assert.equal(
+    vp.hasProvenance({ dist: { attestations: { url: 'u', provenance: { predicateType: 'p' } } } }),
+    true,
+  );
   assert.equal(vp.hasProvenance({ dist: { attestations: { url: 'u' } } }), false);
   assert.equal(vp.hasProvenance({ dist: {} }), false);
   assert.equal(vp.hasProvenance(undefined), false);
@@ -914,5 +1088,208 @@ test('coverage proofs: a gate that examined nothing is not a pass', () => {
   assert.deepEqual(pats('vitest run'), []);
   assert.deepEqual(pats('node tests/unit.js'), [], 'a custom runner names no --test patterns');
   assert.deepEqual(pats('npm run build && node --test dist/test/*.js'), ['dist/test/*.js']);
-  assert.deepEqual(policy.TEST_GATE_SCRIPTS, ['test:unit', 'test:smoke', 'test:integration', 'test:flows']);
+  assert.deepEqual(policy.TEST_GATE_SCRIPTS, [
+    'test:unit',
+    'test:smoke',
+    'test:integration',
+    'test:flows',
+  ]);
+});
+
+test('treeScanGaps: eslint and vitest over the tree must ignore .claude/ (agent worktrees)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-treescan-'));
+  const gaps = (scripts) => policy.treeScanGaps(dir, scripts);
+  fs.writeFileSync(
+    path.join(dir, 'eslint.config.js'),
+    "export default [{ ignores: ['dist/**'] }];\n",
+  );
+  assert.equal(
+    gaps({ lint: 'eslint . --max-warnings 0' }).length,
+    1,
+    'eslint . without the ignore',
+  );
+  assert.equal(gaps({ lint: 'eslint --max-warnings 0' }).length, 1, 'bare eslint defaults to .');
+  assert.equal(
+    gaps({ lint: 'eslint src server' }).length,
+    0,
+    'explicit paths never reach .claude/',
+  );
+  fs.writeFileSync(
+    path.join(dir, 'eslint.config.js'),
+    "export default [{ ignores: ['dist/**', '.claude/**'] }];\n",
+  );
+  assert.equal(gaps({ lint: 'eslint . --max-warnings 0' }).length, 0, 'ignored');
+  assert.equal(
+    gaps({ lint: 'eslint .', 'test:unit': 'vitest run' }).length,
+    1,
+    'vitest, no config',
+  );
+  assert.equal(
+    gaps({ lint: 'eslint .', 'test:unit': 'vitest run src/utils --pool=threads' }).length,
+    0,
+  );
+  fs.writeFileSync(
+    path.join(dir, 'vite.config.ts'),
+    "export default { test: { exclude: ['node_modules/**', '.claude/**'] } };\n",
+  );
+  assert.equal(gaps({ lint: 'eslint .', 'test:unit': 'vitest run' }).length, 0, 'vitest excluded');
+  assert.equal(gaps({ lint: 'eslint .', 'test:unit': 'node --test tests/*.test.js' }).length, 0);
+});
+
+test('handlesByokKeys: matched on the provider call surface, not the word', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-byok-'));
+  fs.mkdirSync(path.join(dir, 'server'));
+  fs.writeFileSync(
+    path.join(dir, 'server', 'settings.js'),
+    "const providers = ['openai', 'anthropic'];\n",
+  );
+  assert.equal(policy.handlesByokKeys(dir), false, 'a dropdown is not a call');
+  fs.writeFileSync(
+    path.join(dir, 'server', 'ai.js'),
+    "import Anthropic from '@anthropic-ai/sdk';\n",
+  );
+  assert.equal(policy.handlesByokKeys(dir), true);
+  assert.match("fetch('https://api.openai.com/v1/chat')", policy.BYOK_CALL);
+});
+
+test('cmdScaffold --dry-run lists what it would add and writes nothing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-scaffold-dry-'));
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', scripts: {} }));
+  const before = fs.readdirSync(dir).sort();
+  const plan = policy.cmdScaffold(dir, { dryRun: true, quiet: true });
+  assert.deepEqual(fs.readdirSync(dir).sort(), before, 'nothing written');
+  assert.ok(plan.created.includes('.gitignore'));
+  assert.ok(plan.created.some((c) => c.startsWith('package.json scripts:')));
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).scripts.lint,
+    undefined,
+  );
+});
+
+test('ensureElectronBinary: absent module is null, a present binary is not re-downloaded', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-electron-'));
+  assert.equal(policy.ensureElectronBinary(dir), null);
+  const mod = path.join(dir, 'node_modules', 'electron');
+  fs.mkdirSync(path.join(mod, 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(mod, 'path.txt'), 'Electron\n');
+  fs.writeFileSync(path.join(mod, 'dist', 'Electron'), '');
+  assert.deepEqual(policy.ensureElectronBinary(dir), { present: true, downloaded: false });
+});
+
+test('site images: refs, prefix mapping, release status and the site audit', () => {
+  const site = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-site-'));
+  const reg = {
+    siteProject: path.basename(site),
+    siteApps: {
+      'app-one': { img: ['bp'] },
+      'app-two': { repo: 'app-two-repo', img: ['ds'] },
+    },
+    siteSharedImages: ['membership'],
+  };
+  fs.mkdirSync(path.join(site, 'img', 'bp'), { recursive: true });
+  fs.mkdirSync(path.join(site, 'img', 'membership'), { recursive: true });
+  fs.mkdirSync(path.join(site, 'app-one'), { recursive: true });
+  fs.mkdirSync(path.join(site, 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(site, 'img', 'bp', 'hero.png'), '');
+  fs.writeFileSync(path.join(site, 'img', 'bp', 'budget.png'), '');
+  fs.writeFileSync(path.join(site, 'img', 'membership', 'plans.png'), '');
+  fs.writeFileSync(path.join(site, 'package.json'), '{"name":"site"}');
+  fs.writeFileSync(path.join(site, 'app-one', 'version.json'), '{"version":"2.1.0"}');
+  fs.writeFileSync(
+    path.join(site, 'index.html'),
+    '<img src="/img/bp/hero.png"><img src="/img/membership/plans.png"><img src="/img/zz/x.png">',
+  );
+  fs.writeFileSync(path.join(site, 'app-one', 'index.html'), '<img src="/img/bp/budget.png">');
+  fs.writeFileSync(path.join(site, 'dist', 'index.html'), '<img src="/img/bp/built.png">');
+
+  const refs = policy.siteImageRefs(site);
+  assert.deepEqual([...refs.keys()].sort(), [
+    'img/bp/budget.png',
+    'img/bp/hero.png',
+    'img/membership/plans.png',
+    'img/zz/x.png',
+  ]);
+  assert.deepEqual([...refs.get('img/bp/hero.png')], ['index.html'], 'dist is not scanned');
+  assert.equal(policy.siteImageApp('img/bp/hero.png', reg), 'app-one');
+  assert.equal(policy.siteImageApp('img/membership/plans.png', reg), null, 'shared');
+  assert.equal(policy.siteImageApp('img/logo.png', reg), null, 'root-level');
+  assert.equal(policy.siteImageApp('img/zz/x.png', reg), undefined, 'unclaimed prefix');
+
+  // App side: no manifest yet.
+  const app = path.join(path.dirname(site), 'app-one-' + path.basename(site));
+  fs.mkdirSync(app, { recursive: true });
+  fs.writeFileSync(path.join(app, 'package.json'), '{"name":"app-one","version":"2.1.0"}');
+  const regApp = {
+    ...reg,
+    siteApps: { 'app-one': { repo: path.basename(app), img: ['bp'] } },
+  };
+  let st = policy.siteImagesStatus(app, { registry: regApp, siteDir: site });
+  assert.equal(st.manifestMissing, true);
+  assert.equal(
+    policy.siteImagesStatus(app, { registry: { ...reg, siteApps: {} }, siteDir: site }),
+    null,
+    'unmapped repo',
+  );
+
+  // Manifest: one image a minor behind, one current, one shared.
+  fs.writeFileSync(
+    path.join(site, 'img', 'screenshots.json'),
+    JSON.stringify({
+      images: {
+        'img/bp/hero.png': {
+          app: 'app-one',
+          verifiedVersion: '2.0.3',
+          lastVerified: '2026-09-01',
+        },
+        'img/bp/budget.png': {
+          app: 'app-one',
+          verifiedVersion: '2.1.0',
+          lastVerified: '2026-10-01',
+        },
+        'img/membership/plans.png': {
+          app: null,
+          verifiedVersion: null,
+          lastVerified: '2026-10-01',
+        },
+      },
+    }),
+  );
+  st = policy.siteImagesStatus(app, { registry: regApp, siteDir: site });
+  assert.equal(st.images.length, 2);
+  assert.equal(st.pending.length, 1);
+  assert.match(st.pending[0], /hero\.png.*2\.0\.3.*2\.1\.0/);
+  assert.deepEqual(st.verified, ['2.0.3', '2.1.0']);
+  fs.writeFileSync(path.join(app, 'package.json'), '{"name":"app-one","version":"2.1.4"}');
+  assert.equal(
+    policy.siteImagesStatus(app, { registry: regApp, siteDir: site }).pending.length,
+    1,
+    'patch bump changes nothing',
+  );
+});
+
+test('site capture: generated shots compare exactly, hand-made ones by minor; the hook regex', () => {
+  const b = policy.imageBehind;
+  assert.equal(
+    b({ captured: true, verifiedVersion: '1.5.0' }, '1.5.1'),
+    true,
+    'patch moves a captured shot',
+  );
+  assert.equal(b({ captured: true, verifiedVersion: '1.5.1' }, '1.5.1'), false);
+  assert.equal(b({ verifiedVersion: '1.5.0' }, '1.5.9'), false, 'hand-made: patch is fine');
+  assert.equal(b({ verifiedVersion: '1.5.0' }, '1.6.0'), true);
+  assert.equal(b({ verifiedVersion: null }, '0.1.0'), true, 'unverified is behind');
+  const re = policy.SITE_CAPTURE_INVOCATION;
+  const run = (script) => ['npm', 'run', script].join(' ');
+  assert.ok(re.test(run('site:capture')));
+  assert.ok(re.test(['npm', '--prefix', '../some-app', 'run', 'site:capture'].join(' ')));
+  assert.ok(!re.test('grep site:capture package.json'));
+  assert.ok(!re.test(run('docs:' + 'capture')));
+});
+
+test('siteCaptureWindow: registry value with a 1512x1045 default', () => {
+  assert.deepEqual(policy.siteCaptureWindow({}), { width: 1512, height: 1045 });
+  assert.deepEqual(
+    policy.siteCaptureWindow({ siteCaptureWindow: { width: '1600', height: 1000 } }),
+    { width: 1600, height: 1000 },
+  );
 });

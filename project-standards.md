@@ -1,7 +1,7 @@
 # Project Standards
 
 The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
-**Version:** 2.74
+**Version:** 2.78
 **Last updated:** 2026-10-16
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
@@ -247,6 +247,7 @@ Note the site-wide CORS rule is dashboard configuration, outside version control
 
   **Written for customers, not mirrored from the repo `CHANGELOG.md`.** The repo changelog is a development record: per-version, detailed, and it names internal tooling, scripts and file paths. The public entry states user-visible impact in plain language, and bundles internal work into one "under the hood" line or omits it. Do not reveal implementation detail that only helps someone probing the app.
 - **Site-side, checked when `policy check` runs in the marketing-site repo:** every app directory publishing a `version.json` must have a `changelog/index.html`, that page must link to the store so a customer sent there by the banner can actually download, and the `url` field in `version.json` must be that changelog page. These are obligations rather than tidiness because the far end of the link lives in software already installed and cannot be fixed there.
+- **Product-page screenshots carry the version they show.** The site's `img/screenshots.json` records, per image, the site app, `verifiedVersion` and `lastVerified`; after a release the screenshots are re-shot or confirmed in the site session and recorded with `policy site-images --verify <app>` (no flag prints where each app stands, and `--init` creates the manifest once). The app's `verify-ready --release` reads the same record for the "Product-page screenshots current" step, so a version bumped without the screenshots being looked at is caught on both sides.
 - **No in-app license gate** — the store download is the gate. An activation check puts a network dependency in the startup path, burns an activation on every validation, and needs somewhere to store the key.
 - **These four are enforced, not advisory.** `check` FAILs an Electron project that carries a puppeteer dependency, calls the store licence API, uses `safeStorage`, or has no `findFreePort()`. Matching is on imports and calls, so discussing `safeStorage` in a comment (to record that a project moved off it) does not flag.
 - **Electron itself is audited, despite being a devDependency.** The `security` script is `--omit=dev` because the gate models shipped risk and dev dependencies do not ship. Electron is the exception: electron-builder bundles it into the DMG, so Chromium is in the shipped artifact while sitting in `devDependencies`. `gates` therefore audits the full tree for Electron projects and FAILs on an Electron high or critical advisory only, leaving dev-chain advisories out of the gate. It runs in `gates` rather than `check` because it is a network call and the session-start hook has a 10 second budget. When it fires, check whether the fix is inside the declared range: if so `policy deps-update` resolves it, otherwise it needs a major upgrade decision (`policy upgrade electron`).
@@ -256,6 +257,15 @@ Note the site-wide CORS rule is dashboard configuration, outside version control
 - **Diagnostics:** structured local logging + "Export diagnostics" — see § Diagnostics Logging.
 - **Privacy disclosure:** BYOK apps send user content to the configured AI provider — state this consistently in the app's settings UI, README/listing, and the site's terms page. No commercial release without the disclosure in place.
 - **Both providers, not one.** A BYOK app must wire up Anthropic *and* OpenAI. Supporting one makes an account with that vendor a condition of using the app, which is a purchase barrier rather than a preference: a buyer who already pays OpenAI should not need a second vendor relationship to open something they bought. `check` FAILs an Electron project that calls one provider and not the other, matching on the SDK import or API host rather than the vendor's name, since settings copy, type unions and stale-key migrations mention providers an app never calls. Apps with no AI at all are not flagged. The reference shape is a `MODELS` map keyed by provider with per-provider stored keys and a per-provider validation path.
+
+### Product-page screenshots
+
+- A site app with Playwright flows carries `"site:capture": "npm run build && SITE_CAPTURE=1 playwright test"`. `check` FAILs a site app with flows and no such script, or whose flows do not read the variables in the next bullet; `scaffold` adds the script.
+- The flows read `SITE_CAPTURE`, `SITE_CAPTURE_DIR`, `SITE_CAPTURE_WIDTH` and `SITE_CAPTURE_HEIGHT` from the environment and hard-code neither a size nor a path. When `SITE_CAPTURE` is `1` they write each product shot to `SITE_CAPTURE_DIR`, under the filename the product page references, at the window the two size variables give. They use the demo fixture only. `policy site-capture` sets the size from the registry key `siteCaptureWindow` (default 1512x1045 CSS px, which gives the 3024x2090 pixels of the existing shots); a site app overrides it with `siteApps.<app>.captureWindow`.
+- The site session regenerates the shots during the release checklist with `policy site-capture <app>`. It runs the script with `SITE_CAPTURE_DIR` set to the site's `img/<prefix>/`, marks the captured entries verified against the app's version, and lists hand-made images (composed heroes, store covers) for `policy site-images --verify <app>`.
+- Captured files that no page references are a WARN from `site-capture`.
+- "Behind" differs by kind. A captured screenshot is behind when the app's version differs at all, patch included, so buyers see the shipping build. A hand-made image is behind when the minor moves, as for help pages.
+- `site-capture` refuses an unknown app or one with no `site:capture` script. Its release pre-flight and sign-off messages name the command first.
 
 ### External State Must Be Subscribed, Not Polled Once
 
@@ -505,6 +515,8 @@ These are the ONLY sanctioned global exclusions (`check` FAILs any other). Anyth
 - `eslint-plugin-react-hooks` — React Hooks rules
 - `eslint-plugin-import` — Import ordering
 - `eslint-plugin-security` — Security anti-pattern detection (eval, non-literal require, regex DoS). Sanctioned rule-offs (triaged, too noisy for local-data apps): `security/detect-object-injection`, `security/detect-non-literal-fs-filename`. All other security rules stay on, and the ESLint config must cover ALL first-party code — never add `server/` (or any source dir) to `ignores`.
+
+**Tree-scanning gates ignore `.claude/`.** Claude Code's worktree isolation checks out a full copy of the repo, on an older commit, under `.claude/worktrees/`. ESLint flat config and vitest do not read `.gitignore`, so a tree scan that does not exclude that folder lints or tests the stale copy and can fail a gate on code that is not in the commit. `policy check` FAILs an eslint `lint` script that runs over `.` (or with no path) when no ESLint config mentions `.claude`, and a vitest test script with no path when no vitest config mentions it. The ESLint fix is `'.claude/**'` in the `ignores` entry of `eslint.config.js`; the vitest fix is `test.exclude: [...configDefaults.exclude, '.claude/**']`. Prettier and semgrep need no change because they honour the gitignore file, which already lists the worktree folder.
 
 **Required Prettier plugins:**
 - `prettier-plugin-tailwindcss` — Tailwind class sorting

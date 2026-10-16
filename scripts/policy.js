@@ -32,6 +32,14 @@
  *   verify-ready [dir]  Confirm gates marker matches current diff + changelog updated
  *                         --release      add release checks (version, attribution, checklist)
  *                         --ack-manual   record that manual release checks were performed
+ *   site-images [dir]   From the site project: track which app version each product-page
+ *                         screenshot was verified against (img/screenshots.json)
+ *                         --init                     add every referenced image at the site's current versions
+ *                         --verify <app> [--version <v>]  record an app's screenshots as checked
+ *   site-capture <app>  From the site project: run the app's site:capture flows into the site's
+ *                         image folder and record the result in img/screenshots.json
+ *                         --version <v>              record against this version instead of the app's
+ *                         (sets SITE_CAPTURE=1, SITE_CAPTURE_DIR and the window from registry siteCaptureWindow)
  *   help-handback <app> From the help site project: confirm an app's help pages are current
  *                         and committed, then print the message to paste into the app session
  *   health [dir]        Maintenance run: outdated, audit, registry staleness; records timestamp
@@ -582,6 +590,133 @@ function sourceFilesMatching(dir, pattern, exts = /\.(ts|tsx|js|jsx|mjs|cjs)$/) 
   return hits.sort();
 }
 
+// A BYOK app, matched on the call surface (SDK import or API host): the test
+// the provider-coverage check uses, shared so scaffold and check agree on
+// what "handles API keys" means. Scaffold used to key secret storage on
+// "Electron app with no AES-256-CBC code", which also describes an app with
+// nothing to encrypt: one app here has no AI feature and got an unimported
+// copy with the placeholder still in it, which the Stop hook then flagged as
+// a security-sensitive change (2026-10-16).
+const ANTHROPIC_CALL = /api\.anthropic\.com|['"]@anthropic-ai\/sdk['"]/;
+const OPENAI_CALL = /api\.openai\.com|from\s+['"]openai['"]|require\(['"]openai['"]\)/;
+const BYOK_CALL = new RegExp(`${ANTHROPIC_CALL.source}|${OPENAI_CALL.source}`);
+function handlesByokKeys(dir) {
+  return sourceFilesMatching(dir, BYOK_CALL).length > 0;
+}
+
+// Tools pointed at the whole tree see everything under it, including the
+// checkouts Claude Code's worktree isolation creates in .claude/worktrees/:
+// a full copy of the repo on an older commit. ESLint flat config and vitest
+// do not read .gitignore, so `eslint .` linted a worktree's stale
+// server/index.js and failed one app's gates on a warning in code that
+// was not in the tree being committed (2026-10-16). Prettier and semgrep
+// honour .gitignore, where .claude/ is already required; playwright and
+// node --test take explicit paths; html-validate takes a top-level glob.
+// Returns one message per tool that scans the tree without the ignore.
+const ESLINT_CONFIGS = [
+  'eslint.config.js',
+  'eslint.config.mjs',
+  'eslint.config.cjs',
+  'eslint.config.ts',
+  'eslint.config.mts',
+  'eslint.config.cts',
+  '.eslintrc',
+  '.eslintrc.js',
+  '.eslintrc.cjs',
+  '.eslintrc.json',
+  '.eslintrc.yml',
+  '.eslintrc.yaml',
+  '.eslintignore',
+];
+const VITEST_CONFIGS = [
+  'vitest.config.ts',
+  'vitest.config.js',
+  'vitest.config.mts',
+  'vitest.config.mjs',
+  'vitest.workspace.ts',
+  'vitest.workspace.js',
+  'vite.config.ts',
+  'vite.config.js',
+  'vite.config.mts',
+  'vite.config.mjs',
+];
+// Flags that take their value as the next token, so the value is not read
+// as a path (`eslint --max-warnings 0` scans ".", not a file called 0).
+const VALUE_FLAGS = new Set([
+  '--max-warnings',
+  '--ext',
+  '--config',
+  '-c',
+  '--format',
+  '-f',
+  '--rule',
+  '--parser',
+  '--parser-options',
+  '--ignore-pattern',
+  '--cache-location',
+  '--rulesdir',
+  '--env',
+  '--reporter',
+  '--dir',
+  '--root',
+  '--project',
+  '--pool',
+  '--maxWorkers',
+  '--outputFile',
+]);
+function scriptTargets(script, tool) {
+  const m = new RegExp(`\\b${tool}\\b([^&|;]*)`).exec(script || '');
+  if (!m) return null;
+  const tokens = m[1].split(/\s+/).filter(Boolean);
+  const targets = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t.startsWith('-')) {
+      if (VALUE_FLAGS.has(t)) i++;
+      continue;
+    }
+    if (t !== 'run') targets.push(t);
+  }
+  return targets;
+}
+function anyMentionsClaude(dir, names) {
+  return names.some((n) => /\.claude\b/.test(readFile(path.join(dir, n))));
+}
+function treeScanGaps(dir, scripts) {
+  const gaps = [];
+  const lintTargets = scriptTargets(scripts.lint, 'eslint');
+  const lintsTree = lintTargets && (lintTargets.length === 0 || lintTargets.includes('.'));
+  if (lintsTree && !anyMentionsClaude(dir, ESLINT_CONFIGS)) {
+    gaps.push(
+      `lint runs eslint over the whole tree and the ESLint config does not ignore .claude/ — agent worktrees under .claude/worktrees/ are a full checkout, so the gate lints stale copies of the source. Add '.claude/**' to the ignores entry of eslint.config.js (project-standards § Code Quality)`,
+    );
+  }
+  const unit = TEST_GATE_SCRIPTS.map((k) => scripts[k]).find((v) => v && /\bvitest\b/.test(v));
+  const vitestTargets = unit ? scriptTargets(unit, 'vitest') : null;
+  if (vitestTargets && vitestTargets.length === 0 && !anyMentionsClaude(dir, VITEST_CONFIGS)) {
+    gaps.push(
+      `vitest runs over the whole tree and no vitest/vite config excludes .claude/ — a worktree's copy of every test runs twice, once stale. Add test.exclude: [...configDefaults.exclude, '.claude/**'] to the config (project-standards § Testing tiers)`,
+    );
+  }
+  return gaps;
+}
+
+// Electron's binary arrives through its postinstall. After `npm update` moves
+// electron the first thing to launch it is the flow-test runner, and the
+// download (minutes on a slow link) is charged against the first test's
+// timeout: one app's first flow test timed out after 4.5 minutes
+// following an Electron bump and passed in 26 seconds on the re-run
+// (2026-10-16). Electron's own install.js is idempotent and path.txt names
+// the binary it installed, so this is a no-op when the binary is present.
+function ensureElectronBinary(dir) {
+  const mod = path.join(dir, 'node_modules', 'electron');
+  if (!exists(mod)) return null;
+  const rel = readFile(path.join(mod, 'path.txt')).trim();
+  if (rel && exists(path.join(mod, 'dist', rel))) return { present: true, downloaded: false };
+  const r = sh(`"${process.execPath}" install.js`, mod);
+  return { present: r.ok, downloaded: r.ok, out: r.out };
+}
+
 // Settings footer and update banner rules that project-standards § Electron
 // had stated since the footer was specified and `check` never read. An app
 // session found `check` passing two revisions of its banner and footer that
@@ -601,8 +736,7 @@ function termsLinkRe(termsUrl) {
 // `getItem('dismissedUpdateVersion') === v`. A close button alone that only
 // clears state would re-show the banner at the hourly recheck; one that never
 // compares hides every later release too. Both fail this.
-const DISMISS_PER_VERSION_RE =
-  /dismiss\w*(?:['"`]?\s*\))?\s*[!=]==|[!=]==\s*[\w$.]*dismiss/i;
+const DISMISS_PER_VERSION_RE = /dismiss\w*(?:['"`]?\s*\))?\s*[!=]==|[!=]==\s*[\w$.]*dismiss/i;
 
 /** Comments removed, so a line explaining a rule is not read as obeying or
  *  breaking it. Rough: a `//` inside a string survives as code, which errs
@@ -629,7 +763,10 @@ function uiFilesMatching(dir, pattern) {
  *  `distributes`: the app ships to customers (a shipped DMG or declared
  *  gumroad), which is when Terms are owed. `versionCheck`: the file holding
  *  the update check, or null when the app has no banner to dismiss. */
-function footerBannerFindings(dir, { distributes, versionCheck, termsUrl = loadRegistry().termsUrl }) {
+function footerBannerFindings(
+  dir,
+  { distributes, versionCheck, termsUrl = loadRegistry().termsUrl },
+) {
   const findings = [];
   for (const f of uiFilesMatching(dir, ALL_RIGHTS_RESERVED_RE)) {
     findings.push(
@@ -638,7 +775,7 @@ function footerBannerFindings(dir, { distributes, versionCheck, termsUrl = loadR
   }
   if (distributes && uiFilesMatching(dir, termsLinkRe(termsUrl)).length === 0) {
     findings.push(
-      `no Terms link — the settings footer must link ${termsUrl || 'the site\'s /terms/ page'}, where the product terms and the BYOK privacy disclosure live (project-standards § Electron)`,
+      `no Terms link — the settings footer must link ${termsUrl || "the site's /terms/ page"}, where the product terms and the BYOK privacy disclosure live (project-standards § Electron)`,
     );
   }
   if (versionCheck && uiFilesMatching(dir, DISMISS_PER_VERSION_RE).length === 0) {
@@ -672,11 +809,13 @@ const FONT_HOST_OPT_OUT = /policy:names-font-host/;
 function remoteFontFindings(dir) {
   const findings = [];
   for (const f of sourceFilesMatching(dir, REMOTE_FONT_HOST_RE, FONT_SOURCE_FILES)) {
-    if (/(^|\/)(tests?|__tests__|e2e|docs)\//.test(f) || /\.(test|spec)\.[jt]sx?$/.test(f)) continue;
+    if (/(^|\/)(tests?|__tests__|e2e|docs)\//.test(f) || /\.(test|spec)\.[jt]sx?$/.test(f))
+      continue;
     const lines = stripComments(readFile(path.join(dir, f)))
       .split('\n')
       .filter((l) => REMOTE_FONT_HOST_RE.test(l) && !FONT_HOST_OPT_OUT.test(l));
-    if (lines.length > 0) findings.push(`${f} (${lines.length} line${lines.length === 1 ? '' : 's'})`);
+    if (lines.length > 0)
+      findings.push(`${f} (${lines.length} line${lines.length === 1 ? '' : 's'})`);
   }
   return findings;
 }
@@ -939,6 +1078,8 @@ function auditSite(dir) {
   // The URL each app is told to visit must be the changelog page. This is the
   // one end of the link that stays editable after a DMG ships, so pointing it
   // at a store means losing the update route if distribution ever moves.
+  auditSiteImages(dir);
+
   for (const app of appDirs) {
     const meta = readJSON(path.join(dir, app, 'version.json'));
     if (!meta) {
@@ -954,6 +1095,474 @@ function auditSite(dir) {
           `(…${want}) — a store URL baked into shipped copies becomes a dead end if distribution moves`,
       );
   }
+}
+
+// ------------------------------------------------------------ site images
+//
+// Product-page screenshots on the marketing site had no record of which app
+// version they showed. Help pages carry verifiedVersion/lastVerified in front
+// matter and the release reads it; the site is static HTML with images under
+// img/<prefix>/, and the only rule was a sentence calling the site "human
+// judgment". The same model, applied to images: a manifest in the site repo
+// (img/screenshots.json) records the app and the app version each image was
+// verified against. The site's own check keeps the manifest complete and at
+// the version the site advertises; an app's release pre-flight reads it the
+// way it reads the help pages. Home, membership and the catalogue reuse the
+// product shots, so one entry per file covers every page.
+//
+// registry.json: siteProject names the site folder; siteApps maps each site
+// app (the folder holding version.json) to its repo folder and the img/
+// prefixes it owns; siteSharedImages lists prefixes that belong to no app
+// (tracked for existence only). Names stay in the registry so the mirrored
+// script names no product.
+const SITE_IMAGE_MANIFEST = path.join('img', 'screenshots.json');
+const SITE_IMAGE_EXT = /\.(?:png|jpe?g|webp|gif|avif|svg)$/i;
+
+/** The window product shots are captured at: registry siteCaptureWindow, default 1512x1045. */
+function siteCaptureWindow(reg = loadRegistry()) {
+  const w = reg.siteCaptureWindow || {};
+  return { width: Number(w.width) || 1512, height: Number(w.height) || 1045 };
+}
+
+/** registry siteApps without its _comment and other underscore keys. */
+function siteAppEntries(reg = loadRegistry()) {
+  return Object.entries(reg.siteApps || {}).filter(([k]) => !k.startsWith('_'));
+}
+
+function siteDirFor(dir, siteProject = loadRegistry().siteProject) {
+  if (!siteProject) return null;
+  const candidate = path.join(path.dirname(path.resolve(dir)), siteProject);
+  return exists(path.join(candidate, 'package.json')) ? candidate : null;
+}
+
+/** Every img/ path the site's HTML references, with the pages that use it. */
+function siteImageRefs(siteDir) {
+  const refs = new Map();
+  const SKIP = new Set(['node_modules', 'dist', 'playwright-report', 'test-results', 'tests']);
+  const walk = (d) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name.startsWith('.') || SKIP.has(e.name)) continue;
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!/\.html?$/.test(e.name)) continue;
+      const page = path.relative(siteDir, full);
+      const html = readFile(full);
+      const re = /(?:src|srcset|content|href)=["']\/?(img\/[^"'\s?#,]+)/g;
+      let m;
+      while ((m = re.exec(html))) {
+        if (!SITE_IMAGE_EXT.test(m[1])) continue;
+        if (!refs.has(m[1])) refs.set(m[1], new Set());
+        refs.get(m[1]).add(page);
+      }
+    }
+  };
+  walk(siteDir);
+  return refs;
+}
+
+/**
+ * Which site app an image belongs to, by its img/<prefix>/. Returns the app
+ * folder, null for a shared or root-level image, or undefined when the prefix
+ * is claimed by nothing (a registry gap the site check reports).
+ */
+function siteImageApp(imgPath, reg = loadRegistry()) {
+  const parts = imgPath.split('/');
+  if (parts.length < 3) return null;
+  const prefix = parts[1];
+  if ((reg.siteSharedImages || []).includes(prefix)) return null;
+  for (const [app, cfg] of siteAppEntries(reg)) {
+    if ((cfg.img || []).includes(prefix)) return app;
+  }
+  return undefined;
+}
+
+function readSiteManifest(siteDir) {
+  const m = readJSON(path.join(siteDir, SITE_IMAGE_MANIFEST));
+  return m && typeof m.images === 'object' && m.images ? m : null;
+}
+
+function writeSiteManifest(siteDir, manifest) {
+  const sorted = {};
+  for (const k of Object.keys(manifest.images).sort()) sorted[k] = manifest.images[k];
+  manifest.images = sorted;
+  fs.writeFileSync(
+    path.join(siteDir, SITE_IMAGE_MANIFEST),
+    JSON.stringify(manifest, null, 2) + '\n',
+  );
+}
+
+/** The site folder (the one holding version.json) for an app repo, or null. */
+function siteAppFor(dir, reg = loadRegistry()) {
+  const folder = path.basename(path.resolve(dir));
+  for (const [app, cfg] of siteAppEntries(reg)) {
+    if ((cfg.repo || app) === folder) return app;
+  }
+  return null;
+}
+
+/**
+ * Behind: a generated screenshot (captured by the app's flows) is behind the
+ * moment the app's version differs at all — re-capture is one command, and
+ * a buyer should see the shipping build. A hand-made image (a composed hero,
+ * a store cover) is behind when the minor moves, the help pages' rule, since
+ * confirming it is a judgment, not a command.
+ */
+function imageBehind(e, version) {
+  if (!e) return false;
+  if (e.captured) return String(e.verifiedVersion || '') !== String(version || '');
+  return minorOf(e.verifiedVersion) < minorOf(version);
+}
+
+/**
+ * Where an app's product-page screenshots stand against the app's version,
+ * read from the app's side for the release pre-flight. An image is behind
+ * when its verifiedVersion minor is below the app's minor — the help pages'
+ * rule, so a patch release does not demand a re-shoot. Null when no site is
+ * beside the project or the registry maps no site app to this repo.
+ */
+function siteImagesStatus(dir, opts = {}) {
+  const reg = opts.registry || loadRegistry();
+  const siteDir = opts.siteDir || siteDirFor(dir, reg.siteProject);
+  if (!siteDir) return null;
+  const app = siteAppFor(dir, reg);
+  if (!app) return null;
+  const manifest = readSiteManifest(siteDir);
+  if (!manifest)
+    return { siteDir, app, manifestMissing: true, images: [], pending: [], verified: [] };
+  const pkg = readJSON(path.join(dir, 'package.json')) || {};
+  const current = pkg.version || '0.0.0';
+  const images = Object.entries(manifest.images).filter(([, e]) => e && e.app === app);
+  const pending = images
+    .filter(([, e]) => imageBehind(e, current))
+    .map(
+      ([img, e]) =>
+        `${img} (verified against ${e.verifiedVersion || 'nothing'}, app is now ${current})`,
+    );
+  const verified = [...new Set(images.map(([, e]) => e.verifiedVersion).filter(Boolean))].sort();
+  return {
+    siteDir,
+    app,
+    manifestMissing: false,
+    images: images.map(([img]) => img),
+    pending,
+    verified,
+  };
+}
+
+/** The site's own check: the manifest is complete, and current where the site advertises a version. */
+function auditSiteImages(siteDir, reg = loadRegistry()) {
+  const refs = siteImageRefs(siteDir);
+  const manifest = readSiteManifest(siteDir);
+  if (!manifest) {
+    fail(
+      `Site: no ${SITE_IMAGE_MANIFEST} — product-page screenshots have no record of the app version they show. Bootstrap it: policy site-images --init`,
+    );
+    return;
+  }
+  const unmapped = [...refs.keys()].filter((img) => siteImageApp(img, reg) === undefined);
+  if (unmapped.length > 0) {
+    const prefixes = [...new Set(unmapped.map((i) => i.split('/')[1]))];
+    fail(
+      `Site: img/ prefix(es) claimed by no app in registry.json siteApps (or siteSharedImages): ${prefixes.join(', ')} — add them so each screenshot has an app version to be checked against`,
+    );
+  }
+  const untracked = [...refs.keys()].filter((img) => !manifest.images[img]);
+  if (untracked.length > 0) {
+    fail(
+      `Site: ${untracked.length} referenced image(s) missing from ${SITE_IMAGE_MANIFEST}: ${untracked.slice(0, 6).join(', ')}${untracked.length > 6 ? ', …' : ''} — run: policy site-images --init (adds them at the site's current versions)`,
+    );
+  }
+  const gone = Object.keys(manifest.images).filter((img) => !exists(path.join(siteDir, img)));
+  if (gone.length > 0)
+    fail(
+      `Site: ${gone.length} manifest entry/ies name a file that no longer exists: ${gone.slice(0, 6).join(', ')}`,
+    );
+  const orphan = Object.keys(manifest.images).filter(
+    (img) => !refs.has(img) && !gone.includes(img),
+  );
+  if (orphan.length > 0)
+    warn(
+      `Site: ${orphan.length} manifest entry/ies no page references any more: ${orphan.slice(0, 6).join(', ')} — remove them or the file`,
+    );
+  // Behind the site's own advertised version: version.json was bumped for a
+  // release and the screenshots were not looked at in the same session.
+  const behind = {};
+  for (const [img, e] of Object.entries(manifest.images)) {
+    if (!e || !e.app) continue;
+    const meta = readJSON(path.join(siteDir, e.app, 'version.json'));
+    if (!meta || !meta.version) continue;
+    if (imageBehind(e, meta.version)) {
+      (behind[e.app] = behind[e.app] || { version: meta.version, images: [] }).images.push(
+        `${img} (${e.verifiedVersion || 'unverified'})`,
+      );
+    }
+  }
+  for (const [app, b] of Object.entries(behind)) {
+    fail(
+      `Site: ${app}/version.json advertises ${b.version} but ${b.images.length} screenshot(s) were verified against an older version: ${b.images.slice(0, 5).join(', ')}${b.images.length > 5 ? ', …' : ''} — regenerate: policy site-capture ${app}; hand-made images: confirm, then policy site-images --verify ${app}`,
+    );
+  }
+  if (unmapped.length + untracked.length + gone.length + Object.keys(behind).length === 0) {
+    ok(
+      `Site: ${Object.keys(manifest.images).length} screenshot(s) tracked in ${SITE_IMAGE_MANIFEST}, all at their app's advertised minor`,
+    );
+  }
+}
+
+/**
+ * policy site-images [--init] [--verify <app> [--version <v>]], from the site project.
+ *   --init    add every referenced image to the manifest at the site's current
+ *             version for its app (existing entries untouched)
+ *   --verify  record that an app's screenshots were looked at (re-shot or
+ *             confirmed unchanged) against a version — the site's version.json
+ *             version unless --version says otherwise
+ *   (none)    print where each app's screenshots stand
+ */
+function cmdSiteImages(dir, flags) {
+  guardLocalPath(dir);
+  const reg = loadRegistry();
+  const here = path.resolve(dir);
+  if (!reg.siteProject) {
+    fail('registry.json names no siteProject, so there is no site to track screenshots for');
+    return finish();
+  }
+  if (path.basename(here) !== reg.siteProject) {
+    fail(`Run this from the ${reg.siteProject} project, not from ${path.basename(here)}`);
+    return finish();
+  }
+  section(`Site screenshots: ${here}`);
+  const today = new Date().toISOString().slice(0, 10);
+  const refs = siteImageRefs(here);
+  const manifest = readSiteManifest(here) || {
+    _comment:
+      "Which app version each product-page screenshot was verified against. Kept by policy site-images; checked by policy check here and by each app's verify-ready --release.",
+    images: {},
+  };
+
+  if (flags.includes('--init')) {
+    let added = 0;
+    for (const [img, pages] of refs) {
+      if (manifest.images[img]) continue;
+      const app = siteImageApp(img, reg);
+      if (app === undefined) {
+        warn(`${img}: prefix claimed by no app in registry.json siteApps — added without an app`);
+      }
+      const meta = app ? readJSON(path.join(here, app, 'version.json')) : null;
+      manifest.images[img] = {
+        app: app || null,
+        verifiedVersion: meta && meta.version ? meta.version : null,
+        lastVerified: today,
+        pages: [...pages].sort(),
+      };
+      added++;
+    }
+    writeSiteManifest(here, manifest);
+    ok(
+      `${added} image(s) added to ${SITE_IMAGE_MANIFEST} (${Object.keys(manifest.images).length} tracked)`,
+    );
+  }
+
+  const verifyApp = flagValue(flags, '--verify');
+  if (verifyApp) {
+    if (!Object.prototype.hasOwnProperty.call(reg.siteApps || {}, verifyApp)) {
+      fail(
+        `${verifyApp} is not a site app in registry.json siteApps (${siteAppEntries(reg)
+          .map(([k]) => k)
+          .join(', ')})`,
+      );
+      return finish();
+    }
+    const meta = readJSON(path.join(here, verifyApp, 'version.json')) || {};
+    const version = flagValue(flags, '--version') || meta.version;
+    if (!version) {
+      fail(`${verifyApp}/version.json has no version and --version was not given`);
+      return finish();
+    }
+    let n = 0;
+    for (const e of Object.values(manifest.images)) {
+      if (!e || e.app !== verifyApp) continue;
+      e.verifiedVersion = version;
+      e.lastVerified = today;
+      n++;
+    }
+    writeSiteManifest(here, manifest);
+    ok(`${n} ${verifyApp} screenshot(s) recorded as verified against ${version} on ${today}`);
+  }
+
+  // Status by app, always.
+  const byApp = {};
+  for (const [img, e] of Object.entries(manifest.images)) {
+    const key = (e && e.app) || '(shared)';
+    (byApp[key] = byApp[key] || []).push([img, e]);
+  }
+  for (const [app, list] of Object.entries(byApp).sort()) {
+    const meta = app !== '(shared)' ? readJSON(path.join(here, app, 'version.json')) : null;
+    const advertised = meta && meta.version;
+    const behind = advertised ? list.filter(([, e]) => imageBehind(e, advertised)).length : 0;
+    const versions = [...new Set(list.map(([, e]) => e.verifiedVersion || 'unverified'))].join(
+      ', ',
+    );
+    console.log(
+      `  ${behind ? RED : GREEN}${app.padEnd(20)}${RESET} ${String(list.length).padStart(3)} image(s)  verified against ${versions}${advertised ? `  site advertises ${advertised}` : ''}${behind ? `  ${RED}${behind} behind${RESET}` : ''}`,
+    );
+  }
+  auditSiteImages(here, reg);
+  return finish();
+}
+
+/**
+ * policy site-capture <app> [--version <v>], from the site project: run the
+ * app's own Playwright capture into the site's image folder for that app and
+ * record what it produced.
+ *
+ * The app's flows and demo fixture are the same ones its help pages use; the
+ * site session owns the result, as the help site session owns the help
+ * captures. The flow reads SITE_CAPTURE=1 and writes product shots to
+ * SITE_CAPTURE_DIR, set here from the registry, so no app names the site.
+ * Every manifest entry for the app whose file the capture rewrote is marked
+ * captured and verified against the app's version; the rest (composed heroes,
+ * store covers) are listed for the hand check that site-images --verify
+ * records.
+ */
+function cmdSiteCapture(dir, rest, flags) {
+  guardLocalPath(dir);
+  const reg = loadRegistry();
+  const here = path.resolve(dir);
+  if (!reg.siteProject || path.basename(here) !== reg.siteProject) {
+    fail(`Run this from the ${reg.siteProject || 'site'} project, not from ${path.basename(here)}`);
+    return finish();
+  }
+  const app = rest.find((a) => !a.startsWith('--'));
+  const cfg =
+    app && Object.prototype.hasOwnProperty.call(reg.siteApps || {}, app) && reg.siteApps[app];
+  if (!cfg) {
+    fail(
+      `Name a site app: policy site-capture <app> — one of ${siteAppEntries(reg)
+        .map(([k]) => k)
+        .join(', ')}`,
+    );
+    return finish();
+  }
+  const repoDir = path.join(path.dirname(here), cfg.repo || app);
+  const pkg = readJSON(path.join(repoDir, 'package.json'));
+  if (!pkg) {
+    fail(`${repoDir} has no package.json — registry siteApps.${app}.repo names the wrong folder?`);
+    return finish();
+  }
+  if (!(pkg.scripts || {})['site:capture']) {
+    fail(
+      `${path.basename(repoDir)} has no site:capture script — its check names the fix; until then confirm by hand: policy site-images --verify ${app}`,
+    );
+    return finish();
+  }
+  const prefix = (cfg.img || [])[0];
+  if (!prefix) {
+    fail(`registry siteApps.${app}.img lists no img/ prefix to capture into`);
+    return finish();
+  }
+  const outDir = path.join(here, 'img', prefix);
+  fs.mkdirSync(outDir, { recursive: true });
+  const version = flagValue(flags, '--version') || pkg.version;
+  // The window the product shots are taken at lives in the registry, not in
+  // each app's flow, so every app's shots share one shape and a change is
+  // one edit. Per-app override: siteApps.<app>.captureWindow.
+  const win = siteCaptureWindow({ siteCaptureWindow: cfg.captureWindow || reg.siteCaptureWindow });
+  section(
+    `Site capture: ${app} from ${path.basename(repoDir)} ${version} into img/${prefix}/ at ${win.width}x${win.height}`,
+  );
+  const started = Date.now();
+  process.stdout.write(
+    `  ${DIM}running${RESET} npm run site:capture (build + Playwright, minutes) ... `,
+  );
+  let r;
+  try {
+    const out = execSync('npm run --silent site:capture', {
+      cwd: repoDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: 20 * 60 * 1000,
+      env: {
+        ...process.env,
+        SITE_CAPTURE: '1',
+        SITE_CAPTURE_DIR: outDir,
+        SITE_CAPTURE_WIDTH: String(win.width),
+        SITE_CAPTURE_HEIGHT: String(win.height),
+      },
+    });
+    r = { ok: true, out };
+  } catch (e) {
+    r = { ok: false, out: ((e.stdout || '') + (e.stderr || '')).trim() };
+  }
+  console.log(r.ok ? `${GREEN}done${RESET}` : `${RED}FAILED${RESET}`);
+  if (!r.ok) {
+    console.log(r.out.split('\n').slice(-25).join('\n'));
+    fail(`site:capture failed in ${path.basename(repoDir)} — nothing recorded`);
+    return finish();
+  }
+
+  const manifest = readSiteManifest(here);
+  if (!manifest) {
+    fail(`no ${SITE_IMAGE_MANIFEST} to record into — run: policy site-images --init`);
+    return finish();
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const produced = [];
+  const untouched = [];
+  for (const [img, e] of Object.entries(manifest.images)) {
+    if (!e || e.app !== app) continue;
+    let mtime = 0;
+    try {
+      mtime = fs.statSync(path.join(here, img)).mtimeMs;
+    } catch {
+      /* missing: the audit below reports it */
+    }
+    if (mtime >= started) {
+      e.captured = true;
+      e.verifiedVersion = version;
+      e.lastVerified = today;
+      produced.push(img);
+    } else untouched.push(img);
+  }
+  // Files the capture wrote that no page references: the flow names a shot
+  // the site does not use, or the page uses a different name.
+  const refs = siteImageRefs(here);
+  const stray = fs
+    .readdirSync(outDir)
+    .filter((n) => SITE_IMAGE_EXT.test(n))
+    .map((n) => `img/${prefix}/${n}`)
+    .filter((img) => !refs.has(img) && fs.statSync(path.join(here, img)).mtimeMs >= started);
+  writeSiteManifest(here, manifest);
+  if (produced.length > 0)
+    ok(
+      `${produced.length} screenshot(s) regenerated and recorded against ${version}: ${produced.map((p) => path.basename(p)).join(', ')}`,
+    );
+  else
+    warn(
+      'the capture rewrote none of the images the site references — check the flow writes to SITE_CAPTURE_DIR with the names the pages use',
+    );
+  if (untouched.length > 0)
+    warn(
+      `${untouched.length} ${app} image(s) not produced by the capture (hand-made?): ${untouched.map((p) => path.basename(p)).join(', ')} — confirm each against ${version}, then: policy site-images --verify ${app} --version ${version}`,
+    );
+  if (stray.length > 0)
+    warn(
+      `${stray.length} captured file(s) no page references: ${stray.map((p) => path.basename(p)).join(', ')}`,
+    );
+  auditSiteImages(here, reg);
+  console.log(
+    `\n  ${DIM}Look at the new shots on the pages, run gates here, then commit them with the manifest.${RESET}`,
+  );
+  return finish();
 }
 
 function auditPolicyRepo(root) {
@@ -1066,9 +1675,22 @@ function auditPolicyRepo(root) {
   } else fail(`machine/hooks.json missing one of ${HOOK_EVENTS.join(', ')}`);
 
   const preCommit = readFile(path.join(root, 'templates/pre-commit'));
-  for (const needle of ['leak-scan', 'verify-marker', 'gates --fast']) {
+  // secrets:staged must survive the early exit: the hook used to leave as soon
+  // as the policy repo was absent, which skipped the staged secret scan on
+  // every machine but the developer's (found in an app
+  // session, 2026-10-16). The early-exit branch must name the scan.
+  for (const needle of ['leak-scan', 'verify-marker', 'gates --fast', 'secrets:staged']) {
     if (preCommit.includes(needle)) ok(`pre-commit template includes ${needle}`);
     else fail(`pre-commit template missing ${needle}`);
+  }
+  {
+    const earlyExit = preCommit.split('leak-scan')[0];
+    if (/npm run (--silent )?secrets:staged/.test(earlyExit))
+      ok('pre-commit template scans the stage before its no-policy-repo exit');
+    else
+      fail(
+        'pre-commit template exits before running secrets:staged when build-policy is absent — handed-over projects commit secrets unscanned',
+      );
   }
 
   const ci = readFile(path.join(root, 'templates/ci.yml'));
@@ -1288,13 +1910,8 @@ function auditElectronStandards(dir, proj) {
         if (!licence && /api\.gumroad\.com\/v2\/licenses/.test(t)) licence = rel;
         if (!safeStorage && /safeStorage\s*\.\s*\w+|[{,]\s*safeStorage\s*[},]/.test(t))
           safeStorage = rel;
-        if (!callsAnthropic && /api\.anthropic\.com|['"]@anthropic-ai\/sdk['"]/.test(t))
-          callsAnthropic = rel;
-        if (
-          !callsOpenAI &&
-          /api\.openai\.com|from\s+['"]openai['"]|require\(['"]openai['"]\)/.test(t)
-        )
-          callsOpenAI = rel;
+        if (!callsAnthropic && ANTHROPIC_CALL.test(t)) callsAnthropic = rel;
+        if (!callsOpenAI && OPENAI_CALL.test(t)) callsOpenAI = rel;
         if (!opensExternal && /shell\s*\.\s*openExternal/.test(t)) opensExternal = true;
         // Matched on intent, not one spelling. One app reads the URL from an
         // env var, so it never contains "version.json" and a literal match
@@ -1628,8 +2245,11 @@ function auditElectronStandards(dir, proj) {
   // gap is caught at check time rather than after the launch build). With
   // distribution none the DMGs are test builds and the banner is added when
   // the app is far enough along to test it against a version.json.
-  const declaredGumroad =
-    !!(proj.pkg && proj.pkg.policy && proj.pkg.policy.distribution === 'gumroad');
+  const declaredGumroad = !!(
+    proj.pkg &&
+    proj.pkg.policy &&
+    proj.pkg.policy.distribution === 'gumroad'
+  );
   if (!versionCheck && (shippedDmgVersions(dir, proj).size > 0 || declaredGumroad)) {
     findings.push(
       `no update check at all, yet this app ${declaredGumroad ? 'is declared for Gumroad distribution' : 'ships a DMG'} — ` +
@@ -2050,7 +2670,8 @@ function auditApprovalMismatch(dir, id, e) {
   const a = loadAuditApprovals(dir)[id];
   if (!a) return '';
   if (a.hash !== auditEntryHash(e)) return ' (changed since it was approved)';
-  if (!a.project) return ' (approved before approvals were bound to a project — approve it again here)';
+  if (!a.project)
+    return ' (approved before approvals were bound to a project — approve it again here)';
   if (a.project !== auditProjectId(dir))
     return ` (approved for "${a.project}", not this one — a copied approval; check the reason against this project)`;
   return '';
@@ -2565,7 +3186,8 @@ function auditModelIds(dir) {
  * think) — project-standards § AI Integration.
  */
 const FIRST_BLOCK_TEXT_RE = /\bcontent\s*(?:\?\.)?\[\s*0\s*\]\s*(?:\?\.|\.)\s*text\b/;
-const THINKING_DEFAULT_MODEL_RE = /['"`](claude-(?:sonnet-5|opus-5|haiku-5|fable|mythos)[a-z0-9.-]*)['"`]/;
+const THINKING_DEFAULT_MODEL_RE =
+  /['"`](claude-(?:sonnet-5|opus-5|haiku-5|fable|mythos)[a-z0-9.-]*)['"`]/;
 // Models that reject `thinking: {type: 'disabled'}` with a 400: Sonnet 5.5
 // (use `between_tools`), Opus 5.5 (lower the effort), Fable and Mythos (omit
 // the parameter). Sonnet 5, Opus 5 and Haiku 4.5 still accept it, and Haiku 5.5
@@ -2576,19 +3198,22 @@ const THINKING_DISABLED_RE = /\btype\s*:\s*['"]disabled['"]/;
 // the 5.5 generation, Fable and Mythos. Haiku 4.5, Sonnet 5 and Opus 5 accept
 // them. A sampling parameter is read as the request field (`temperature:` or
 // `temperature=`), not the word in prose or a UI label.
-const NO_SAMPLING_MODEL_RE = /['"`](claude-(?:sonnet-5-5|opus-5-5|haiku-5-5|fable|mythos)[a-z0-9.-]*)['"`]/;
+const NO_SAMPLING_MODEL_RE =
+  /['"`](claude-(?:sonnet-5-5|opus-5-5|haiku-5-5|fable|mythos)[a-z0-9.-]*)['"`]/;
 // A betterleaks flag that exposes the finding itself: -v / --verbose print the
 // value (1.x), -v / --validate and -a / --analyze send it to the provider (2.x),
 // --validation does the same in 1.x. Matched on the flag as a whole word so
 // `--no-verbose` or a path containing `-v` cannot trip it.
-const SECRET_SCAN_LEAKY_FLAG_RE = /(?:^|\s)(-v|-a|--verbose|--validate|--validation|--analyze)(?=\s|$)/;
+const SECRET_SCAN_LEAKY_FLAG_RE =
+  /(?:^|\s)(-v|-a|--verbose|--validate|--validation|--analyze)(?=\s|$)/;
 
 // The one fix for template drift and a drifted secret-scan script. The
 // messages used to spell out `cp` and `rm` per file; a site session read those
 // as destructive overwrites needing the developer's confirmation and stopped
 // with the gates still failing (2026-10-10). `sync-templates` is the sanctioned
 // command, gated like any change, so the messages name it and nothing else.
-const TEMPLATE_SYNC_HINT = 'run: policy sync-templates . (gated like any change: CHANGELOG, gates, developer commit)';
+const TEMPLATE_SYNC_HINT =
+  'run: policy sync-templates . (gated like any change: CHANGELOG, gates, developer commit)';
 const SAMPLING_PARAM_RE = /\b(temperature|top_p|top_k)\s*[:=]\s*[0-9.]/;
 
 /** The registry's smart and fast tier IDs, for check messages that name where an app is heading. */
@@ -2829,6 +3454,41 @@ function cmdCheck(dir, flags = []) {
   if (proj.hasHTML) required.push('lint:html');
   if (proj.hasCSS) required.push('lint:css');
   if (proj.hasServer) required.push('test:smoke');
+  // A site app with Playwright flows captures its own product shots (2.78):
+  // the flows and the demo fixture already exist for the help pages, and
+  // the site session runs them through `policy site-capture <app>`. Without
+  // the script the screenshots stay hand-made and drift with every release.
+  if (siteAppFor(dir) && scripts['test:flows'] && /playwright/.test(scripts['test:flows'])) {
+    // The filenames come from the site's manifest, so the session that adds
+    // the flow needs no hand-off: the check names every shot the page uses.
+    const siteShots = siteImagesStatus(dir);
+    const names =
+      siteShots && siteShots.images.length
+        ? ` The product page references: ${siteShots.images.map((i) => path.basename(i)).join(', ')} — write exactly those names.`
+        : '';
+    if (scripts['site:capture'] && /SITE_CAPTURE=1/.test(scripts['site:capture'])) {
+      // The flow takes its target and window from the environment that
+      // policy site-capture sets; a flow with its own size or path drifts.
+      const flows = sourceFilesMatching(path.join(dir, 'tests'), /SITE_CAPTURE_DIR/);
+      const sized = sourceFilesMatching(path.join(dir, 'tests'), /SITE_CAPTURE_WIDTH/);
+      if (flows.length === 0)
+        fail(
+          `site:capture script present but no flow under tests/ reads process.env.SITE_CAPTURE_DIR — the capture would write nowhere the site reads (project-standards § Product-page screenshots).${names}`,
+        );
+      else if (sized.length === 0)
+        fail(
+          "the site capture flow does not read process.env.SITE_CAPTURE_WIDTH / SITE_CAPTURE_HEIGHT — the window size is set by the policy so every app's product shots share one shape (project-standards § Product-page screenshots)",
+        );
+      else
+        ok(
+          'site:capture script present; the flow reads the target folder and window from the policy',
+        );
+    } else {
+      fail(
+        `no site:capture script, so this app's product-page screenshots on the site cannot be regenerated — add "site:capture": "npm run build && SITE_CAPTURE=1 playwright test" and have the flows, when SITE_CAPTURE is 1, open the window at SITE_CAPTURE_WIDTH x SITE_CAPTURE_HEIGHT and write the product shots to SITE_CAPTURE_DIR (project-standards § Product-page screenshots).${names}`,
+      );
+    }
+  }
   required.push('sast');
   const devDepsForBuild = { ...(proj.pkg.dependencies || {}), ...(proj.pkg.devDependencies || {}) };
   if ('vite' in devDepsForBuild || 'typescript' in devDepsForBuild) required.push('build');
@@ -2843,6 +3503,11 @@ function cmdCheck(dir, flags = []) {
         `type-check script "${scripts['type-check']}" checks zero files: tsconfig.json is a solution config ("files": [] + references) and bare tsc never follows references — use "tsc -b --noEmit" (project-standards § TypeScript)`,
       );
     }
+  }
+  {
+    const gaps = treeScanGaps(dir, scripts);
+    for (const g of gaps) fail(g);
+    if (gaps.length === 0) ok('Tree-scanning gates ignore .claude/ (agent worktrees)');
   }
   // Scripts that cannot fail on empty input (every gate, not only smoke).
   for (const g of GATE_ORDER) {
@@ -2929,7 +3594,10 @@ function cmdCheck(dir, flags = []) {
       fail(
         `${name} script is "${scripts[name]}" — ${m[1]} prints the secret (betterleaks 1.x --verbose) or sends it to the provider (betterleaks 2 --validate / --analyze). Drop the flag; the exit code is the gate. Standard: "${STANDARD_SCRIPTS[name]}" — ${TEMPLATE_SYNC_HINT}`,
       );
-    if (/\bbetterleaks\b/.test(scripts[name]) && !/(?:^|\s)--redact(?:=\d+)?(?=\s|$)/.test(scripts[name]))
+    if (
+      /\bbetterleaks\b/.test(scripts[name]) &&
+      !/(?:^|\s)--redact(?:=\d+)?(?=\s|$)/.test(scripts[name])
+    )
       fail(
         `${name} script is "${scripts[name]}" — missing --redact, so a finding prints the secret's value into the terminal, the session transcript and CI logs (betterleaks 2 prints findings by default; 1.x under -v). Standard: "${STANDARD_SCRIPTS[name]}"`,
       );
@@ -3429,9 +4097,7 @@ function cmdCheck(dir, flags = []) {
       norm(canonicalPolicyPath(readFile(agPath), dir)) !==
       norm(readFile(path.join(TEMPLATES, 'AGENTS.md')))
     ) {
-      fail(
-        `AGENTS.md differs from the shared template — ${TEMPLATE_SYNC_HINT}`,
-      );
+      fail(`AGENTS.md differs from the shared template — ${TEMPLATE_SYNC_HINT}`);
     } else ok('AGENTS.md matches shared template');
   }
 
@@ -3501,14 +4167,17 @@ function checkStaleness(dir, reg) {
     const drift = refresh.driftCount || 0;
     const overLimit = drift > driftLimit;
     const overAge = drift > 0 && (daysStale === null || daysStale > refreshDays);
-    const ageText = daysStale === null ? 'never refreshed here' : `last refresh ${daysStale} days ago`;
+    const ageText =
+      daysStale === null ? 'never refreshed here' : `last refresh ${daysStale} days ago`;
     if (overLimit && overAge) {
       fail(
         `${drift} dependencies behind their allowed range (${ageText}) — refresh before feature work: ` +
           `policy deps-update, then gates`,
       );
     } else if (overLimit || (overAge && daysStale !== null)) {
-      warn(`${drift} dependencies behind their allowed range (${ageText}) — run: policy deps-update`);
+      warn(
+        `${drift} dependencies behind their allowed range (${ageText}) — run: policy deps-update`,
+      );
     }
 
     if (refresh.fixable && refresh.fixable.length) {
@@ -3606,7 +4275,10 @@ function secretReportLocations(findings) {
   // sequences or newlines that would spoof or hide a line in the terminal and
   // the session transcript, so control characters are shown as escapes.
   const clean = (v) =>
-    String(v).replace(/[\x00-\x1f\x7f-\x9f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
+    String(v).replace(
+      /[\x00-\x1f\x7f-\x9f]/g,
+      (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`,
+    );
   return findings
     .filter((f) => f && typeof f.File === 'string')
     .map((f) => `${clean(f.File)}:${f.StartLine || '?'} (${clean(f.RuleID || 'rule unknown')})`);
@@ -3616,7 +4288,11 @@ function secretScanLocations(dir, staged) {
   try {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-leaks-'));
     const report = path.join(tmp, 'report.json');
-    shArgs('betterleaks', ['git', ...(staged ? ['--staged'] : ['.']), '--redact', '-r', report], dir);
+    shArgs(
+      'betterleaks',
+      ['git', ...(staged ? ['--staged'] : ['.']), '--redact', '-r', report],
+      dir,
+    );
     return secretReportLocations(readJSON(report));
   } catch {
     return [];
@@ -3788,8 +4464,7 @@ function buildReviewDiff(dir, base, srcFiles) {
 
 function countDiffLines(diff) {
   let n = 0;
-  for (const line of diff.split('\n'))
-    if (/^[+-]/.test(line) && !/^(\+\+\+|---) /.test(line)) n++;
+  for (const line of diff.split('\n')) if (/^[+-]/.test(line) && !/^(\+\+\+|---) /.test(line)) n++;
   return n;
 }
 
@@ -3868,7 +4543,7 @@ const REVIEW_SCHEMA = {
 };
 
 const REVIEW_PROMPT = [
-  'You are the code reviewer in a quality gate for a solo developer\'s local-first apps',
+  "You are the code reviewer in a quality gate for a solo developer's local-first apps",
   '(Electron, Express, React, TypeScript, vanilla JS; data stored as JSON files under local_data/).',
   'You receive a unified diff on stdin and nothing else. Review only what the diff shows.',
   'Look for: correctness bugs, security issues (injection, unsafe eval, path traversal, secrets in code,',
@@ -3901,8 +4576,18 @@ function judgeClaudeReview(json) {
       error: `claude reported an error: ${String(json.result || json.subtype || 'unknown').slice(0, 300)}`,
     };
   const so = json.structured_output;
-  if (!so || typeof so !== 'object' || !Array.isArray(so.findings) || !['pass', 'fail'].includes(so.verdict))
-    return { pass: false, findings: [], blocking: [], error: 'claude result did not match the review schema' };
+  if (
+    !so ||
+    typeof so !== 'object' ||
+    !Array.isArray(so.findings) ||
+    !['pass', 'fail'].includes(so.verdict)
+  )
+    return {
+      pass: false,
+      findings: [],
+      blocking: [],
+      error: 'claude result did not match the review schema',
+    };
   const findings = so.findings.filter((f) => f && typeof f === 'object');
   const blocking = findings.filter((f) => /^(critical|high)$/i.test(String(f.severity)));
   return { pass: blocking.length === 0, findings, blocking, error: null };
@@ -3912,7 +4597,9 @@ function formatFindings(findings) {
   return findings
     .map(
       (f) =>
-        `  ${String(f.severity || '').toUpperCase().padEnd(8)} ${f.file}${f.line ? `:${f.line}` : ''}  ${f.title}` +
+        `  ${String(f.severity || '')
+          .toUpperCase()
+          .padEnd(8)} ${f.file}${f.line ? `:${f.line}` : ''}  ${f.title}` +
         (f.detail ? `\n           ${String(f.detail).replace(/\n/g, '\n           ')}` : ''),
     )
     .join('\n');
@@ -3930,7 +4617,11 @@ function reviewWithClaude(dir, { base, srcFiles }) {
   const diff = buildReviewDiff(dir, base, srcFiles);
   if (!diff.trim()) return { ok: false, out: 'the diff is empty — nothing for a reviewer to read' };
   if (diff.length > REVIEW_MAX_CLAUDE_BYTES)
-    return { ok: false, escalate: true, out: `diff is ${diff.length} bytes, over the Claude limit` };
+    return {
+      ok: false,
+      escalate: true,
+      out: `diff is ${diff.length} bytes, over the Claude limit`,
+    };
   const entry = loadRegistry().entries['anthropic-model-smart'];
   const model = entry && entry.value;
   if (!model) return { ok: false, out: 'registry.json has no anthropic-model-smart entry' };
@@ -3968,7 +4659,8 @@ function reviewWithClaude(dir, { base, srcFiles }) {
   const lines = [];
   if (judged.error) lines.push(judged.error);
   if (judged.findings.length > 0) lines.push(formatFindings(judged.findings));
-  if (!judged.pass && judged.error && r.stderr) lines.push(String(r.stderr).trim().split('\n').slice(-10).join('\n'));
+  if (!judged.pass && judged.error && r.stderr)
+    lines.push(String(r.stderr).trim().split('\n').slice(-10).join('\n'));
   return {
     ok: judged.pass,
     out: lines.join('\n'),
@@ -4430,6 +5122,17 @@ function cmdGates(dir, flags) {
       );
       continue;
     }
+    if (g.script === 'test:flows') {
+      const e = ensureElectronBinary(dir);
+      if (e && e.downloaded)
+        console.log(
+          `  ${DIM}downloaded the Electron binary before the flow tests, so the first test's timeout does not pay for it${RESET}`,
+        );
+      else if (e && !e.present)
+        console.log(
+          `  ${YELLOW}⚠${RESET} Electron binary download failed (${e.out.split('\n').slice(-1)[0]}) — the flow tests will try again`,
+        );
+    }
     const t0 = Date.now();
     process.stdout.write(`  ${DIM}running${RESET} ${g.name} (npm run ${g.script}) ... `);
     // Committed work is reviewed against the commit the last pass saw.
@@ -4440,7 +5143,8 @@ function cmdGates(dir, flags) {
     if (extra) process.stdout.write(`${DIM}(committed since ${reviewBase.slice(0, 12)})${RESET} `);
     if (g.script === 'review' && rootReview)
       process.stdout.write(`${DIM}(first commit, reviewed from an empty base)${RESET} `);
-    if (g.script === 'review' && review) process.stdout.write(`${DIM}[${review.reviewer}]${RESET} `);
+    if (g.script === 'review' && review)
+      process.stdout.write(`${DIM}[${review.reviewer}]${RESET} `);
     const runCodeRabbit = () =>
       rootReview ? reviewRootCommit(dir) : sh(`npm run review${extra}`, dir);
     let r;
@@ -4897,7 +5601,9 @@ function helpPageFrontMatter(file) {
 }
 
 function minorOf(version) {
-  const [major, minor] = String(version || '0.0').split('.').map(Number);
+  const [major, minor] = String(version || '0.0')
+    .split('.')
+    .map(Number);
   return (major || 0) * 1000 + (minor || 0);
 }
 
@@ -4976,7 +5682,9 @@ function helpPagesStatus(dir, opts = {}) {
         dir,
       ).out;
       if (newer) {
-        pending.push(`${page}: ${source} changed after ${fm.lastVerified} (${newer.split('\n')[0]})`);
+        pending.push(
+          `${page}: ${source} changed after ${fm.lastVerified} (${newer.split('\n')[0]})`,
+        );
       }
     }
   }
@@ -5042,7 +5750,9 @@ function cmdHelpHandback(dir, app) {
   );
   const own = [
     ...status.pages,
-    ...[...slugs].map((slug) => path.join('src', 'assets', slug)).filter((d) => exists(path.join(here, d))),
+    ...[...slugs]
+      .map((slug) => path.join('src', 'assets', slug))
+      .filter((d) => exists(path.join(here, d))),
   ];
   const dirty = sh(
     `git status --porcelain -- ${own.map((f) => safeToken(f, 'help path')).join(' ')}`,
@@ -5062,7 +5772,16 @@ function cmdHelpHandback(dir, app) {
     .sort();
   ok(`${status.pages.length} page(s) for ${app} are current against ${proj.pkg.version}`);
   console.log(`\n${BOLD}Paste this into the ${app} session:${RESET}\n`);
-  console.log(helpHandbackMessage(app, proj.pkg.version, status, dates[dates.length - 1], helpProject, commit) + '\n');
+  console.log(
+    helpHandbackMessage(
+      app,
+      proj.pkg.version,
+      status,
+      dates[dates.length - 1],
+      helpProject,
+      commit,
+    ) + '\n',
+  );
   return finish();
 }
 
@@ -5107,8 +5826,7 @@ function verifyRelease(dir, proj, flags) {
     fail(
       `No gates marker (.policy/gates.json) — nothing records a review of the tree being released. Run: policy gates --reviewer coderabbit`,
     );
-  else if (relReviewer === 'coderabbit')
-    ok('CodeRabbit review passed on the tree being released');
+  else if (relReviewer === 'coderabbit') ok('CodeRabbit review passed on the tree being released');
   else if (relReviewer === 'claude')
     fail(
       `The gates marker records a Claude review${relMarker.review && relMarker.review.reason ? ` (${relMarker.review.reason})` : ''} — ` +
@@ -5310,7 +6028,43 @@ function verifyRelease(dir, proj, flags) {
     );
     console.log(`\n${helpHandoffMessage(dir, proj, help)}\n`);
   } else if (help && help.pages.length) {
-    ok(`Help pages current (${help.pages.length} page(s) verified against ${help.verified.join(', ')})`);
+    ok(
+      `Help pages current (${help.pages.length} page(s) verified against ${help.verified.join(', ')})`,
+    );
+  }
+
+  // Product-page screenshots on the marketing site, same shape as the help
+  // pages: the manifest is the record, the site session does the work, and
+  // the step sits after the help pages and before the marketing drafts (the
+  // drafts reuse the shots). Pending before the DMG, a FAIL after it, and
+  // the sign-off refuses it.
+  const site = siteImagesStatus(dir);
+  const imagesPending = !!(site && site.pending.length);
+  if (site && site.manifestMissing) {
+    warn(
+      `${path.basename(site.siteDir)} has no ${SITE_IMAGE_MANIFEST}, so its screenshots of this app cannot be checked — in that project run: policy site-images --init`,
+    );
+  } else if (site && site.images.length) {
+    const step = imagesPending
+      ? `Product-page screenshots regenerated for ${proj.pkg.version} in the ${path.basename(site.siteDir)} session (${site.pending.length} behind; there: policy site-capture ${site.app}, then site-images --verify ${site.app} for any hand-made image)`
+      : `Product-page screenshots current for ${proj.pkg.version} (${site.images.length} image(s), verified against ${site.verified.join(', ')})`;
+    const marketing = checklist.findIndex((c) => /marketing/i.test(c));
+    checklist.splice(marketing === -1 ? checklist.length : marketing, 0, step);
+    const list =
+      site.pending.slice(0, 8).join('\n        ') + (site.pending.length > 8 ? '\n        …' : '');
+    if (imagesPending && preBuild) {
+      warn(
+        `Product-page screenshots are behind ${proj.pkg.version} (${site.pending.length} of ${site.images.length}) — pending, not a blocker for the build:\n        ${list}`,
+      );
+    } else if (imagesPending) {
+      fail(
+        `Product-page screenshots are behind ${proj.pkg.version} (${site.pending.length} of ${site.images.length}). In ${path.basename(site.siteDir)}: policy site-capture ${site.app} (hand-made images: site-images --verify ${site.app} --version ${proj.pkg.version})\n        ${list}`,
+      );
+    } else {
+      ok(
+        `Product-page screenshots current (${site.images.length} image(s) verified against ${site.verified.join(', ')})`,
+      );
+    }
   }
 
   const tagName = `v${proj.pkg.version}`;
@@ -5341,6 +6095,11 @@ function verifyRelease(dir, proj, flags) {
     fail(
       `Help pages are behind ${proj.pkg.version} — the ack was not recorded. Bring them up to date in the help site session ` +
         `(hand-off above), paste its hand-back message here, then re-run the sign-off.`,
+    );
+  } else if (flags.includes('--ack-manual') && imagesPending) {
+    fail(
+      `Product-page screenshots are behind ${proj.pkg.version} — the ack was not recorded. In ${path.basename(site.siteDir)} run ` +
+        `policy site-capture ${site.app} (hand-made images: site-images --verify ${site.app} --version ${proj.pkg.version}), then re-run the sign-off.`,
     );
   } else if (flags.includes('--ack-manual') && !tagExists) {
     // Refuse the signature rather than record a release with no durable marker.
@@ -5454,7 +6213,9 @@ function fixableAdvisories(audit) {
     if (v.fixAvailable !== true) continue;
     out.push({ name, severity: v.severity, direct: !!v.isDirect });
   }
-  return out.sort((a, b) => (a.severity === b.severity ? a.name.localeCompare(b.name) : a.severity === 'critical' ? -1 : 1));
+  return out.sort((a, b) =>
+    a.severity === b.severity ? a.name.localeCompare(b.name) : a.severity === 'critical' ? -1 : 1,
+  );
 }
 
 /** "Bump x from 1.2.3 to 1.2.4" -> { name, from, to }; null for group PRs and anything else. */
@@ -5517,7 +6278,9 @@ function dependabotReviewVerdict(comments, reviewer) {
 
 /** The open-PR cap from .github/dependabot.yml (Dependabot's default is 5). */
 function dependabotPrLimit(dir) {
-  const m = /open-pull-requests-limit:\s*(\d+)/.exec(readFile(path.join(dir, '.github', 'dependabot.yml')));
+  const m = /open-pull-requests-limit:\s*(\d+)/.exec(
+    readFile(path.join(dir, '.github', 'dependabot.yml')),
+  );
   return m ? parseInt(m[1], 10) : 5;
 }
 
@@ -5652,6 +6415,13 @@ function cmdDepsUpdate(dir) {
       return finish();
     }
     console.log(`${GREEN}done${RESET}`);
+    const e = ensureElectronBinary(dir);
+    if (e && e.downloaded)
+      ok('Electron binary downloaded (so the first flow test does not pay for it)');
+    else if (e && !e.present)
+      warn(
+        `Electron binary download failed: ${e.out.split('\n').slice(-1)[0]} — gates will retry before the flow tests`,
+      );
     const after = outdatedSplit(dir);
     ok(`${inRange.length - after.inRange.length} package(s) updated within range`);
     if (after.inRange.length > 0) {
@@ -5810,6 +6580,20 @@ function cmdHealth(dir, flags) {
         `score each: node ${path.join(POLICY_ROOT, 'scripts', 'verify-package.js')} <package>`,
     );
 
+  // What scaffold would add, found here on every project rather than in the
+  // next app session that runs scaffold by hand (where the unneeded
+  // secret-storage.js copy and the worktree lint gap surfaced, 2026-10-16).
+  // The sweep runs health for every project, so a template or scaffold rule
+  // change shows up fleet-wide the month it lands.
+  {
+    const plan = cmdScaffold(dir, { dryRun: true, quiet: true });
+    if (plan.created.length > 0)
+      warn(
+        `scaffold would add ${plan.created.length} item(s): ${plan.created.join(', ')} — review with: policy scaffold --dry-run, then: policy scaffold`,
+      );
+    else ok('scaffold would add nothing (templates and scripts current)');
+  }
+
   state.staleDeps = stale;
   state.lastHealthRun = new Date().toISOString();
   saveState(dir, state);
@@ -5848,7 +6632,13 @@ function cmdHealthAll() {
     const m = /(PASS|FAIL) — (\d+) ok, (\d+) warnings, (\d+) failures/.exec(strip(r.out));
     const row = m
       ? { name, pass: +m[2], warn: +m[3], fail: +m[4] }
-      : { name, pass: 0, warn: 0, fail: 1, error: strip(r.out).split('\n').slice(-3).join(' ').slice(0, 200) };
+      : {
+          name,
+          pass: 0,
+          warn: 0,
+          fail: 1,
+          error: strip(r.out).split('\n').slice(-3).join(' ').slice(0, 200),
+        };
     row.fails = strip(r.out)
       .split('\n')
       .filter((l) => /^\s*✗ /.test(l))
@@ -5859,7 +6649,10 @@ function cmdHealthAll() {
     );
   }
   fs.mkdirSync(path.dirname(HEALTH_SWEEP), { recursive: true });
-  fs.writeFileSync(HEALTH_SWEEP, JSON.stringify({ time: new Date().toISOString(), rows }, null, 2) + '\n');
+  fs.writeFileSync(
+    HEALTH_SWEEP,
+    JSON.stringify({ time: new Date().toISOString(), rows }, null, 2) + '\n',
+  );
   const failing = rows.filter((r) => r.fail);
   for (const r of failing) {
     console.log(`\n${BOLD}${r.name}${RESET}`);
@@ -5879,13 +6672,17 @@ function reportHealthSweep(reg) {
   const sweep = readJSON(HEALTH_SWEEP);
   const windowDays = ((reg.staleness && reg.staleness.healthRunDays) || 30) + 7;
   if (!sweep || !sweep.time) {
-    warn('No health sweep recorded — run: policy health --all (setup-machine installs the monthly launchd job)');
+    warn(
+      'No health sweep recorded — run: policy health --all (setup-machine installs the monthly launchd job)',
+    );
     return;
   }
   const days = daysSince(sweep.time);
   const failing = (sweep.rows || []).filter((r) => r.fail);
   if (days > windowDays) {
-    warn(`Health sweep ${days} days old — the launchd job is not running (policy doctor), or run: policy health --all`);
+    warn(
+      `Health sweep ${days} days old — the launchd job is not running (policy doctor), or run: policy health --all`,
+    );
   } else if (failing.length) {
     warn(
       `Health sweep ${days} days ago: ${failing.length} project(s) failing — ${failing
@@ -5977,10 +6774,15 @@ const STANDARD_SCRIPTS = {
   prepare: 'husky',
 };
 
-function cmdScaffold(dir) {
+function cmdScaffold(dir, opts = {}) {
   guardLocalPath(dir);
   const proj = detectProject(dir);
-  section(`Scaffold: ${path.resolve(dir)}`);
+  // --dry-run lists what scaffold would add and writes nothing; health runs
+  // it on every project so scaffold drift is found in the sweep rather than
+  // in whichever app session next runs scaffold by hand.
+  const dryRun = !!opts.dryRun;
+  const quiet = !!opts.quiet;
+  if (!quiet) section(`Scaffold${dryRun ? ' (dry run)' : ''}: ${path.resolve(dir)}`);
   const created = [];
   const skipped = [];
 
@@ -5998,7 +6800,7 @@ function cmdScaffold(dir) {
             `present when install-script tracking began (${new Date().toISOString().split('T')[0]})`,
           ]),
         );
-        fs.writeFileSync(allowPath, JSON.stringify(allow, null, 2) + '\n');
+        if (!dryRun) fs.writeFileSync(allowPath, JSON.stringify(allow, null, 2) + '\n');
         created.push(`allowed-packages.json _installScripts (${found.length})`);
       }
     }
@@ -6008,7 +6810,9 @@ function cmdScaffold(dir) {
   if (proj.isGit) {
     const branch = missingOriginHead(dir);
     if (branch) {
-      const r = sh(`git remote set-head origin ${safeToken(branch, 'branch')}`, dir);
+      const r = dryRun
+        ? { ok: true }
+        : sh(`git remote set-head origin ${safeToken(branch, 'branch')}`, dir);
       if (r.ok) created.push(`origin/HEAD -> origin/${branch}`);
     }
   }
@@ -6050,12 +6854,14 @@ function cmdScaffold(dir) {
       skipped.push(dest);
       return;
     }
-    fs.mkdirSync(path.dirname(destPath), { recursive: true });
-    fs.writeFileSync(destPath, localizePolicyPath(readFile(path.join(TEMPLATES, tpl)), dir));
-    try {
-      fs.chmodSync(destPath, fs.statSync(path.join(TEMPLATES, tpl)).mode);
-    } catch {
-      /* mode is cosmetic for non-executables */
+    if (!dryRun) {
+      fs.mkdirSync(path.dirname(destPath), { recursive: true });
+      fs.writeFileSync(destPath, localizePolicyPath(readFile(path.join(TEMPLATES, tpl)), dir));
+      try {
+        fs.chmodSync(destPath, fs.statSync(path.join(TEMPLATES, tpl)).mode);
+      } catch {
+        /* mode is cosmetic for non-executables */
+      }
     }
     created.push(dest);
   };
@@ -6065,7 +6871,7 @@ function cmdScaffold(dir) {
   // to bump, and every project's file is derived from it.
   const nodePin = (loadRegistry().entries || {})['node-lts'];
   if (nodePin && nodePin.value && !exists(path.join(dir, '.nvmrc'))) {
-    fs.writeFileSync(path.join(dir, '.nvmrc'), `${nodePin.value}\n`);
+    if (!dryRun) fs.writeFileSync(path.join(dir, '.nvmrc'), `${nodePin.value}\n`);
     created.push('.nvmrc');
   } else if (nodePin && nodePin.value) skipped.push('.nvmrc');
 
@@ -6092,12 +6898,16 @@ function cmdScaffold(dir) {
       /new BrowserWindow\s*\(/,
       'the Electron main process',
     );
-    copyUnlessImplemented(
-      'secret-storage.js',
-      'server/secret-storage.js',
-      /createCipheriv\s*\(\s*['"]aes-256-cbc['"]/,
-      'AES-256-CBC secret storage',
-    );
+    // Only an app that calls a BYOK provider has keys to encrypt; for the
+    // rest the file is dead code with a placeholder in it (see BYOK_CALL).
+    if (handlesByokKeys(dir)) {
+      copyUnlessImplemented(
+        'secret-storage.js',
+        'server/secret-storage.js',
+        /createCipheriv\s*\(\s*['"]aes-256-cbc['"]/,
+        'AES-256-CBC secret storage',
+      );
+    } else skipped.push('server/secret-storage.js (no BYOK provider call — nothing to encrypt)');
     // Copied into build/ rather than generated, because it is real signing code
     // that must stay identical across apps: a per-project copy that drifts is
     // how one app quietly stops stapling. build/ is committed (it holds source
@@ -6106,14 +6916,15 @@ function cmdScaffold(dir) {
   }
 
   if (!exists(path.join(dir, 'CHANGELOG.md'))) {
-    fs.writeFileSync(
-      path.join(dir, 'CHANGELOG.md'),
-      `# Changelog\n\n## [0.1.0] - ${new Date().toISOString().slice(0, 10)}\n- Initial setup\n`,
-    );
+    if (!dryRun)
+      fs.writeFileSync(
+        path.join(dir, 'CHANGELOG.md'),
+        `# Changelog\n\n## [0.1.0] - ${new Date().toISOString().slice(0, 10)}\n- Initial setup\n`,
+      );
     created.push('CHANGELOG.md');
   } else skipped.push('CHANGELOG.md');
 
-  fs.mkdirSync(path.join(dir, '.claude', 'specs'), { recursive: true });
+  if (!dryRun) fs.mkdirSync(path.join(dir, '.claude', 'specs'), { recursive: true });
 
   // Merge missing standard scripts into package.json (never overwrite existing)
   if (proj.hasPkg) {
@@ -6126,6 +6937,12 @@ function cmdScaffold(dir) {
     if (proj.isTS) add['type-check'] = tsconfigIsSolution(dir) ? 'tsc -b --noEmit' : 'tsc --noEmit';
     if (proj.hasHTML) add['lint:html'] = 'html-validate *.html';
     if (proj.hasCSS) add['lint:css'] = 'stylelint "styles/*.css"';
+    if (
+      siteAppFor(dir) &&
+      pkg.scripts['test:flows'] &&
+      /playwright/.test(pkg.scripts['test:flows'])
+    )
+      add['site:capture'] = 'npm run build && SITE_CAPTURE=1 playwright test';
     const fastParts = [
       'lint',
       proj.hasHTML && 'lint:html',
@@ -6146,25 +6963,31 @@ function cmdScaffold(dir) {
       }
     }
     if (addedScripts.length > 0) {
-      fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+      if (!dryRun) fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
       created.push(`package.json scripts: ${addedScripts.join(', ')}`);
     }
     try {
-      fs.chmodSync(path.join(dir, '.husky', 'pre-commit'), 0o755);
+      if (!dryRun) fs.chmodSync(path.join(dir, '.husky', 'pre-commit'), 0o755);
     } catch {
       /* fine */
     }
-    if (!exists(path.join(dir, 'allowed-packages.json'))) {
+    if (!quiet && !exists(path.join(dir, 'allowed-packages.json'))) {
       console.log(`  ${YELLOW}⚠${RESET} No allowed-packages.json — bootstrap it:`);
       console.log(`      node ../build-policy/scripts/bootstrap-allowlist.js .`);
     }
   }
 
-  for (const c of created) console.log(`  ${GREEN}created${RESET} ${c}`);
-  for (const s of skipped) console.log(`  ${DIM}exists  ${s}${RESET}`);
-  console.log(
-    `\nRe-run 'policy check' to see remaining gaps (devDependencies must be installed manually).\n`,
-  );
+  if (!quiet) {
+    const verb = dryRun ? 'would create' : 'created';
+    for (const c of created) console.log(`  ${GREEN}${verb}${RESET} ${c}`);
+    for (const s of skipped) console.log(`  ${DIM}exists  ${s}${RESET}`);
+    console.log(
+      dryRun
+        ? `\nNothing written. Run 'policy scaffold' to create the ${created.length} item(s) above.\n`
+        : `\nRe-run 'policy check' to see remaining gaps (devDependencies must be installed manually).\n`,
+    );
+  }
+  return { created, skipped };
 }
 
 /**
@@ -6233,8 +7056,7 @@ function cmdSyncTemplates(dir) {
       changed.push(`package.json scripts.${name}`);
       console.log(`  ${GREEN}written${RESET} package.json scripts.${name} = "${cmd}"`);
     }
-    if (Object.keys(syncs).length)
-      fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+    if (Object.keys(syncs).length) fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
   }
   const nodePin = (loadRegistry().entries || {})['node-lts'];
   if (nodePin && nodePin.value && readFile(path.join(dir, '.nvmrc')).trim() !== nodePin.value) {
@@ -6661,7 +7483,21 @@ function cmdDoctor() {
       'claude',
       // A system prompt of our own, as the gate passes: the default one is
       // large enough that a probe under it ran past a five-cent budget.
-      ['-p', '--setting-sources', '', '--tools', '', '--no-session-persistence', '--output-format', 'json', '--max-budget-usd', '0.10', '--system-prompt', 'Reply with the single word ok.', 'ok?'],
+      [
+        '-p',
+        '--setting-sources',
+        '',
+        '--tools',
+        '',
+        '--no-session-persistence',
+        '--output-format',
+        'json',
+        '--max-budget-usd',
+        '0.10',
+        '--system-prompt',
+        'Reply with the single word ok.',
+        'ok?',
+      ],
       { cwd: os.tmpdir(), encoding: 'utf8', timeout: 60000 },
     );
     let j = null;
@@ -6673,8 +7509,13 @@ function cmdDoctor() {
     if (j && !j.is_error) ok('claude headless review works (logged in)');
     else
       fail(
-        `claude -p is not usable: ${j ? String(j.result || j.subtype) : String(probe.stderr || probe.stdout || '').trim().slice(0, 200) || 'no output'} — ` +
-          'open claude and run /login, then re-run doctor',
+        `claude -p is not usable: ${
+          j
+            ? String(j.result || j.subtype)
+            : String(probe.stderr || probe.stdout || '')
+                .trim()
+                .slice(0, 200) || 'no output'
+        } — ` + 'open claude and run /login, then re-run doctor',
       );
   }
 
@@ -6775,15 +7616,21 @@ function cmdDoctor() {
     );
 
   if (process.platform === 'darwin') {
-    if (!exists(sweepPlistPath())) warn(`Monthly health sweep not installed (${SWEEP_LABEL}) — run: policy setup-machine`);
-    else if (!sweepLoaded()) warn(`Monthly health sweep written but not loaded in launchd — run: policy setup-machine`);
+    if (!exists(sweepPlistPath()))
+      warn(`Monthly health sweep not installed (${SWEEP_LABEL}) — run: policy setup-machine`);
+    else if (!sweepLoaded())
+      warn(`Monthly health sweep written but not loaded in launchd — run: policy setup-machine`);
     else {
       // The plist pins the node binary that ran setup-machine (under nvm, a
       // versioned path), so a Node upgrade leaves the job pointing at nothing
       // and launchd reports it loaded all the same.
-      const prog = /<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]+)<\/string>/.exec(readFile(sweepPlistPath()));
+      const prog = /<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]+)<\/string>/.exec(
+        readFile(sweepPlistPath()),
+      );
       if (prog && !exists(prog[1]))
-        warn(`Monthly health sweep points at ${prog[1]}, which no longer exists — run: policy setup-machine`);
+        warn(
+          `Monthly health sweep points at ${prog[1]}, which no longer exists — run: policy setup-machine`,
+        );
       else ok(`Monthly health sweep scheduled (${SWEEP_LABEL})`);
     }
   }
@@ -6892,7 +7739,8 @@ function cmdSetupMachine() {
     const domain = `gui/${process.getuid()}`;
     sh(`launchctl bootout ${domain} "${dest}"`, os.homedir());
     const load = sh(`launchctl bootstrap ${domain} "${dest}"`, os.homedir());
-    if (load.ok || sweepLoaded()) ok(`Installed monthly health sweep (${SWEEP_LABEL}, 1st of the month 09:00)`);
+    if (load.ok || sweepLoaded())
+      ok(`Installed monthly health sweep (${SWEEP_LABEL}, 1st of the month 09:00)`);
     else warn(`Wrote ${dest} but launchctl did not load it: ${load.out.slice(0, 200)}`);
   }
 
@@ -7007,6 +7855,12 @@ const BUILD_INVOCATION =
 // match a grep or an echo that names it (and did, twice, on the day it landed).
 const HELP_CAPTURE_INVOCATION =
   /\b(?:npm\s+(?:--prefix\s+\S+\s+)?run|yarn|pnpm(?:\s+run)?)\s+docs:capture\b/;
+// Product-page screenshots are the site session's work for the same reason
+// (policy 2.78): the capture writes into the site repo, and the manifest
+// there is what records the result. `policy site-capture <app>` from the site
+// project is the one sanctioned way to run it.
+const SITE_CAPTURE_INVOCATION =
+  /\b(?:npm\s+(?:--prefix\s+\S+\s+)?run|yarn|pnpm(?:\s+run)?)\s+site:capture\b/;
 
 function readStdinJSON() {
   try {
@@ -7108,7 +7962,10 @@ function lastAssistantText(transcriptPath) {
 // signature on text the developer has not read (asked for 2026-10-10).
 function unpresentedExceptions(dir, replyText) {
   const exceptions = loadAuditExceptions(dir);
-  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const norm = (s) =>
+    String(s || '')
+      .replace(/\s+/g, ' ')
+      .trim();
   const reply = norm(replyText);
   const out = [];
   for (const [id, e] of Object.entries(exceptions)) {
@@ -7300,9 +8157,9 @@ function cmdHookStop() {
           (proj.isGit && repoHasNoCommits(dir)
             ? `This repo has no commits, so /security-review has nothing to diff against: review these files directly, record the ack, and tell the developer ${ROOT_COMMIT_HINT}. `
             : proj.isGit && missingOriginHead(dir) !== null
-            ? `First make /security-review runnable (this repo has no origin/HEAD, which git creates only on clone): ` +
-              `${missingOriginHead(dir) ? `git remote set-head origin ${missingOriginHead(dir)}` : 'git fetch origin, then policy scaffold'}. `
-            : '') +
+              ? `First make /security-review runnable (this repo has no origin/HEAD, which git creates only on clone): ` +
+                `${missingOriginHead(dir) ? `git remote set-head origin ${missingOriginHead(dir)}` : 'git fetch origin, then policy scaffold'}. `
+              : '') +
           `Run /security-review over these changes, fix what it finds, then record it: ` +
           `node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} security-ack` +
           (rec
@@ -7793,6 +8650,25 @@ function cmdHookPretool() {
     );
     process.exit(0);
   }
+  if (input.tool_name === 'Bash' && SITE_CAPTURE_INVOCATION.test(cmd)) {
+    const siteProject = loadRegistry().siteProject;
+    const here = path.basename(path.resolve(input.cwd || process.cwd()));
+    if (siteProject && here !== siteProject) {
+      console.log(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason:
+              `BUILD-POLICY: product-page screenshots are the ${siteProject} session's work, not this session's. ` +
+              `Do not run site:capture here. In a ${siteProject} session run: node ../build-policy/scripts/policy.js site-capture <app> ` +
+              "— it runs this app's capture into the site's image folder and records the result in img/screenshots.json.",
+          },
+        }),
+      );
+      process.exit(0);
+    }
+  }
   // Screenshot capture belongs to the help site session (it owns the pages,
   // flows and fixtures). An app session that runs it is doing the other
   // session's work, and the result lands in a help site nobody is editing.
@@ -8081,7 +8957,9 @@ For each ⚠ peer above where the project is below the required major: what has 
 // The entry as the approver reads it: the reason wrapped as prose, the facts
 // on one line, no JSON. What is being approved is the reason, so it leads.
 function wrapText(text, width, indent) {
-  const words = String(text || '').split(/\s+/).filter(Boolean);
+  const words = String(text || '')
+    .split(/\s+/)
+    .filter(Boolean);
   const lines = [];
   let line = '';
   for (const w of words) {
@@ -8166,7 +9044,7 @@ function cmdApproveException(ids, flags = []) {
 
 function main() {
   const [, , command, ...rawRest] = process.argv;
-  const rest = normalizeValueFlags(rawRest, ['--reviewer']);
+  const rest = normalizeValueFlags(rawRest, ['--reviewer', '--verify', '--version']);
   const flags = rest.filter((a) => a.startsWith('--'));
   const dir = rest.find((a) => !a.startsWith('--')) || '.';
   hookMode = flags.includes('--hook');
@@ -8188,8 +9066,15 @@ function main() {
       return cmdVerifyReady(dir, flags);
     case 'security-ack':
       return cmdSecurityAck(dir);
+    case 'site-images':
+      return cmdSiteImages(dir, flags);
+    case 'site-capture':
+      return cmdSiteCapture('.', rest, flags);
     case 'help-handback':
-      return cmdHelpHandback('.', rest.find((a) => !a.startsWith('--')));
+      return cmdHelpHandback(
+        '.',
+        rest.find((a) => !a.startsWith('--')),
+      );
     case 'health':
       return flags.includes('--all') ? cmdHealthAll() : cmdHealth(dir, flags);
     case 'deps-update':
@@ -8202,7 +9087,7 @@ function main() {
         flags,
       );
     case 'scaffold':
-      return cmdScaffold(dir);
+      return cmdScaffold(dir, { dryRun: flags.includes('--dry-run') });
     case 'handoff':
       return cmdHandoff();
     case 'mirror-sync':
@@ -8228,6 +9113,18 @@ if (require.main === module) main();
 // For tests/ only: the pure predicates the hooks and gates decide on.
 module.exports = {
   runSast,
+  siteImageRefs,
+  siteImageApp,
+  siteImagesStatus,
+  auditSiteImages,
+  imageBehind,
+  siteCaptureWindow,
+  SITE_CAPTURE_INVOCATION,
+  treeScanGaps,
+  handlesByokKeys,
+  BYOK_CALL,
+  ensureElectronBinary,
+  cmdScaffold,
   TEST_GATE_SCRIPTS,
   zeroInputReason,
   emptyPassScriptReason,
