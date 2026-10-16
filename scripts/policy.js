@@ -3529,7 +3529,7 @@ function checkStaleness(dir, reg) {
         warn(
           `${prs.superseded.length} open Dependabot PR(s) already superseded by the lockfile: ${list}` +
             `${prs.superseded.length > 4 ? ', …' : ''} — close them: ` +
-            `gh pr close ${prs.superseded.map((p) => p.number).join(' ')} --comment "Superseded by a local dependency refresh on main"`,
+            `for n in ${prs.superseded.map((p) => p.number).join(' ')}; do gh pr close $n --comment "Superseded by a local dependency refresh on main"; done`,
         );
       }
       if (prs.open.length) {
@@ -5284,7 +5284,26 @@ function verifyRelease(dir, proj, flags) {
     const marketing = checklist.findIndex((c) => /marketing/i.test(c));
     checklist.splice(marketing === -1 ? checklist.length : marketing, 0, step);
   }
-  if (helpPending) {
+  // Only the DMG-producing profiles have an artifact to stage the checklist on.
+  const buildsArtifact = profile === 'gumroad' || profile === 'none';
+  // Before the DMG exists, the help pages are a checklist step like every
+  // other: the release order is gates -> commit -> build -> checklist, and the
+  // help work sits inside the checklist (before the marketing drafts). The
+  // build hook refuses to build until verify-ready --release records a pass
+  // with zero failures, so a FAIL here before the build made the DMG
+  // unbuildable until the help pages were done — the opposite of the order
+  // CLAUDE.md states, and the first app to release with stale pages after
+  // both checks landed hit exactly that wall. Pre-build it is reported as
+  // pending, with the hand-off printed so the help session can start in
+  // parallel; once the DMG exists it is a FAIL, and the sign-off refuses it.
+  const preBuild = buildsArtifact && !builtDmgVersions(dir).has(proj.pkg.version);
+  if (helpPending && preBuild) {
+    warn(
+      `Help pages are behind ${proj.pkg.version} (${help.pending.length} page problem(s)) — pending, not a blocker for the build. ` +
+        `Open a session in ${path.basename(help.helpDir)} and paste:`,
+    );
+    console.log(`\n${helpHandoffMessage(dir, proj, help)}\n`);
+  } else if (helpPending) {
     fail(
       `Help pages are behind ${proj.pkg.version} (${help.pending.length} page problem(s)). ` +
         `Open a session in ${path.basename(help.helpDir)} and paste:`,
@@ -5293,8 +5312,6 @@ function verifyRelease(dir, proj, flags) {
   } else if (help && help.pages.length) {
     ok(`Help pages current (${help.pages.length} page(s) verified against ${help.verified.join(', ')})`);
   }
-  // Only the DMG-producing profiles have an artifact to stage the checklist on.
-  const buildsArtifact = profile === 'gumroad' || profile === 'none';
 
   const tagName = `v${proj.pkg.version}`;
   const tagExists =
