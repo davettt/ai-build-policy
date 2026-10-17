@@ -1349,3 +1349,19 @@ test('policy reports: append numbers entries, list parses them, close marks one'
     'numbering continues past closed',
   );
 });
+
+test('siteTrackedImages: a store image under an app folder is tracked without a page (R-1)', () => {
+  const site = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-store-'));
+  const reg = { siteApps: { 'app-one': { img: ['ao'] } }, siteSharedImages: ['membership'] };
+  fs.mkdirSync(path.join(site, 'img', 'ao'), { recursive: true });
+  fs.mkdirSync(path.join(site, 'img', 'zz'), { recursive: true });
+  fs.writeFileSync(path.join(site, 'img', 'ao', 'hero.png'), '');
+  fs.writeFileSync(path.join(site, 'img', 'ao', 'store-cover.png'), '');
+  fs.writeFileSync(path.join(site, 'img', 'ao', 'notes.txt'), '');
+  fs.writeFileSync(path.join(site, 'img', 'zz', 'x.png'), '');
+  fs.writeFileSync(path.join(site, 'index.html'), '<img src="/img/ao/hero.png">');
+  const t = policy.siteTrackedImages(site, reg);
+  assert.deepEqual([...t.keys()].sort(), ['img/ao/hero.png', 'img/ao/store-cover.png']);
+  assert.deepEqual([...t.get('img/ao/hero.png')], ['index.html']);
+  assert.equal(t.get('img/ao/store-cover.png').size, 0, 'store image: no page');
+});

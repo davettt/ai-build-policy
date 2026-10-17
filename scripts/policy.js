@@ -1187,6 +1187,38 @@ function siteImageApp(imgPath, reg = loadRegistry()) {
   return undefined;
 }
 
+/**
+ * Every image the manifest should hold: each one a page references, plus
+ * every image file under a claimed img/<prefix>/ folder whether a page uses
+ * it or not. Store listing images (a cover, a thumbnail) live beside the
+ * product shots and are uploaded to the store rather than referenced by a
+ * page, so the reference scan alone missed them and a release passed
+ * "screenshots current" with a stale cover (report R-1, 2026-10-17).
+ * Returns Map img -> Set(pages); an unreferenced file has an empty set.
+ */
+function siteTrackedImages(siteDir, reg = loadRegistry()) {
+  const tracked = siteImageRefs(siteDir);
+  const prefixes = new Set([
+    ...siteAppEntries(reg).flatMap(([, cfg]) => cfg.img || []),
+    ...(reg.siteSharedImages || []),
+  ]);
+  for (const prefix of prefixes) {
+    const dir = path.join(siteDir, 'img', prefix);
+    let names = [];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      if (!SITE_IMAGE_EXT.test(n)) continue;
+      const img = `img/${prefix}/${n}`;
+      if (!tracked.has(img)) tracked.set(img, new Set());
+    }
+  }
+  return tracked;
+}
+
 function readSiteManifest(siteDir) {
   const m = readJSON(path.join(siteDir, SITE_IMAGE_MANIFEST));
   return m && typeof m.images === 'object' && m.images ? m : null;
@@ -1277,10 +1309,11 @@ function auditSiteImages(siteDir, reg = loadRegistry()) {
       `Site: img/ prefix(es) claimed by no app in registry.json siteApps (or siteSharedImages): ${prefixes.join(', ')} — add them so each screenshot has an app version to be checked against`,
     );
   }
-  const untracked = [...refs.keys()].filter((img) => !manifest.images[img]);
+  const tracked = siteTrackedImages(siteDir, reg);
+  const untracked = [...tracked.keys()].filter((img) => !manifest.images[img]);
   if (untracked.length > 0) {
     fail(
-      `Site: ${untracked.length} referenced image(s) missing from ${SITE_IMAGE_MANIFEST}: ${untracked.slice(0, 6).join(', ')}${untracked.length > 6 ? ', …' : ''} — run: policy site-images --init (adds them at the site's current versions)`,
+      `Site: ${untracked.length} image(s) missing from ${SITE_IMAGE_MANIFEST} (referenced by a page or under an app's img/ folder): ${untracked.slice(0, 6).join(', ')}${untracked.length > 6 ? ', …' : ''} — run: policy site-images --init (adds them at the site's current versions)`,
     );
   }
   const gone = Object.keys(manifest.images).filter((img) => !exists(path.join(siteDir, img)));
@@ -1289,11 +1322,11 @@ function auditSiteImages(siteDir, reg = loadRegistry()) {
       `Site: ${gone.length} manifest entry/ies name a file that no longer exists: ${gone.slice(0, 6).join(', ')}`,
     );
   const orphan = Object.keys(manifest.images).filter(
-    (img) => !refs.has(img) && !gone.includes(img),
+    (img) => !tracked.has(img) && !gone.includes(img),
   );
   if (orphan.length > 0)
     warn(
-      `Site: ${orphan.length} manifest entry/ies no page references any more: ${orphan.slice(0, 6).join(', ')} — remove them or the file`,
+      `Site: ${orphan.length} manifest entry/ies outside every page and every app's img/ folder: ${orphan.slice(0, 6).join(', ')} — remove them or the file`,
     );
   // Behind the site's own advertised version: version.json was bumped for a
   // release and the screenshots were not looked at in the same session.
@@ -1352,7 +1385,7 @@ function cmdSiteImages(dir, flags) {
 
   if (flags.includes('--init')) {
     let added = 0;
-    for (const [img, pages] of refs) {
+    for (const [img, pages] of siteTrackedImages(here, reg)) {
       if (manifest.images[img]) continue;
       const app = siteImageApp(img, reg);
       if (app === undefined) {
@@ -1364,6 +1397,7 @@ function cmdSiteImages(dir, flags) {
         verifiedVersion: meta && meta.version ? meta.version : null,
         lastVerified: today,
         pages: [...pages].sort(),
+        ...(pages.size === 0 ? { store: true } : {}),
       };
       added++;
     }
@@ -1535,14 +1569,13 @@ function cmdSiteCapture(dir, rest, flags) {
       produced.push(img);
     } else untouched.push(img);
   }
-  // Files the capture wrote that no page references: the flow names a shot
-  // the site does not use, or the page uses a different name.
-  const refs = siteImageRefs(here);
+  // Files the capture wrote that the manifest does not know: the flow names a
+  // shot the site does not use, or the page uses a different name.
   const stray = fs
     .readdirSync(outDir)
     .filter((n) => SITE_IMAGE_EXT.test(n))
     .map((n) => `img/${prefix}/${n}`)
-    .filter((img) => !refs.has(img) && fs.statSync(path.join(here, img)).mtimeMs >= started);
+    .filter((img) => !manifest.images[img] && fs.statSync(path.join(here, img)).mtimeMs >= started);
   writeSiteManifest(here, manifest);
   if (produced.length > 0)
     ok(
@@ -9272,6 +9305,7 @@ if (require.main === module) main();
 module.exports = {
   runSast,
   siteImageRefs,
+  siteTrackedImages,
   siteImageApp,
   siteImagesStatus,
   auditSiteImages,
