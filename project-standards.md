@@ -1,8 +1,7 @@
 # Project Standards
 
-The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
-**Version:** 2.81
-**Last updated:** 2026-10-16
+**Version:** 2.82
+**Last updated:** 2026-10-17
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -305,6 +304,8 @@ The pattern is **one throttled check with several triggers**, not separate mecha
 
 All three call the same function, and that function does nothing if the last check was less than `UPDATE_CHECK_INTERVAL` (60 minutes) ago. That throttle is what makes the triggers safe to overlap: switching windows a hundred times a day still makes at most one request an hour. Record the check time when the request *starts*, not when it succeeds, so a failing network cannot turn every focus event into a retry.
 
+The Settings "Check for updates" action calls that same function with a manual override that bypasses the throttle. It reports the result to the user, including a network failure, and keeps the last known update state if the check fails.
+
 ```tsx
 const UPDATE_CHECK_INTERVAL = 60 * 60 * 1000;
 
@@ -605,7 +606,7 @@ These are the ONLY sanctioned global exclusions (`check` FAILs any other). Anyth
 
 Pair it with an identity check in `waitForServer`. A 200 does not prove the server is yours, since any static server returns 200. Assert on a field only your API returns, then fail loudly when another server holds the port rather than timing out or, worse, proceeding.
 
-E2E (Playwright): per-app for commercial apps with complex UI flows. Not a default.
+E2E (Playwright): per-app for commercial apps with complex UI flows. Not a default. Flows run against the tree being committed, never a deployed URL: a web project's Playwright config declares `webServer` (a command that builds and serves the output, with `reuseExistingServer: true`) and defaults `baseURL` to it. `PLAYWRIGHT_BASE_URL` is set explicitly only for a post-deploy run. `check` FAILs a config whose default `baseURL` is a remote host with no `webServer`.
 
 ### Prettier baseline
 

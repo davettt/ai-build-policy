@@ -327,6 +327,39 @@ function typeCheckWalksReferences(script) {
 // known empty-input pass, and these helpers make the empty run visible.
 const TEST_GATE_SCRIPTS = ['test:unit', 'test:smoke', 'test:integration', 'test:flows'];
 
+const PLAYWRIGHT_CONFIGS = ['playwright.config.ts', 'playwright.config.js', 'playwright.config.mjs', 'playwright.config.cjs'];
+
+/**
+ * The remote URL a Playwright config falls back to when nothing serves the
+ * project locally, or null when the flows run against a local server. A
+ * config whose default `baseURL` is a deployed host and that declares no
+ * `webServer` runs the flow gate against what is already live, so gates pass
+ * a broken tree and fail a clean one for a deploy it never touched (a site
+ * session found it, 2026-10-17). Local hosts and an env-var-only base URL
+ * with a local fallback are fine; a `webServer` block means Playwright
+ * builds and serves the tree itself.
+ */
+function playwrightRemoteTarget(text) {
+  const src = String(text || '');
+  if (!/baseURL/.test(src)) return null;
+  if (/\bwebServer\s*:/.test(src)) return null;
+  const m = /baseURL\s*:[^\n]*?['"`](https?:\/\/[^'"`\s]+)['"`]/.exec(src);
+  if (!m) return null;
+  if (/^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:|\/|$)/.test(m[1])) return null;
+  return m[1];
+}
+
+/** First Playwright config in the project root, with its remote target, or null. */
+function playwrightTargetGap(dir) {
+  for (const name of PLAYWRIGHT_CONFIGS) {
+    const file = path.join(dir, name);
+    if (!exists(file)) continue;
+    const url = playwrightRemoteTarget(readFile(file));
+    return url ? { file: name, url } : null;
+  }
+  return null;
+}
+
 // node --test exits 0 when its patterns match no file and prints "tests 0"
 // (spec reporter: "ℹ tests 0"; tap: "# tests 0"). vitest exits 1 on no
 // files unless passWithNoTests, and then prints "No test files found".
@@ -3740,6 +3773,15 @@ function cmdCheck(dir, flags = []) {
     fail(
       `No test tier (test:unit, test:smoke, test:integration, test:flows) — gates run no tests for this project. Add ${want} (project-standards § Testing tiers)`,
     );
+  }
+  // Flow tests prove the tree being committed only when they run against
+  // it. A config that falls back to the deployed site tests the last deploy.
+  if (scripts['test:flows'] && /playwright/.test(scripts['test:flows'])) {
+    const gap = playwrightTargetGap(dir);
+    if (gap)
+      fail(
+        `${gap.file}: flows default to ${gap.url} and the config has no webServer — the flow gate tests the deployed site, not this tree. Add webServer: { command: '<build and serve the output>', url: 'http://localhost:<port>', reuseExistingServer: true } and default baseURL to that local URL; set PLAYWRIGHT_BASE_URL explicitly for a post-deploy run (project-standards § Testing tiers)`,
+      );
   }
   if (scripts.sast && !scripts.sast.includes('--error')) {
     fail(
@@ -9306,6 +9348,8 @@ module.exports = {
   runSast,
   siteImageRefs,
   siteTrackedImages,
+  playwrightRemoteTarget,
+  playwrightTargetGap,
   siteImageApp,
   siteImagesStatus,
   auditSiteImages,

@@ -1365,3 +1365,18 @@ test('siteTrackedImages: a store image under an app folder is tracked without a 
   assert.deepEqual([...t.get('img/ao/hero.png')], ['index.html']);
   assert.equal(t.get('img/ao/store-cover.png').size, 0, 'store image: no page');
 });
+
+test('playwrightRemoteTarget: a deployed default base URL without webServer is a gap', () => {
+  const p = policy.playwrightRemoteTarget;
+  assert.equal(p("use: { baseURL: process.env.PLAYWRIGHT_BASE_URL || 'https://example.com', }"), 'https://example.com');
+  assert.equal(p("use: { baseURL: 'https://example.com/app' }"), 'https://example.com/app');
+  assert.equal(p("use: { baseURL: process.env.BASE || 'http://localhost:8080' }"), null, 'local fallback');
+  assert.equal(p("use: { baseURL: 'http://127.0.0.1:3000' }"), null);
+  assert.equal(p("webServer: { command: 'npm run preview', url: 'http://localhost:8080' },\nuse: { baseURL: process.env.X || 'https://example.com' }"), null, 'webServer serves the tree');
+  assert.equal(p("use: { baseURL: process.env.PLAYWRIGHT_BASE_URL }"), null, 'env only');
+  assert.equal(p("export default defineConfig({ testDir: './tests' })"), null, 'Electron flows: no base URL');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-pw-'));
+  assert.equal(policy.playwrightTargetGap(dir), null);
+  fs.writeFileSync(path.join(dir, 'playwright.config.ts'), "export default { use: { baseURL: 'https://example.com' } }");
+  assert.deepEqual(policy.playwrightTargetGap(dir), { file: 'playwright.config.ts', url: 'https://example.com' });
+});
