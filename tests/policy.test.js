@@ -1380,3 +1380,32 @@ test('playwrightRemoteTarget: a deployed default base URL without webServer is a
   fs.writeFileSync(path.join(dir, 'playwright.config.ts'), "export default { use: { baseURL: 'https://example.com' } }");
   assert.deepEqual(policy.playwrightTargetGap(dir), { file: 'playwright.config.ts', url: 'https://example.com' });
 });
+
+test('securitySensitiveFiles: a screenshot named like a session handler is not security-sensitive', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-sec-'));
+  const files = [
+    'src/assets/product/sessions-and-journeys-1.png',
+    'public/img/token-flow.webp',
+    'src/auth/session.ts',
+  ];
+  assert.deepEqual(policy.securitySensitiveFiles(dir, files), ['src/auth/session.ts']);
+});
+
+test('helpSlugFolder: a help-site slug resolves to the one repo folder its pages cite', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-slug-'));
+  const help = path.join(parent, 'helpsite');
+  const docs = path.join(help, 'src', 'content', 'docs', 'insights');
+  fs.mkdirSync(docs, { recursive: true });
+  for (const f of ['repo-folder', 'other-repo']) {
+    fs.mkdirSync(path.join(parent, f));
+    fs.writeFileSync(path.join(parent, f, 'package.json'), '{}');
+  }
+  const page = (name, fm) => fs.writeFileSync(path.join(docs, name), `---\n${fm}\n---\n# ${name}\n`);
+  page('a.mdx', 'app: product-name\nsources:\n  - repo-folder/src/App.tsx');
+  page('b.mdx', 'app: product-name\nsources: []');
+  page('c.mdx', 'app: split\nsources:\n  - repo-folder/src/A.tsx\n  - other-repo/src/B.tsx');
+  assert.equal(policy.helpSlugFolder(help, 'product-name'), 'repo-folder');
+  assert.equal(policy.helpSlugFolder(help, 'nothing'), null);
+  // Pages naming two repos: refuse to guess.
+  assert.equal(policy.helpSlugFolder(help, 'split'), null);
+});

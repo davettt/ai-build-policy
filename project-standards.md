@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.82
-**Last updated:** 2026-10-17
+**Version:** 2.83
+**Last updated:** 2026-10-18
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -346,6 +346,10 @@ Do it in the renderer, where every app already does the check: the result lands 
 - Window focus/blur (`visibilitychange` or `focus`/`blur` events)
 - Network status (`navigator.onLine` + `online`/`offline` events)
 - System locale changes (rare, but `languagechange` event exists)
+- Calendar date: "today", and every countdown and overdue state derived from it. An app left open overnight shows yesterday's counts. Recheck on focus and `visibilitychange`, plus a once-a-minute interval that updates state only when the date has changed.
+- Data another process writes. When an assistant (MCP) adds items through the server, the window still shows what it loaded at launch, so a new item appears only after a reload. Re-fetch on window focus, plus a light interval while that access is on, or have the server push a change event (SSE) that the renderer re-fetches on.
+
+**Day counts and date keys are local.** Days between two local midnights use `Math.round(diff / 86400000)`, never `Math.ceil`. The day a DST change happens is 23 or 25 hours long, so `ceil` over a 25-hour day adds one. `check` FAILs `Math.ceil` over a day in milliseconds. A line where `ceil` is intended (time left until an instant, not a date) opts out with `// policy:ceil-intended`. A date key, filename or "today" comparison uses the local date (`getFullYear()`, `getMonth() + 1`, `getDate()`), never `toISOString().slice(0, 10)`, which is the UTC date.
 
 **DMG Build, Code Signing & Notarization:**
 

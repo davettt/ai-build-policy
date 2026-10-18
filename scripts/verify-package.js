@@ -360,13 +360,31 @@ async function main() {
   console.log(`\n  ${BOLD}Socket risk assessment:${RESET}`);
   let socket = { checked: null, status: 'unavailable' };
   try {
-    const out = execFileSync('socket', ['package', 'score', 'npm', `${pkg}@${latest}`, '--json'], {
-      encoding: 'utf8',
-      timeout: 60000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const parsed = JSON.parse(out.slice(out.indexOf('{')));
-    if (parsed.ok === false) throw Object.assign(new Error(JSON.stringify(parsed)), { stdout: out });
+    const scoreOnce = () => {
+      const out = execFileSync('socket', ['package', 'score', 'npm', `${pkg}@${latest}`, '--json'], {
+        encoding: 'utf8',
+        timeout: 60000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const parsed = JSON.parse(out.slice(out.indexOf('{')));
+      if (parsed.ok === false) throw Object.assign(new Error(JSON.stringify(parsed)), { stdout: out });
+      return parsed;
+    };
+    // Socket rate-limits after a handful of calls, so scoring a whole
+    // allowlist recorded every later package as 'unavailable' (R-2,
+    // 2026-10-17). Back off on a 429 and retry; a loop then paces itself.
+    let parsed;
+    for (const wait of [15, 30, 60, 0]) {
+      try {
+        parsed = scoreOnce();
+        break;
+      } catch (err) {
+        const msg = `${(err && err.stdout) || ''} ${(err && err.stderr) || ''} ${(err && err.message) || ''}`;
+        if (!/429/.test(msg) || wait === 0) throw err;
+        console.log(`  ${DIM}Socket rate limited — retrying in ${wait}s${RESET}`);
+        await new Promise((r) => setTimeout(r, wait * 1000));
+      }
+    }
     const data = parsed.data || {};
     const self = (data.self && data.self.score) || {};
     const deep = (data.transitively && data.transitively.score) || {};

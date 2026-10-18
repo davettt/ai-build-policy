@@ -534,12 +534,16 @@ const SECURITY_CONTENT_PATTERNS = [
   /fs\.(rm|rmSync|unlink|unlinkSync|rmdir)\b|rimraf/,
   /DELETE\s+FROM|DROP\s+TABLE/i,
 ];
+// Images, fonts and media under src/ or public/ count as source for the gates,
+// but carry no code: a screenshot named sessions-and-journeys.png is not a
+// session handler (R-3, 2026-10-17).
+const MEDIA_ASSET = /\.(png|jpe?g|webp|gif|avif|svg|ico|woff2?|ttf|otf|mp4|webm|mov)$/i;
 function securitySensitiveFiles(dir, files) {
   // In the policy repo the enforcement code is the sensitive surface.
   if (path.resolve(dir) === POLICY_ROOT)
     return files.filter((f) => /^(scripts|machine|templates)\//.test(f));
   return files.filter((f) => {
-    if (!isSourceFile(f)) return false;
+    if (!isSourceFile(f) || MEDIA_ASSET.test(f)) return false;
     if (SECURITY_PATH_PATTERNS.test(f)) return true;
     const body = readFile(path.join(dir, f));
     return body ? SECURITY_CONTENT_PATTERNS.some((re) => re.test(body)) : false;
@@ -851,6 +855,26 @@ function remoteFontFindings(dir) {
       .filter((l) => REMOTE_FONT_HOST_RE.test(l) && !FONT_HOST_OPT_OUT.test(l));
     if (lines.length > 0)
       findings.push(`${f} (${lines.length} line${lines.length === 1 ? '' : 's'})`);
+  }
+  return findings;
+}
+
+// Days between two local midnights with Math.ceil(ms / 86400000): a DST
+// fall-back day is 25h, so ceil adds one and a countdown is a day out once a
+// year. Shipped in one app's countdown (R-6, 2026-10-17). Math.round is
+// right for midnight-to-midnight; a line where ceil is intended (time left
+// until an instant, not a date) opts out with the marker.
+const DAY_COUNT_CEIL_RE =
+  /Math\.ceil\([^;\n]*(86_?400_?000|24\s*\*\s*60\s*\*\s*60\s*\*\s*1000|1000\s*\*\s*60\s*\*\s*60\s*\*\s*24|\b(MS_PER_DAY|DAY_MS|ONE_DAY_MS|msPerDay|dayMs)\b)/;
+const DAY_COUNT_OPT_OUT = /policy:ceil-intended/;
+function dayCountFindings(dir) {
+  const findings = [];
+  for (const f of sourceFilesMatching(dir, DAY_COUNT_CEIL_RE)) {
+    if (/(^|\/)(tests?|__tests__|e2e)\//.test(f) || /\.(test|spec)\.[jt]sx?$/.test(f)) continue;
+    const lines = readFile(path.join(dir, f)).split('\n');
+    lines.forEach((l, i) => {
+      if (DAY_COUNT_CEIL_RE.test(l) && !DAY_COUNT_OPT_OUT.test(l)) findings.push(`${f}:${i + 1}`);
+    });
   }
   return findings;
 }
@@ -1265,6 +1289,11 @@ function writeSiteManifest(siteDir, manifest) {
     path.join(siteDir, SITE_IMAGE_MANIFEST),
     JSON.stringify(manifest, null, 2) + '\n',
   );
+  // JSON.stringify spreads short arrays over lines where Prettier keeps them on
+  // one, so the site's format:check failed after every recapture (R-8,
+  // 2026-10-17). Format with the site's own Prettier and config when it has one.
+  const prettier = path.join(siteDir, 'node_modules', '.bin', 'prettier');
+  if (exists(prettier)) sh(`"${prettier}" --write ${SITE_IMAGE_MANIFEST}`, siteDir);
 }
 
 /** The site folder (the one holding version.json) for an app repo, or null. */
@@ -1802,7 +1831,21 @@ function auditPolicyRepo(root) {
   // runner: no dependency, no node_modules in this repo. The hook predicates
   // needed three false-positive fixes in two weeks, which is what these cover.
   if (exists(path.join(root, 'tests'))) {
-    const t = sh("node --test 'tests/**/*.test.js'", root);
+    // From a pre-commit hook git exports GIT_INDEX_FILE (a temporary index on a
+    // `git commit <path>`), and the tests' throwaway repos inherited it:
+    // "Error building trees" in every one (2026-10-18). Tests get a clean env.
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([k]) => !/^GIT_(INDEX_FILE|DIR|WORK_TREE|PREFIX|OBJECT_DIRECTORY)$/.test(k)),
+    );
+    let t;
+    try {
+      t = {
+        ok: true,
+        out: execSync("node --test 'tests/**/*.test.js'", { cwd: root, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
+      };
+    } catch (e) {
+      t = { ok: false, out: (e.stdout || '') + (e.stderr || '') };
+    }
     if (t.ok) ok('Policy repo tests pass (node --test tests/**/*.test.js)');
     else
       fail(
@@ -4005,6 +4048,13 @@ function cmdCheck(dir, flags = []) {
   if (proj.hasServer) {
     auditSecurityInfrastructure(dir, proj);
   }
+
+  const dayCounts = dayCountFindings(dir);
+  if (dayCounts.length > 0) {
+    fail(
+      `Day counts rounded up with Math.ceil in: ${dayCounts.join(', ')} — across a DST fall-back the day between two local midnights is 25h, so the count is one too many. Use Math.round on the difference between two local midnights (project-standards § Locale & Date Formatting)`,
+    );
+  }
   // Unconditional: servers also live outside server/ (monorepo apps/server,
   // src/server). Silent when no listen() exists.
   auditNetworkExposure(dir);
@@ -5965,10 +6015,19 @@ function cmdHelpHandback(dir, app) {
     fail('Name the app folder: policy help-handback <app>');
     return finish();
   }
+  // The help site names apps by slug (product-name), the repo by folder
+  // (repo-folder); accept either (R-5, 2026-10-17).
+  if (!exists(path.join(path.dirname(here), app, 'package.json'))) {
+    const folder = helpSlugFolder(here, app);
+    if (folder) app = folder;
+  }
   const appDir = path.join(path.dirname(here), app);
   const proj = detectProject(appDir);
   if (!proj.pkg) {
-    fail(`No package.json at ${appDir}: the app folder must sit beside the help site`);
+    fail(
+      `No package.json at ${appDir}, and no help page with app: ${app} names a source folder. ` +
+        `Pass the app's repo folder (beside the help site) or its help-site slug.`,
+    );
     return finish();
   }
   const status = helpPagesStatus(appDir, { helpDir: here });
@@ -6017,6 +6076,32 @@ function cmdHelpHandback(dir, app) {
     ) + '\n',
   );
   return finish();
+}
+
+/**
+ * The repo folder behind a help-site slug, read from the first path segment
+ * of the `sources` its pages cite. Null when no page names one, or when pages
+ * disagree — guessing between two repos would hand back the wrong app.
+ */
+function helpSlugFolder(helpDir, slug) {
+  const docs = path.join(helpDir, 'src', 'content', 'docs');
+  if (!exists(docs)) return null;
+  const walk = (d) =>
+    fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) return walk(p);
+      return /\.mdx?$/.test(e.name) ? [p] : [];
+    });
+  const folders = new Set();
+  for (const file of walk(docs)) {
+    const fm = helpPageFrontMatter(file);
+    if (fm.app !== slug || !Array.isArray(fm.sources)) continue;
+    for (const s of fm.sources) if (s.includes('/')) folders.add(s.split('/')[0]);
+  }
+  const found = [...folders].filter((f) =>
+    exists(path.join(path.dirname(helpDir), f, 'package.json')),
+  );
+  return found.length === 1 ? found[0] : null;
 }
 
 /** The message the help site session hands back to the app session. */
@@ -8455,8 +8540,11 @@ const POLICY_OWNER = path.join(POLICY_ROOT, '.policy', 'owner.json');
 const POLICY_WRITE_OP =
   /(^|[\s;&|(])(sed\s+-i|perl\s+-[a-z]*i|tee|cp|mv|rm|touch|patch|truncate)\s|(?<![0-9&])>>?\s*["']?(?!\/dev\/|\/tmp\/|\/private\/tmp\/)[^\s&|"']|open\([^)]*,\s*["'][wa]|writeFileSync|appendFileSync|\bgit\b[^|;&]*\s(checkout|restore|reset|stash|apply|revert|clean)\b/;
 
+// REPORTS.md is appended by app sessions through `policy report`, outside any
+// claim, so counting it kept a finished session's claim alive for a day and
+// refused the next build-policy session (2026-10-18).
 function policyTreeDirty() {
-  return changedFiles(POLICY_ROOT).some((f) => !f.startsWith('.policy/'));
+  return changedFiles(POLICY_ROOT).some((f) => !f.startsWith('.policy/') && f !== 'REPORTS.md');
 }
 
 function isUnderRoot(p, cwd, root) {
@@ -9420,6 +9508,9 @@ module.exports = {
   isArchived,
   helpPageFrontMatter,
   helpPagesStatus,
+  helpSlugFolder,
+  securitySensitiveFiles,
+  dayCountFindings,
   helpHandoffMessage,
   helpHandbackMessage,
   HELP_CAPTURE_INVOCATION,
