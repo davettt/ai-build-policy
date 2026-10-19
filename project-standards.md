@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.83
-**Last updated:** 2026-10-18
+**Version:** 2.85
+**Last updated:** 2026-10-19
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -396,6 +396,8 @@ Legacy projects using `APPLE_ID`/`APPLE_TEAM_ID`/`APPLE_APP_SPECIFIC_PASSWORD` i
   }
 }
 ```
+
+**`files` lists folders with globs, not files one by one.** When `files` names each server file, a newly imported module is left out of the DMG and the installed app crashes on start, while every gate passes because tests run from source. `check` follows the relative imports from `main` (`import`, `import()`, `require()`, and `path.join(…, 'server', 'index.js')` with literal segments) and FAILs any reached file that `files` does not include, along with a `main` whose server load it cannot follow. A new top-level folder (`shared/`) needs its own glob.
 
 **`mac.notarize` covers the app, not the DMG. Both are required.** electron-builder submits and staples the `.app`, then packages that stapled app into a disk image afterwards, and never submits the container itself. Every DMG built this way is unsigned: `codesign` reports "code object is not signed at all" and `spctl` "no usable signature" on the DMG, while the app inside verifies as "Notarized Developer ID". It is a builder default rather than a per-project mistake.
 

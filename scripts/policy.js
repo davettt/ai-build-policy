@@ -2622,9 +2622,123 @@ function auditElectronStandards(dir, proj) {
     );
   }
 
+  const pkgFiles = proj.pkg || {};
+  const unpacked = packagedImportGaps(dir, pkgFiles);
+  // A loader the walk cannot follow would pass with nothing checked, so an
+  // app with a server must show the walk reached past main.
+  if (
+    proj.hasServer &&
+    pkgFiles.build &&
+    Array.isArray(pkgFiles.build.files) &&
+    packagedImportGaps(dir, { main: pkgFiles.main, build: { files: [] } }).length <= 1
+  ) {
+    findings.push(
+      `${pkgFiles.main || 'package.json main'} loads its server in a way the packaging check cannot follow, so build.files is unverified — import it with a relative specifier or path.join(__dirname, '..', 'server', 'index.js') (project-standards § Electron)`,
+    );
+  }
+  if (unpacked.length > 0) {
+    findings.push(
+      `build.files leaves out ${unpacked.length} file(s) the packaged app imports: ${unpacked.slice(0, 6).join(', ')}${unpacked.length > 6 ? ', …' : ''} — the installed app crashes on start while every gate passes, because the tests run from source. Add them to build.files, or list folders with globs (server/**/*) rather than files (project-standards § Electron)`,
+    );
+  }
+
   if (findings.length > 0) {
     for (const f of findings) fail(`Electron standard: ${f}`);
   } else ok('Electron standards followed (no licence gate, puppeteer, or safeStorage)');
+}
+
+/**
+ * An electron-builder `files` glob as a RegExp over project-relative paths.
+ * Covers what the apps write: `**`, `*`, `?` and `{a,b}`. A pattern with no
+ * glob character also matches as a folder, as electron-builder treats it.
+ */
+function builderGlobRe(pattern) {
+  if (!/[*?{]/.test(pattern)) {
+    const lit = pattern.replace(/\/+$/, '').replace(/[.+^$()|[\]\\]/g, '\\$&');
+    return new RegExp(`^${lit}(/.*)?$`);
+  }
+  let re = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '*' && pattern[i + 1] === '*') {
+      if (pattern[i + 2] === '/') {
+        re += '(?:.*/)?';
+        i += 2;
+      } else {
+        re += '.*';
+        i += 1;
+      }
+    } else if (c === '*') re += '[^/]*';
+    else if (c === '?') re += '[^/]';
+    else if (c === '{') re += '(?:';
+    else if (c === '}') re += ')';
+    else if (c === ',' && re.lastIndexOf('(?:') > re.lastIndexOf(')')) re += '|';
+    else re += c.replace(/[.+^$()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`^${re}$`);
+}
+
+/**
+ * Files the packaged main process reaches through relative imports that
+ * build.files does not include. One app listed its server files one by
+ * one, a new module imported by server.js was left out, and the installed DMG
+ * crashed on start with every gate green (R-13, 2026-10-18). Followed
+ * statically from package.json `main`: `import … from`, `import()`,
+ * `require()` and `export … from` with a ./ or ../ specifier. Later patterns
+ * win, so a `!` exclusion after an include removes the file, as in
+ * electron-builder. No `files` key means electron-builder packs everything.
+ */
+function packagedImportGaps(dir, pkg) {
+  const patterns = pkg.build && Array.isArray(pkg.build.files) ? pkg.build.files : null;
+  if (!patterns || !pkg.main) return [];
+  const rules = patterns
+    .filter((p) => typeof p === 'string')
+    .map((p) => ({ neg: p.startsWith('!'), re: builderGlobRe(p.replace(/^!/, '')) }));
+  const included = (f) => rules.reduce((inc, r) => (r.re.test(f) ? !r.neg : inc), false);
+  const SPEC =
+    /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+)['"](\.{1,2}\/[^'"]+)['"]/gm;
+  const PATH_JOIN_SPEC = /\bpath\.(?:join|resolve)\(\s*([\w$.]+)\s*((?:,\s*['"][^'"]+['"]\s*)+)\)/g;
+  const resolve = (from, spec) => {
+    const base = path.posix.normalize(path.posix.join(path.posix.dirname(from), spec));
+    if (base.startsWith('..')) return null;
+    return (
+      [base, `${base}.js`, `${base}.mjs`, `${base}.cjs`, `${base}/index.js`].find((c) => {
+        try {
+          return fs.statSync(path.join(dir, c)).isFile();
+        } catch {
+          return false;
+        }
+      }) || null
+    );
+  };
+  const seen = new Set();
+  const entry = path.posix.normalize(String(pkg.main).replace(/^\.\//, ''));
+  if (entry.startsWith('..') || path.posix.isAbsolute(entry)) return [];
+  const queue = [entry];
+  while (queue.length > 0) {
+    const f = queue.shift();
+    if (seen.has(f) || !exists(path.join(dir, f))) continue;
+    seen.add(f);
+    if (!/\.(js|mjs|cjs)$/.test(f)) continue;
+    const src = stripComments(readFile(path.join(dir, f)));
+    for (const m of src.matchAll(SPEC)) {
+      const next = resolve(f, m[1]);
+      if (next) queue.push(next);
+    }
+    // import(path.join(__dirname, '..', 'server', 'index.js')), or the same
+    // join through a variable (ROOT, then pathToFileURL) before import(). The
+    // segments after the base must all be literals ending in a script.
+    for (const m of src.matchAll(PATH_JOIN_SPEC)) {
+      const parts = [...m[2].matchAll(/['"]([^'"]+)['"]/g)].map((x) => x[1]);
+      if (!/\.[mc]?js$/.test(parts[parts.length - 1])) continue;
+      const rel = `./${parts.join('/')}`;
+      const next = /^(__dirname|import\.meta\.dirname)$/.test(m[1])
+        ? resolve(f, rel)
+        : resolve('package.json', rel) || resolve(f, rel);
+      if (next) queue.push(next);
+    }
+  }
+  return [...seen].filter((f) => f !== 'package.json' && !included(f)).sort();
 }
 
 // Cross-platform native binaries: @rolldown/binding-linux-x64-gnu and friends.
@@ -5947,7 +6061,9 @@ function helpPagesStatus(dir, opts = {}) {
     const page = path.relative(helpDir, file);
     pages.push(page);
     if (fm.verifiedVersion) verified.add(String(fm.verifiedVersion));
-    if (minorOf(current) > minorOf(fm.verifiedVersion)) {
+    // A shared page (app: general) covers several apps, so the help site's
+    // schema gives it no verifiedVersion; only its sources date it (R-18).
+    if (fm.app !== 'general' && minorOf(current) > minorOf(fm.verifiedVersion)) {
       pending.push(
         `${page}: checked against ${fm.verifiedVersion || 'nothing'}, app is now ${current}`,
       );
@@ -9511,6 +9627,8 @@ module.exports = {
   helpSlugFolder,
   securitySensitiveFiles,
   dayCountFindings,
+  packagedImportGaps,
+  builderGlobRe,
   helpHandoffMessage,
   helpHandbackMessage,
   HELP_CAPTURE_INVOCATION,

@@ -758,6 +758,15 @@ test('helpPagesStatus: pages are read from the app side by slug or source, pendi
     'gone-source.mdx',
     `app: app-one\nverifiedVersion: 2.1.0\nlastVerified: ${today}\nsources:\n  - app-one/src/Gone.tsx`,
   );
+  // Shared pages carry no verifiedVersion; only their sources date them.
+  page(
+    'shared-current.mdx',
+    `app: general\nlastVerified: ${today}\nsources:\n  - app-one/src/App.tsx\n  - other/src/App.tsx`,
+  );
+  page(
+    'shared-stale.mdx',
+    `app: general\nlastVerified: 2020-01-01\nsources:\n  - app-one/src/App.tsx`,
+  );
   page(
     'other-app.mdx',
     `app: other\nverifiedVersion: 1.0.0\nlastVerified: ${today}\nsources:\n  - other/src/App.tsx`,
@@ -773,10 +782,13 @@ test('helpPagesStatus: pages are read from the app side by slug or source, pendi
 
   assert.equal(policy.helpPagesStatus(app, { helpProject: 'missing' }), null);
   const s = policy.helpPagesStatus(app, { helpProject: 'helpsite' });
-  assert.equal(s.pages.length, 4, s.pages.join(','));
+  assert.equal(s.pages.length, 6, s.pages.join(','));
   assert.deepEqual(s.verified.sort(), ['2.0.4', '2.1.0']);
-  assert.equal(s.pending.length, 3, s.pending.join('\n'));
+  assert.equal(s.pending.length, 4, s.pending.join('\n'));
   const pending = s.pending.join('\n');
+  assert.doesNotMatch(pending, /shared-current\.mdx/);
+  assert.doesNotMatch(pending, /checked against nothing/);
+  assert.match(pending, /shared-stale\.mdx: app-one\/src\/App\.tsx changed after 2020-01-01/);
   assert.match(pending, /old-minor\.mdx: checked against 2\.0\.4, app is now 2\.1\.0/);
   assert.match(pending, /stale-source\.mdx: app-one\/src\/App\.tsx changed after 2020-01-01/);
   assert.match(pending, /gone-source\.mdx: source app-one\/src\/Gone\.tsx no longer exists/);
@@ -1408,4 +1420,54 @@ test('helpSlugFolder: a help-site slug resolves to the one repo folder its pages
   assert.equal(policy.helpSlugFolder(help, 'nothing'), null);
   // Pages naming two repos: refuse to guess.
   assert.equal(policy.helpSlugFolder(help, 'split'), null);
+});
+
+test('builderGlobRe: electron-builder globs and bare folder names', () => {
+  const m = (p, f) => policy.builderGlobRe(p).test(f);
+  assert.ok(m('server/**/*', 'server/src/a.js'));
+  assert.ok(m('**/*.map', 'dist/a.js.map'));
+  assert.ok(m('fonts', 'fonts/a.woff2'));
+  assert.ok(m('{server,shared}/*.js', 'shared/dates.js'));
+  assert.ok(!m('server/**/*', 'shared/dates.js'));
+  assert.ok(!m('server.js', 'server.json'));
+});
+
+test('packagedImportGaps: a module the packaged main reaches but build.files omits', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-pack-'));
+  const w = (f, s) => {
+    fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+    fs.writeFileSync(path.join(dir, f), s);
+  };
+  w('electron/main.js', "const { start } = await import('../server.js');\nconst p = require('./preload');");
+  w('electron/preload.js', '');
+  w('server.js', "import { log } from './logger.js';\nimport { gate } from './access.js';\n// import './commented.js'");
+  w('logger.js', '');
+  w('access.js', "export * from './shared/util.js';");
+  w('shared/util.js', '');
+  const pkg = (files) => ({ main: 'electron/main.js', build: { files } });
+  assert.deepEqual(policy.packagedImportGaps(dir, pkg(['electron/**/*', 'server.js', 'logger.js'])), [
+    'access.js',
+    'shared/util.js',
+  ]);
+  assert.deepEqual(policy.packagedImportGaps(dir, pkg(['electron/**/*', '*.js', 'shared/**/*'])), []);
+  // A later exclusion wins, as in electron-builder.
+  assert.deepEqual(policy.packagedImportGaps(dir, pkg(['**/*', '!shared/**'])), ['shared/util.js']);
+  // No files key: electron-builder packs everything.
+  assert.deepEqual(policy.packagedImportGaps(dir, { main: 'electron/main.js', build: {} }), []);
+});
+
+test('packagedImportGaps: server loaded through path.join, directly or via a root variable', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-pack-join-'));
+  const w = (f, s) => {
+    fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+    fs.writeFileSync(path.join(dir, f), s);
+  };
+  w(
+    'electron/main.js',
+    "await import(path.join(__dirname, '..', 'server', 'index.js'));\nconst e = pathToFileURL(path.join(ROOT, 'server', 'other.js')).href;",
+  );
+  w('server/index.js', '');
+  w('server/other.js', '');
+  const gaps = policy.packagedImportGaps(dir, { main: 'electron/main.js', build: { files: ['electron/**/*'] } });
+  assert.deepEqual(gaps, ['server/index.js', 'server/other.js']);
 });
