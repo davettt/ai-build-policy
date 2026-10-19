@@ -101,6 +101,9 @@ let hookMode = false;
 // Set while the audit runs inside another command (gates), where finish()
 // must return rather than end the process.
 let embedded = false;
+// Set while the audit runs as the gates' compliance step, which is itself a
+// step of finishing a release (R-19).
+let forGates = false;
 
 function ok(msg) {
   results.pass++;
@@ -327,7 +330,12 @@ function typeCheckWalksReferences(script) {
 // known empty-input pass, and these helpers make the empty run visible.
 const TEST_GATE_SCRIPTS = ['test:unit', 'test:smoke', 'test:integration', 'test:flows'];
 
-const PLAYWRIGHT_CONFIGS = ['playwright.config.ts', 'playwright.config.js', 'playwright.config.mjs', 'playwright.config.cjs'];
+const PLAYWRIGHT_CONFIGS = [
+  'playwright.config.ts',
+  'playwright.config.js',
+  'playwright.config.mjs',
+  'playwright.config.cjs',
+];
 
 /**
  * The remote URL a Playwright config falls back to when nothing serves the
@@ -586,6 +594,27 @@ function builtDmgVersions(dir) {
 function shippedDmgVersions(dir, proj) {
   if (releaseProfile(proj) === 'none') return new Set();
   return builtDmgVersions(dir);
+}
+
+/**
+ * For a version with a DMG but no tag: the commit that set the version in
+ * package.json (the release commit, short hash) and the source files changed
+ * since it, committed or not. { commit: null } when no commit set it.
+ */
+function untaggedReleaseState(dir, version) {
+  const found = shArgs(
+    'git',
+    ['log', '-1', '--format=%h', `-S"version": "${version}"`, '--', 'package.json'],
+    dir,
+  );
+  const commit = found.ok && /^[0-9a-f]{4,40}$/.test(found.out) ? found.out : null;
+  if (!commit) return { commit: null, sourceAfter: [] };
+  const diff = shArgs('git', ['diff', '--name-only', commit, '--'], dir);
+  const after = new Set([
+    ...(diff.ok ? diff.out.split('\n').filter(Boolean) : []),
+    ...changedFiles(dir),
+  ]);
+  return { commit, sourceAfter: [...after].filter(isSourceFile) };
 }
 
 /** The DMG built for a given version, or null. Only `release/` itself is
@@ -1835,13 +1864,20 @@ function auditPolicyRepo(root) {
     // `git commit <path>`), and the tests' throwaway repos inherited it:
     // "Error building trees" in every one (2026-10-18). Tests get a clean env.
     const env = Object.fromEntries(
-      Object.entries(process.env).filter(([k]) => !/^GIT_(INDEX_FILE|DIR|WORK_TREE|PREFIX|OBJECT_DIRECTORY)$/.test(k)),
+      Object.entries(process.env).filter(
+        ([k]) => !/^GIT_(INDEX_FILE|DIR|WORK_TREE|PREFIX|OBJECT_DIRECTORY)$/.test(k),
+      ),
     );
     let t;
     try {
       t = {
         ok: true,
-        out: execSync("node --test 'tests/**/*.test.js'", { cwd: root, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
+        out: execSync("node --test 'tests/**/*.test.js'", {
+          cwd: root,
+          env,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        }),
       };
     } catch (e) {
       t = { ok: false, out: (e.stdout || '') + (e.stderr || '') };
@@ -4345,12 +4381,29 @@ function cmdCheck(dir, flags = []) {
       const relTag = `v${proj.pkg.version}`;
       const tagged =
         sh(`git tag --list ${safeToken(relTag, 'git tag')}`, dir).out.trim() === relTag;
+      // The gates are themselves a step of finishing the release, so failing
+      // them here left a release whose later commits were tests or docs with
+      // no way forward: gates refused for the missing tag, verify-ready
+      // refused for the tree changed since gates (R-19). In the gates only,
+      // a release with no source change since its commit is in progress, not
+      // abandoned; the sign-off still refuses until the tag exists.
+      const rel = untaggedReleaseState(dir, proj.pkg.version);
+      const tagCmd = `git tag ${relTag}${rel.commit ? ` ${rel.commit}` : ''} && git push origin ${relTag}`;
       if (tagged) ok(`Release ${relTag} tagged`);
+      else if (forGates && rel.commit && rel.sourceAfter.length === 0)
+        warn(
+          `Release ${relTag} in progress: DMG built, release commit ${rel.commit} not yet tagged, no source changed since. ` +
+            `When it is signed off: ${tagCmd}`,
+        );
       else
         fail(
           `A DMG exists for ${proj.pkg.version} but ${relTag} is not tagged — the release was started and never signed off. ` +
-            `Finish it (dogfood, upload, site update), then: git tag ${relTag} && git push origin ${relTag}, ` +
-            `and the developer runs verify-ready --release --ack-manual`,
+            `Finish it (dogfood, upload, site update), then: ${tagCmd}` +
+            (rel.commit ? ` (${rel.commit} is the commit that set ${proj.pkg.version})` : '') +
+            `, and the developer runs verify-ready --release --ack-manual` +
+            (rel.sourceAfter.length
+              ? `. Source changed since ${rel.commit}: ${rel.sourceAfter.slice(0, 3).join(', ')}`
+              : ''),
         );
     }
   }
@@ -5080,9 +5133,10 @@ function reviewWithClaude(dir, { base, srcFiles }) {
  * presented, so a gap is found while the fix is cheap. Binding it at release
  * instead would surface structural problems after testing and force a retest.
  */
-function complianceSummary(dir) {
+function complianceSummary(dir, opts = {}) {
   const saved = { ...results, lines: [...results.lines] };
   const savedHook = hookMode;
+  forGates = Boolean(opts.forGates);
   results.pass = 0;
   results.warn = 0;
   results.fail = 0;
@@ -5103,11 +5157,12 @@ function complianceSummary(dir) {
   Object.assign(results, saved);
   hookMode = savedHook;
   embedded = false;
+  forGates = false;
   return summary;
 }
 
-function complianceFailures(dir) {
-  return complianceSummary(dir)
+function complianceFailures(dir, opts = {}) {
+  return complianceSummary(dir, opts)
     .lines.filter((l) => l.startsWith('FAIL: '))
     .map((l) => l.slice(6));
 }
@@ -5389,7 +5444,7 @@ function cmdGates(dir, flags) {
   // hatch reachable by whoever just got stopped is the thing this policy exists
   // to remove. Compliance is either met or the gates do not run.
   if (!fast) {
-    const failures = complianceFailures(dir);
+    const failures = complianceFailures(dir, { forGates: true });
     if (failures.length > 0) {
       console.log(`  ${RED}✗${RESET} Compliance (${failures.length})`);
       for (const f of failures) console.log(`      ${RED}•${RESET} ${f}`);
@@ -9624,6 +9679,8 @@ module.exports = {
   isArchived,
   helpPageFrontMatter,
   helpPagesStatus,
+  untaggedReleaseState,
+  complianceSummary,
   helpSlugFolder,
   securitySensitiveFiles,
   dayCountFindings,

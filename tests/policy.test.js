@@ -721,6 +721,47 @@ test('every message that hands the developer the approve command names --confirm
   assert.match(src, /approve-exception <GHSA-id> --confirm/);
 });
 
+test('untaggedReleaseState: names the commit that set the version and the source changed since', () => {
+  const app = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-release-'));
+  const git = (args) =>
+    require('child_process').execFileSync('git', args, { cwd: app, stdio: 'ignore' });
+  const commit = (msg) => {
+    git(['add', '.']);
+    git(['-c', 'user.name=t', '-c', 'user.email=t@localhost', 'commit', '-q', '-m', msg]);
+  };
+  const pkg = (v) =>
+    fs.writeFileSync(
+      path.join(app, 'package.json'),
+      `{\n  "name": "app",\n  "version": "${v}"\n}\n`,
+    );
+  git(['init', '-q', '-b', 'main']);
+  fs.mkdirSync(path.join(app, 'src'));
+  fs.mkdirSync(path.join(app, 'tests'));
+  fs.writeFileSync(path.join(app, 'src', 'a.js'), '1');
+  pkg('1.0.0');
+  commit('root');
+  assert.deepEqual(policy.untaggedReleaseState(app, '9.9.9'), { commit: null, sourceAfter: [] });
+
+  pkg('1.1.0');
+  commit('release 1.1.0');
+  const rel = require('child_process')
+    .execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: app, encoding: 'utf8' })
+    .trim();
+  // A test-only commit after the release: in progress, not abandoned.
+  fs.writeFileSync(path.join(app, 'tests', 'flow.spec.js'), '1');
+  commit('test: flow');
+  assert.deepEqual(policy.untaggedReleaseState(app, '1.1.0'), { commit: rel, sourceAfter: [] });
+
+  // Source after the release, committed or not, is reported.
+  fs.writeFileSync(path.join(app, 'src', 'a.js'), '2');
+  commit('fix');
+  fs.writeFileSync(path.join(app, 'src', 'b.js'), '1');
+  const s = policy.untaggedReleaseState(app, '1.1.0');
+  assert.equal(s.commit, rel);
+  assert.deepEqual(s.sourceAfter.sort(), ['src/a.js', 'src/b.js']);
+  fs.rmSync(app, { recursive: true, force: true });
+});
+
 test('helpPagesStatus: pages are read from the app side by slug or source, pending by minor or newer source', () => {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-help-'));
   const app = path.join(parent, 'app-one');
@@ -1380,17 +1421,40 @@ test('siteTrackedImages: a store image under an app folder is tracked without a 
 
 test('playwrightRemoteTarget: a deployed default base URL without webServer is a gap', () => {
   const p = policy.playwrightRemoteTarget;
-  assert.equal(p("use: { baseURL: process.env.PLAYWRIGHT_BASE_URL || 'https://example.com', }"), 'https://example.com');
+  assert.equal(
+    p("use: { baseURL: process.env.PLAYWRIGHT_BASE_URL || 'https://example.com', }"),
+    'https://example.com',
+  );
   assert.equal(p("use: { baseURL: 'https://example.com/app' }"), 'https://example.com/app');
-  assert.equal(p("use: { baseURL: process.env.BASE || 'http://localhost:8080' }"), null, 'local fallback');
+  assert.equal(
+    p("use: { baseURL: process.env.BASE || 'http://localhost:8080' }"),
+    null,
+    'local fallback',
+  );
   assert.equal(p("use: { baseURL: 'http://127.0.0.1:3000' }"), null);
-  assert.equal(p("webServer: { command: 'npm run preview', url: 'http://localhost:8080' },\nuse: { baseURL: process.env.X || 'https://example.com' }"), null, 'webServer serves the tree');
-  assert.equal(p("use: { baseURL: process.env.PLAYWRIGHT_BASE_URL }"), null, 'env only');
-  assert.equal(p("export default defineConfig({ testDir: './tests' })"), null, 'Electron flows: no base URL');
+  assert.equal(
+    p(
+      "webServer: { command: 'npm run preview', url: 'http://localhost:8080' },\nuse: { baseURL: process.env.X || 'https://example.com' }",
+    ),
+    null,
+    'webServer serves the tree',
+  );
+  assert.equal(p('use: { baseURL: process.env.PLAYWRIGHT_BASE_URL }'), null, 'env only');
+  assert.equal(
+    p("export default defineConfig({ testDir: './tests' })"),
+    null,
+    'Electron flows: no base URL',
+  );
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-pw-'));
   assert.equal(policy.playwrightTargetGap(dir), null);
-  fs.writeFileSync(path.join(dir, 'playwright.config.ts'), "export default { use: { baseURL: 'https://example.com' } }");
-  assert.deepEqual(policy.playwrightTargetGap(dir), { file: 'playwright.config.ts', url: 'https://example.com' });
+  fs.writeFileSync(
+    path.join(dir, 'playwright.config.ts'),
+    "export default { use: { baseURL: 'https://example.com' } }",
+  );
+  assert.deepEqual(policy.playwrightTargetGap(dir), {
+    file: 'playwright.config.ts',
+    url: 'https://example.com',
+  });
 });
 
 test('securitySensitiveFiles: a screenshot named like a session handler is not security-sensitive', () => {
@@ -1412,7 +1476,8 @@ test('helpSlugFolder: a help-site slug resolves to the one repo folder its pages
     fs.mkdirSync(path.join(parent, f));
     fs.writeFileSync(path.join(parent, f, 'package.json'), '{}');
   }
-  const page = (name, fm) => fs.writeFileSync(path.join(docs, name), `---\n${fm}\n---\n# ${name}\n`);
+  const page = (name, fm) =>
+    fs.writeFileSync(path.join(docs, name), `---\n${fm}\n---\n# ${name}\n`);
   page('a.mdx', 'app: product-name\nsources:\n  - repo-folder/src/App.tsx');
   page('b.mdx', 'app: product-name\nsources: []');
   page('c.mdx', 'app: split\nsources:\n  - repo-folder/src/A.tsx\n  - other-repo/src/B.tsx');
@@ -1438,18 +1503,27 @@ test('packagedImportGaps: a module the packaged main reaches but build.files omi
     fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
     fs.writeFileSync(path.join(dir, f), s);
   };
-  w('electron/main.js', "const { start } = await import('../server.js');\nconst p = require('./preload');");
+  w(
+    'electron/main.js',
+    "const { start } = await import('../server.js');\nconst p = require('./preload');",
+  );
   w('electron/preload.js', '');
-  w('server.js', "import { log } from './logger.js';\nimport { gate } from './access.js';\n// import './commented.js'");
+  w(
+    'server.js',
+    "import { log } from './logger.js';\nimport { gate } from './access.js';\n// import './commented.js'",
+  );
   w('logger.js', '');
   w('access.js', "export * from './shared/util.js';");
   w('shared/util.js', '');
   const pkg = (files) => ({ main: 'electron/main.js', build: { files } });
-  assert.deepEqual(policy.packagedImportGaps(dir, pkg(['electron/**/*', 'server.js', 'logger.js'])), [
-    'access.js',
-    'shared/util.js',
-  ]);
-  assert.deepEqual(policy.packagedImportGaps(dir, pkg(['electron/**/*', '*.js', 'shared/**/*'])), []);
+  assert.deepEqual(
+    policy.packagedImportGaps(dir, pkg(['electron/**/*', 'server.js', 'logger.js'])),
+    ['access.js', 'shared/util.js'],
+  );
+  assert.deepEqual(
+    policy.packagedImportGaps(dir, pkg(['electron/**/*', '*.js', 'shared/**/*'])),
+    [],
+  );
   // A later exclusion wins, as in electron-builder.
   assert.deepEqual(policy.packagedImportGaps(dir, pkg(['**/*', '!shared/**'])), ['shared/util.js']);
   // No files key: electron-builder packs everything.
@@ -1468,6 +1542,9 @@ test('packagedImportGaps: server loaded through path.join, directly or via a roo
   );
   w('server/index.js', '');
   w('server/other.js', '');
-  const gaps = policy.packagedImportGaps(dir, { main: 'electron/main.js', build: { files: ['electron/**/*'] } });
+  const gaps = policy.packagedImportGaps(dir, {
+    main: 'electron/main.js',
+    build: { files: ['electron/**/*'] },
+  });
   assert.deepEqual(gaps, ['server/index.js', 'server/other.js']);
 });

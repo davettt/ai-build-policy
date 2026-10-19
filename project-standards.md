@@ -1,6 +1,6 @@
 # Project Standards
 
-**Version:** 2.85
+**Version:** 2.86
 **Last updated:** 2026-10-19
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
