@@ -721,7 +721,7 @@ test('every message that hands the developer the approve command names --confirm
   assert.match(src, /approve-exception <GHSA-id> --confirm/);
 });
 
-test('untaggedReleaseState: names the commit that set the version and the source changed since', () => {
+test('untaggedReleaseState and shippedFilesSince: what changed since the release commit or tag', () => {
   const app = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-release-'));
   const git = (args) =>
     require('child_process').execFileSync('git', args, { cwd: app, stdio: 'ignore' });
@@ -759,6 +759,34 @@ test('untaggedReleaseState: names the commit that set the version and the source
   const s = policy.untaggedReleaseState(app, '1.1.0');
   assert.equal(s.commit, rel);
   assert.deepEqual(s.sourceAfter.sort(), ['src/a.js', 'src/b.js']);
+
+  // After the tag (R-20): tests and docs are not shipped, everything else is,
+  // and a diff that cannot be read counts as a change, never as none.
+  git(['tag', 'v1.1.0', rel]);
+  fs.rmSync(path.join(app, 'src', 'b.js'));
+  git(['reset', '-q', '--hard', rel]);
+  fs.mkdirSync(path.join(app, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(app, 'tests', 'flow.spec.js'), '2');
+  commit('test: flow');
+  fs.writeFileSync(path.join(app, 'NOTES.md'), 'x');
+  assert.deepEqual(policy.shippedFilesSince(app, 'v1.1.0'), []);
+  // Anything else ships, including files a "source" pattern would miss.
+  fs.writeFileSync(path.join(app, 'main.mjs'), '1');
+  fs.writeFileSync(path.join(app, 'electron-builder.json'), '{}');
+  fs.mkdirSync(path.join(app, 'src', 'prompts'));
+  fs.writeFileSync(path.join(app, 'src', 'prompts', 'system.md'), 'x');
+  assert.deepEqual(policy.shippedFilesSince(app, 'v1.1.0').sort(), [
+    'electron-builder.json',
+    'main.mjs',
+    'src/prompts/system.md',
+  ]);
+  // A shipped file moved into tests/ still reports the path it left.
+  for (const f of ['main.mjs', 'electron-builder.json']) fs.rmSync(path.join(app, f));
+  fs.rmSync(path.join(app, 'src', 'prompts'), { recursive: true });
+  git(['mv', 'src/a.js', 'tests/a.js']);
+  commit('move');
+  assert.deepEqual(policy.shippedFilesSince(app, 'v1.1.0'), ['src/a.js']);
+  assert.equal(policy.shippedFilesSince(app, 'v9.9.9').length, 1);
   fs.rmSync(app, { recursive: true, force: true });
 });
 
@@ -1457,14 +1485,19 @@ test('playwrightRemoteTarget: a deployed default base URL without webServer is a
   });
 });
 
-test('securitySensitiveFiles: a screenshot named like a session handler is not security-sensitive', () => {
+test('securitySensitiveFiles: a screenshot or help page named like a handler is not security-sensitive', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-sec-'));
   const files = [
     'src/assets/product/sessions-and-journeys-1.png',
     'public/img/token-flow.webp',
+    'src/content/docs/product/payments-and-overdue.mdx',
     'src/auth/session.ts',
+    'src/billing/payments.ts',
   ];
-  assert.deepEqual(policy.securitySensitiveFiles(dir, files), ['src/auth/session.ts']);
+  assert.deepEqual(policy.securitySensitiveFiles(dir, files), [
+    'src/auth/session.ts',
+    'src/billing/payments.ts',
+  ]);
 });
 
 test('helpSlugFolder: a help-site slug resolves to the one repo folder its pages cite', () => {

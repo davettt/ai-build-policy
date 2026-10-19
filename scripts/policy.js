@@ -544,8 +544,10 @@ const SECURITY_CONTENT_PATTERNS = [
 ];
 // Images, fonts and media under src/ or public/ count as source for the gates,
 // but carry no code: a screenshot named sessions-and-journeys.png is not a
-// session handler (R-3, 2026-10-17).
-const MEDIA_ASSET = /\.(png|jpe?g|webp|gif|avif|svg|ico|woff2?|ttf|otf|mp4|webm|mov)$/i;
+// session handler (R-3, 2026-10-17). Content pages are the same: a help page
+// named payments-and-overdue.mdx is prose, not payment code (R-17).
+const MEDIA_ASSET =
+  /\.(png|jpe?g|webp|gif|avif|svg|ico|woff2?|ttf|otf|mp4|webm|mov|mdx|markdown|txt)$/i;
 function securitySensitiveFiles(dir, files) {
   // In the policy repo the enforcement code is the sensitive surface.
   if (path.resolve(dir) === POLICY_ROOT)
@@ -598,8 +600,9 @@ function shippedDmgVersions(dir, proj) {
 
 /**
  * For a version with a DMG but no tag: the commit that set the version in
- * package.json (the release commit, short hash) and the source files changed
- * since it, committed or not. { commit: null } when no commit set it.
+ * package.json (the release commit, short hash) and the files other than tests
+ * and docs changed since it, committed or not. { commit: null } when no commit
+ * set it.
  */
 function untaggedReleaseState(dir, version) {
   const found = shArgs(
@@ -609,12 +612,29 @@ function untaggedReleaseState(dir, version) {
   );
   const commit = found.ok && /^[0-9a-f]{4,40}$/.test(found.out) ? found.out : null;
   if (!commit) return { commit: null, sourceAfter: [] };
-  const diff = shArgs('git', ['diff', '--name-only', commit, '--'], dir);
-  const after = new Set([
-    ...(diff.ok ? diff.out.split('\n').filter(Boolean) : []),
-    ...changedFiles(dir),
-  ]);
-  return { commit, sourceAfter: [...after].filter(isSourceFile) };
+  const diff = shArgs('git', ['diff', '--name-only', '--no-renames', commit, '--'], dir);
+  if (!diff.ok) return { commit, sourceAfter: [`(git diff ${commit} failed)`] };
+  const after = new Set([...diff.out.split('\n').filter(Boolean), ...changedFiles(dir)]);
+  return { commit, sourceAfter: [...after].filter((f) => !NOT_SHIPPED.test(f)) };
+}
+
+// Files that never reach the packaged app. Deliberately an allowlist: a
+// blocklist of "source" missed .mjs/.cjs, build config, plists and scripts,
+// any of which changes what a rebuilt DMG holds. Markdown counts only at the
+// root or under docs/: an app can bundle src/prompts/*.md.
+const NOT_SHIPPED = /^(tests?|e2e|docs)\/|^[^/]+\.md$/i;
+
+/** Files changed since `ref`, committed or not, other than tests and docs. */
+function shippedFilesSince(dir, ref) {
+  const diff = shArgs(
+    'git',
+    ['diff', '--name-only', '--no-renames', safeToken(ref, 'git ref'), '--'],
+    dir,
+  );
+  // An unreadable diff is not an empty one: report it as a change.
+  if (!diff.ok) return [`(git diff ${ref} failed)`];
+  const files = new Set([...diff.out.split('\n').filter(Boolean), ...changedFiles(dir)]);
+  return [...files].filter((f) => !NOT_SHIPPED.test(f));
 }
 
 /** The DMG built for a given version, or null. Only `release/` itself is
@@ -6310,9 +6330,31 @@ function verifyRelease(dir, proj, flags) {
   // checked, not just that a review happened. A missing marker is a FAIL too:
   // it used to be skipped in silence, which is how an unreviewed tree could
   // reach the DMG build with this section printing nothing.
+  // A release already tagged and signed off, with only tests or docs
+  // committed after the tag, ships what the tag holds: the gates rightly
+  // skipped the review on that diff, and the version needs no bump. Judging
+  // HEAD as a new release refused both (R-20). The sign-off is required
+  // because it was itself refused without the CodeRabbit review, so the
+  // review this skips was recorded once, on the tagged release.
+  const tag = sh('git describe --tags --abbrev=0', dir);
+  const shipped = tag.ok && proj.pkg && tag.out.replace(/^v/, '') === proj.pkg.version;
+  const ahead = shipped
+    ? sh(`git rev-list ${safeToken(tag.out, 'git tag')}..HEAD --count`, dir)
+    : { ok: false, out: '' };
+  const afterTag = shipped ? shippedFilesSince(dir, tag.out) : [];
+  const relState = loadState(dir);
+  const signedOff = Boolean(
+    relState.releaseAck && proj.pkg && relState.releaseAck.version === proj.pkg.version,
+  );
+  const tagShips =
+    shipped && ahead.ok && Number(ahead.out.trim()) > 0 && signedOff && afterTag.length === 0;
   const relMarker = readJSON(path.join(dir, '.policy', 'gates.json'));
   const relReviewer = reviewerOf(relMarker);
-  if (!relMarker || !Array.isArray(relMarker.gates))
+  if (tagShips)
+    ok(
+      `Release ${tag.out} tagged and signed off; the commits after it change only tests or docs, so the release reviewed at the tag is what ships`,
+    );
+  else if (!relMarker || !Array.isArray(relMarker.gates))
     fail(
       `No gates marker (.policy/gates.json) — nothing records a review of the tree being released. Run: policy gates --reviewer coderabbit`,
     );
@@ -6331,16 +6373,22 @@ function verifyRelease(dir, proj, flags) {
   // Version bumped vs last tag. Tag-at-release flow: pkg == tag is CORRECT
   // when the tag sits at HEAD (this release, already tagged); it is a missed
   // bump only when commits landed after the tag.
-  const tag = sh('git describe --tags --abbrev=0', dir);
   if (tag.ok && proj.pkg) {
     const last = tag.out.replace(/^v/, '');
     if (last === proj.pkg.version) {
-      const ahead = sh(`git rev-list ${safeToken(tag.out, 'git tag')}..HEAD --count`, dir);
       if (ahead.ok && ahead.out.trim() === '0')
         ok(`Release ${proj.pkg.version} tagged at HEAD (${tag.out})`);
+      else if (tagShips)
+        ok(
+          `Release ${proj.pkg.version} tagged at ${tag.out}; the ${ahead.out.trim()} commit(s) after it change only tests or docs`,
+        );
       else
         fail(
-          `Commits exist after tag ${tag.out} but package.json is still ${proj.pkg.version} — bump it`,
+          `Commits exist after tag ${tag.out} but package.json is still ${proj.pkg.version} — bump it` +
+            (afterTag.length
+              ? ` (changed since the tag: ${afterTag.slice(0, 3).join(', ')})`
+              : '') +
+            (signedOff ? '' : ' (and the tagged release was never signed off)'),
         );
     } else ok(`Version bumped: ${last} -> ${proj.pkg.version}`);
   } else
@@ -9679,6 +9727,7 @@ module.exports = {
   isArchived,
   helpPageFrontMatter,
   helpPagesStatus,
+  shippedFilesSince,
   untaggedReleaseState,
   complianceSummary,
   helpSlugFolder,
