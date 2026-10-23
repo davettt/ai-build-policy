@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.87
-**Last updated:** 2026-10-19
+**Version:** 2.89
+**Last updated:** 2026-10-23
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -348,6 +348,8 @@ Do it in the renderer, where every app already does the check: the result lands 
 - System locale changes (rare, but `languagechange` event exists)
 - Calendar date: "today", and every countdown and overdue state derived from it. An app left open overnight shows yesterday's counts. Recheck on focus and `visibilitychange`, plus a once-a-minute interval that updates state only when the date has changed.
 - Data another process writes. When an assistant (MCP) adds items through the server, the window still shows what it loaded at launch, so a new item appears only after a reload. Re-fetch on window focus, plus a light interval while that access is on, or have the server push a change event (SSE) that the renderer re-fetches on.
+
+**Assistant access (MCP):** the rules for writing the MCP server's tools (descriptions that name sibling tools, generated server instructions, a help tool, prompts) live in the MCP project's own `CLAUDE.md`, not here. With registry `assistantProject` set, a connected app's full gates run its end-to-end suite from that project, and its release checklist asks for a check of its tool file.
 
 **Day counts and date keys are local.** Days between two local midnights use `Math.round(diff / 86400000)`, never `Math.ceil`. The day a DST change happens is 23 or 25 hours long, so `ceil` over a 25-hour day adds one. `check` FAILs `Math.ceil` over a day in milliseconds. A line where `ceil` is intended (time left until an instant, not a date) opts out with `// policy:ceil-intended`. A date key, filename or "today" comparison uses the local date (`getFullYear()`, `getMonth() + 1`, `getDate()`), never `toISOString().slice(0, 10)`, which is the UTC date.
 

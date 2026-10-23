@@ -4815,6 +4815,12 @@ const GATE_ORDER = [
   // pre-commit subset. The script rebuilds before running, which repeats the
   // Build gate's work; accepted, it costs seconds.
   { name: 'Flow tests', script: 'test:flows' },
+  // A connected app runs the MCP server's end-to-end suite for itself, from
+  // the MCP project beside it (assistantSuiteFor), so an API change that breaks
+  // the assistant fails here, in the session that made it, instead of in the
+  // MCP project's next run. Not an npm script: the suite lives in the other
+  // repo. Full gates only, like the flow tests.
+  { name: 'Assistant end-to-end', script: 'assistant:e2e' },
   // Two reviewers behind one gate (2.71): Claude Code headless on the
   // registry's smart-tier model for ordinary diffs, CodeRabbit when the diff
   // is security-sensitive, touches server or main-process code or a
@@ -4824,6 +4830,125 @@ const GATE_ORDER = [
   { name: 'Code review', script: 'review', whenSourceChanges: true },
 ];
 const REVIEW_RECORD = path.join('.policy', 'review.json');
+const ASSISTANT_GATE = 'assistant:e2e';
+
+// ------------------------------------------------------- assistant access
+
+/**
+ * The MCP server project beside this one, named by registry.json
+ * `assistantProject` (so the mirrored script names no folder). Null when the
+ * registry names none or the folder is not beside the project.
+ */
+function assistantDir(dir, assistantProject = loadRegistry().assistantProject) {
+  if (!assistantProject) return null;
+  const candidate = path.join(path.dirname(path.resolve(dir)), assistantProject);
+  return exists(path.join(candidate, 'package.json')) ? candidate : null;
+}
+
+function isAssistantProject(dir, assistantProject = loadRegistry().assistantProject) {
+  return !!assistantProject && path.basename(path.resolve(dir)) === assistantProject;
+}
+
+/**
+ * The MCP server's end-to-end suite for this app, when the app is connected.
+ * Each suite names the checkout it drives as
+ * `path.join(here, '..', '..', '<folder>')`, so the suites are the record of
+ * which folders are connected and no second list can drift from them. The
+ * app's tool file shares the suite's name (tests/x.test.js, src/apps/x.js).
+ * Returns { mcpDir, test, tools } (paths relative to mcpDir) or null.
+ */
+function assistantSuiteFor(dir, assistantProject = loadRegistry().assistantProject) {
+  const mcpDir = assistantDir(dir, assistantProject);
+  if (!mcpDir || path.resolve(mcpDir) === path.resolve(dir)) return null;
+  const folder = path.basename(path.resolve(dir));
+  let files = [];
+  try {
+    files = fs
+      .readdirSync(path.join(mcpDir, 'tests'))
+      .filter((f) => f.endsWith('.test.js'))
+      .sort();
+  } catch {
+    return null;
+  }
+  const re = /path\.join\(\s*here\s*,\s*'\.\.'\s*,\s*'\.\.'\s*,\s*'([^']+)'\s*\)/g;
+  for (const f of files) {
+    for (const m of readFile(path.join(mcpDir, 'tests', f)).matchAll(re)) {
+      if (m[1] === folder)
+        return {
+          mcpDir,
+          test: `tests/${f}`,
+          tools: `src/apps/${f.replace(/\.test\.js$/, '.js')}`,
+        };
+    }
+  }
+  return null;
+}
+
+/**
+ * Suites and tests the node test runner skipped, as "name: reason". A
+ * describe() skipped with a reason prints one line and counts as zero
+ * skipped tests in the summary, so the summary alone reads as a clean pass.
+ * Reads both the spec reporter (﹣ name (0.2ms) # reason) and TAP.
+ */
+function skippedSuites(out) {
+  const found = [];
+  for (const line of String(out || '').split('\n')) {
+    const m =
+      line.match(/^\s*﹣\s+(.+?)\s+\([\d.]+m?s\)\s*#\s*(.*)$/) ||
+      line.match(/^\s*ok \d+ - (.+?)\s+# SKIP\b\s*(.*)$/);
+    if (m) found.push(`${m[1]}: ${m[2].trim() || 'skipped'}`);
+  }
+  return found;
+}
+
+/** Run the MCP project's suite for one app; a skipped suite is a failure. */
+function runAssistantSuite(suite) {
+  const name = path.basename(suite.mcpDir);
+  if (!exists(path.join(suite.mcpDir, 'node_modules')))
+    return {
+      ok: false,
+      out: `../${name} has no node_modules. Run npm ci there, then re-run: policy gates`,
+    };
+  const r = shArgs(process.execPath, ['--test', suite.test], suite.mcpDir);
+  if (!r.ok) return r;
+  const empty = zeroInputReason('test:integration', r.out);
+  if (empty) return { ok: false, out: `${r.out}\n\n../${name}/${suite.test}: ${empty}` };
+  const skipped = skippedSuites(r.out);
+  if (skipped.length)
+    return {
+      ok: false,
+      out: `${r.out}\n\n../${name}/${suite.test} skipped instead of running:\n  ${skipped.join('\n  ')}`,
+    };
+  return r;
+}
+
+/**
+ * In the MCP project: every app tool file (src/apps/x.js) needs a suite
+ * (tests/x.test.js) that assistantSuiteFor can read, naming a folder that
+ * exists beside the project. Without this a suite reworded past the
+ * path.join pattern would drop its app's gate silently.
+ */
+function assistantCoverageGaps(mcpDir) {
+  const gaps = [];
+  let apps = [];
+  try {
+    apps = fs.readdirSync(path.join(mcpDir, 'src', 'apps')).filter((f) => f.endsWith('.js'));
+  } catch {
+    return gaps;
+  }
+  const re = /path\.join\(\s*here\s*,\s*'\.\.'\s*,\s*'\.\.'\s*,\s*'([^']+)'\s*\)/;
+  for (const f of apps.sort()) {
+    const test = `tests/${f.replace(/\.js$/, '.test.js')}`;
+    const m = exists(path.join(mcpDir, test)) && readFile(path.join(mcpDir, test)).match(re);
+    if (!m)
+      gaps.push(
+        `src/apps/${f}: no ${test} naming its app as path.join(here, '..', '..', '<folder>'), so the app's gates cannot find its suite`,
+      );
+    else if (!exists(path.join(path.dirname(path.resolve(mcpDir)), m[1], 'package.json')))
+      gaps.push(`${test} drives ../${m[1]}, which is not checked out beside this project`);
+  }
+  return gaps;
+}
 
 // ------------------------------------------------------- reviewer selection
 
@@ -5316,8 +5441,9 @@ function cmdGates(dir, flags) {
   const forcedReviewer = flagValue(flags, '--reviewer');
   const withReview = flags.includes('--with-review') || forcedReviewer !== null;
   const scripts = proj.pkg.scripts || {};
-  const gates = GATE_ORDER.filter((g) => (fast ? g.fast : !g.fastOnly)).filter(
-    (g) => scripts[g.script],
+  const assistantSuite = fast ? null : assistantSuiteFor(dir);
+  const gates = GATE_ORDER.filter((g) => (fast ? g.fast : !g.fastOnly)).filter((g) =>
+    g.script === ASSISTANT_GATE ? assistantSuite !== null : scripts[g.script],
   );
   // The filter above skips a gate whose script the project lacks, which is
   // right for optional tooling and wrong for the one scan the hook exists to
@@ -5574,12 +5700,19 @@ function cmdGates(dir, flags) {
   // projects ran no test tier at all and `All N gates passed` never said N
   // was short (found 2026-10-15 in the audit that followed the tsc defect).
   const absent = GATE_ORDER.filter((g) => (fast ? g.fast : !g.fastOnly)).filter(
-    (g) => !scripts[g.script] && g.script !== 'secrets:staged',
+    (g) => !scripts[g.script] && g.script !== 'secrets:staged' && g.script !== ASSISTANT_GATE,
   );
   for (const g of absent)
     console.log(
       `  ${DIM}skipped${RESET} ${g.name} ${DIM}(no "${g.script}" script in package.json)${RESET}`,
     );
+  if (!fast && !assistantSuite) {
+    const mcp = assistantDir(dir);
+    if (mcp && path.resolve(mcp) !== path.resolve(dir))
+      console.log(
+        `  ${DIM}skipped${RESET} Assistant end-to-end ${DIM}(no suite in ../${path.basename(mcp)}/tests drives this folder)${RESET}`,
+      );
+  }
   for (const g of gates) {
     if (g.whenDepsChange && !depsChanged) {
       console.log(
@@ -5607,7 +5740,11 @@ function cmdGates(dir, flags) {
         );
     }
     const t0 = Date.now();
-    process.stdout.write(`  ${DIM}running${RESET} ${g.name} (npm run ${g.script}) ... `);
+    process.stdout.write(
+      g.script === ASSISTANT_GATE
+        ? `  ${DIM}running${RESET} ${g.name} (node --test ../${path.basename(assistantSuite.mcpDir)}/${assistantSuite.test}) ... `
+        : `  ${DIM}running${RESET} ${g.name} (npm run ${g.script}) ... `,
+    );
     // Committed work is reviewed against the commit the last pass saw.
     const extra =
       g.script === 'review' && reviewBase
@@ -5635,7 +5772,27 @@ function cmdGates(dir, flags) {
     else if (g.script === 'security' && exists(path.join(dir, AUDIT_EXCEPTIONS)))
       r = auditWithExceptions(dir);
     else if (g.script === 'sast') r = runSast(dir);
+    else if (g.script === ASSISTANT_GATE) r = runAssistantSuite(assistantSuite);
     else r = sh(`npm run ${safeToken(g.script, 'script name')}`, dir);
+    // The MCP project's suites skip an app whose checkout is missing, and a
+    // skipped describe() counts as zero skipped tests, so its gates passed
+    // with apps untested. There a skip is a failure.
+    if (r.ok && g.script === 'test:integration' && isAssistantProject(dir)) {
+      const skipped = skippedSuites(r.out);
+      const gaps = assistantCoverageGaps(dir);
+      if (skipped.length)
+        r = {
+          ok: false,
+          out:
+            `${r.out}\n\nApp suites skipped instead of running (check out or update the app beside this project):\n  ` +
+            skipped.join('\n  '),
+        };
+      else if (gaps.length)
+        r = {
+          ok: false,
+          out: `${r.out}\n\nApp suites the apps' gates cannot find:\n  ${gaps.join('\n  ')}`,
+        };
+    }
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
     // A gate that ran but examined nothing is not a pass. CodeRabbit exits 0
     // with `"status":"review_skipped","message":"No changes detected"` whenever
@@ -6539,6 +6696,19 @@ function verifyRelease(dir, proj, flags) {
       : `Help pages current for ${proj.pkg.version} (${help.pages.length} page(s), verified against ${help.verified.join(', ')})`;
     const marketing = checklist.findIndex((c) => /marketing/i.test(c));
     checklist.splice(marketing === -1 ? checklist.length : marketing, 0, step);
+  }
+  // Connected apps: the MCP project's tools are written against this app's
+  // API, and nothing in the app's session otherwise points at them. The gate
+  // catches a break; this step catches a new feature the tools do not offer.
+  const assistant = assistantSuiteFor(dir);
+  if (assistant) {
+    const mcp = path.basename(assistant.mcpDir);
+    const marketing = checklist.findIndex((c) => /marketing/i.test(c));
+    checklist.splice(
+      marketing === -1 ? checklist.length : marketing,
+      0,
+      `API or features changed: checked ../${mcp}/${assistant.tools}, its version checks, its instructions line and its bundled help text (none needed if neither changed)`,
+    );
   }
   // Only the DMG-producing profiles have an artifact to stage the checklist on.
   const buildsArtifact = profile === 'gumroad' || profile === 'none';
@@ -9737,6 +9907,10 @@ module.exports = {
   builderGlobRe,
   helpHandoffMessage,
   helpHandbackMessage,
+  assistantSuiteFor,
+  assistantCoverageGaps,
+  isAssistantProject,
+  skippedSuites,
   HELP_CAPTURE_INVOCATION,
   auditProjectId,
   auditEntryHash,

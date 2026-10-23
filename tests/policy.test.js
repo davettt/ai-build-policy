@@ -1581,3 +1581,69 @@ test('packagedImportGaps: server loaded through path.join, directly or via a roo
   });
   assert.deepEqual(gaps, ['server/index.js', 'server/other.js']);
 });
+
+test('assistantSuiteFor: an app is connected when a suite in the MCP project drives its folder', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-assistant-'));
+  const mcp = path.join(parent, 'mcp');
+  const app = path.join(parent, 'app-one');
+  const other = path.join(parent, 'app-two');
+  for (const d of [mcp, app, other]) {
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'package.json'), '{}');
+  }
+  fs.mkdirSync(path.join(mcp, 'tests'));
+  fs.writeFileSync(
+    path.join(mcp, 'tests', 'product-one.test.js'),
+    "const APP = path.join(here, '..', '..', 'app-one');\n",
+  );
+  fs.writeFileSync(path.join(mcp, 'tests', 'dates.test.js'), "const x = path.join(here, 'a');\n");
+
+  const s = policy.assistantSuiteFor(app, 'mcp');
+  assert.deepEqual(s, {
+    mcpDir: mcp,
+    test: 'tests/product-one.test.js',
+    tools: 'src/apps/product-one.js',
+  });
+  assert.equal(policy.assistantSuiteFor(other, 'mcp'), null);
+  assert.equal(policy.assistantSuiteFor(mcp, 'mcp'), null);
+  assert.equal(policy.assistantSuiteFor(app, 'missing'), null);
+  assert.equal(policy.assistantSuiteFor(app, undefined), policy.assistantSuiteFor(app));
+  assert.equal(policy.isAssistantProject(mcp, 'mcp'), true);
+  assert.equal(policy.isAssistantProject(app, 'mcp'), false);
+  assert.equal(policy.isAssistantProject(mcp, null), false);
+
+  fs.mkdirSync(path.join(mcp, 'src', 'apps'), { recursive: true });
+  for (const f of ['product-one.js', 'product-two.js', 'product-three.js'])
+    fs.writeFileSync(path.join(mcp, 'src', 'apps', f), '');
+  fs.writeFileSync(
+    path.join(mcp, 'tests', 'product-two.test.js'),
+    'const APP = path.join(here, "..", "..", "app-two");\n',
+  );
+  fs.writeFileSync(
+    path.join(mcp, 'tests', 'product-three.test.js'),
+    "const APP = path.join(here, '..', '..', 'gone');\n",
+  );
+  const gaps = policy.assistantCoverageGaps(mcp);
+  assert.equal(gaps.length, 2, gaps.join('\n'));
+  assert.match(gaps.join('\n'), /src\/apps\/product-two\.js: no tests\/product-two\.test\.js/);
+  assert.match(gaps.join('\n'), /drives \.\.\/gone, which is not checked out/);
+  fs.rmSync(parent, { recursive: true, force: true });
+});
+
+test('skippedSuites: a skipped describe is found though the summary counts 0 skipped', () => {
+  const spec = [
+    '﹣ Product One through the MCP server (0.28ms) # app-one checkout not found',
+    '▶ Dates',
+    '  ✔ parses (0.2ms)',
+    'ℹ tests 1',
+    'ℹ skipped 0',
+  ].join('\n');
+  assert.deepEqual(policy.skippedSuites(spec), [
+    'Product One through the MCP server: app-one checkout not found',
+  ]);
+  assert.deepEqual(policy.skippedSuites('ok 3 - Product Two # SKIP checkout not found'), [
+    'Product Two: checkout not found',
+  ]);
+  assert.deepEqual(policy.skippedSuites('ℹ skipped 0\n✔ all good (1ms)'), []);
+  assert.deepEqual(policy.skippedSuites(''), []);
+});
