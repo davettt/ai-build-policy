@@ -1647,3 +1647,117 @@ test('skippedSuites: a skipped describe is found though the summary counts 0 ski
   assert.deepEqual(policy.skippedSuites('ℹ skipped 0\n✔ all good (1ms)'), []);
   assert.deepEqual(policy.skippedSuites(''), []);
 });
+
+test('versionInRange: reads npm audit ranges, null for what it cannot read', () => {
+  assert.equal(policy.versionInRange('1.20.8', '<1.20.9'), true);
+  assert.equal(policy.versionInRange('1.20.9', '<1.20.9'), false);
+  assert.equal(policy.versionInRange('2.1.0', '>=2.0.0 <2.2.1'), true);
+  assert.equal(policy.versionInRange('2.2.1', '>=2.0.0 <2.2.1'), false);
+  assert.equal(policy.versionInRange('1.4.0', '1.0.0 - 1.4.0'), true);
+  assert.equal(policy.versionInRange('3.0.0', '<1.0.0 || >=3.0.0 <3.0.2'), true);
+  assert.equal(policy.versionInRange('1.0.0', '^1.0.0'), null);
+  assert.equal(policy.versionInRange('1.0.0-beta.1', '<2.0.0'), null);
+  assert.equal(policy.versionInRange('1.0.0', ''), null);
+});
+
+test('quarantineHold: a fix younger than min-release-age holds until it clears', () => {
+  const times = {
+    created: '2014-01-01T00:00:00.000Z',
+    '1.20.8': '2026-09-08T10:32:14.519Z',
+    '1.20.9': '2026-10-22T11:38:27.889Z',
+    '2.0.0-beta.1': '2026-10-23T00:00:00.000Z',
+  };
+  const during = Date.parse('2026-10-23T23:00:00Z');
+  const after = Date.parse('2026-10-24T12:00:00Z');
+  assert.deepEqual(policy.quarantineHold('1.20.8', '<1.20.9', times, 2, during), {
+    fix: '1.20.9',
+    clears: '2026-10-24 11:38 UTC',
+  });
+  assert.equal(policy.quarantineHold('1.20.8', '<1.20.9', times, 2, after), null);
+  assert.equal(policy.quarantineHold('1.20.8', '<1.20.9', times, 0, during), null);
+  // No fix published: nothing to wait for, the advisory stays open.
+  assert.equal(policy.quarantineHold('1.20.8', '<1.21.0', times, 2, during), null);
+  // Installed version not in the range, or a range it cannot read.
+  assert.equal(policy.quarantineHold('1.20.9', '<1.20.9', times, 2, during), null);
+  assert.equal(policy.quarantineHold('1.20.8', '~1.20.0', times, 2, during), null);
+  // A later release in the same major that has already cleared is installable
+  // now; one in a new major is not a drop-in fix, so the hold stands.
+  const laterTimes = { ...times, '1.21.0': '2026-10-01T00:00:00.000Z' };
+  assert.equal(policy.quarantineHold('1.20.8', '<1.20.9', laterTimes, 2, during), null);
+  const newMajor = { ...times, '2.2.1': '2026-10-01T00:00:00.000Z' };
+  assert.equal(policy.quarantineHold('1.20.8', '<1.20.9', newMajor, 2, during).fix, '1.20.9');
+});
+
+test('auditHeldOnly: only a bare npm audit script can be excused', () => {
+  const failed = { ok: false, out: 'boom' };
+  for (const script of [
+    'npm audit --audit-level=high --omit=dev && npm run secrets',
+    'npm audit; true',
+    'yarn audit',
+    '',
+  ])
+    assert.equal(policy.auditHeldOnly(ROOT, failed, script), failed, script);
+});
+
+test('highAdvisories: high and critical only, at the source package', () => {
+  const report = {
+    vulnerabilities: {
+      'body-parser': {
+        via: [
+          {
+            name: 'body-parser',
+            severity: 'high',
+            range: '<1.20.9',
+            url: 'https://github.com/advisories/GHSA-aaaa-bbbb-cccc',
+            title: 't',
+          },
+        ],
+      },
+      express: { via: ['body-parser'] },
+      debug: { via: [{ name: 'debug', severity: 'moderate', url: 'x/GHSA-dddd' }] },
+    },
+  };
+  assert.deepEqual(policy.highAdvisories(report), [
+    { id: 'GHSA-aaaa-bbbb-cccc', pkg: 'body-parser', title: 't', range: '<1.20.9' },
+  ]);
+  assert.deepEqual(policy.highAdvisories(null), []);
+  assert.equal(policy.highAdvisories(report, 'moderate').length, 2);
+  assert.equal(policy.highAdvisories(report, 'critical').length, 0);
+});
+
+test('electronNodeGap: bundled Node against Node security releases', () => {
+  const releases = [
+    { version: '47.0.0-nightly.20261023', node: '24.22.1' },
+    { version: '45.0.0', node: '24.22.0' },
+    { version: '42.8.1', node: '24.18.1' },
+    { version: '41.9.0', node: '24.17.0' },
+    { version: '41.3.0', node: '24.15.0' },
+    { version: '44.9.3', node: '24.22.0' },
+  ];
+  const index = [
+    { version: 'v24.22.1', security: true },
+    { version: 'v24.22.0', security: false },
+    { version: 'v24.18.1', security: true },
+    { version: 'v24.17.0', security: true },
+    { version: 'v25.1.0', security: true },
+  ];
+  // Nothing stable carries 24.22.1, and the nightly does not count.
+  assert.deepEqual(policy.electronNodeGap('44.9.3', releases, index), {
+    bundled: '24.22.0',
+    security: ['24.22.1'],
+    sameMajor: null,
+    newerMajor: null,
+  });
+  // An in-major upgrade reaches part of the way; a new major reaches further.
+  assert.deepEqual(policy.electronNodeGap('41.3.0', releases, index), {
+    bundled: '24.15.0',
+    security: ['24.17.0', '24.18.1', '24.22.1'],
+    sameMajor: { release: '41.9.0', node: '24.17.0' },
+    newerMajor: { release: '42.8.1', node: '24.18.1' },
+  });
+  assert.equal(
+    policy.electronNodeGap('45.0.0', releases, [{ version: 'v24.22.0', security: true }]),
+    null,
+  );
+  assert.equal(policy.electronNodeGap('99.0.0', releases, index), null);
+});

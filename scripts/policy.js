@@ -2087,6 +2087,164 @@ function cmpSemver(a, b) {
  * Audits the full tree but fails only on Electron, so dev-chain advisories stay
  * out of the gate as 2.4.1 intended.
  */
+/**
+ * The Node.js inside Electron against Node's own security releases (report
+ * R-23). Electron's advisories cover Electron and Chromium, not the Node it
+ * bundles, so a Node security release left every Electron app exposed while
+ * the audit said "no known advisories". Pure: takes Electron's releases.json
+ * and Node's dist/index.json. Returns null when the bundled Node has every
+ * security release of its line, otherwise
+ * { bundled, needed, security: [versions], sameMajor, newerMajor } where the
+ * last two are the lowest stable Electron releases that carry `needed`.
+ */
+function electronNodeGap(electronVersion, releases, nodeIndex) {
+  const rel = (releases || []).find((r) => r.version === electronVersion);
+  if (!rel || !/^\d+\.\d+\.\d+$/.test(rel.node || '')) return null;
+  const bundled = rel.node;
+  const major = bundled.split('.')[0];
+  const security = (nodeIndex || [])
+    .filter((n) => n && n.security === true)
+    .map((n) => String(n.version).replace(/^v/, ''))
+    .filter(
+      (v) => /^\d+\.\d+\.\d+$/.test(v) && v.split('.')[0] === major && cmpSemver(v, bundled) > 0,
+    )
+    .sort(cmpSemver);
+  if (security.length === 0) return null;
+  const eMajor = electronVersion.split('.')[0];
+  const newer = (releases || []).filter(
+    (r) =>
+      /^\d+\.\d+\.\d+$/.test(r.version) &&
+      cmpSemver(r.version, electronVersion) > 0 &&
+      /^\d+\.\d+\.\d+$/.test(r.node || '') &&
+      r.node.split('.')[0] === major,
+  );
+  // The furthest a set of releases gets: the newest security release one of
+  // them carries, and the lowest release that carries it.
+  const best = (list) => {
+    const top = list
+      .map((r) => r.node)
+      .sort(cmpSemver)
+      .pop();
+    const reach = top && security.filter((s) => cmpSemver(s, top) <= 0).pop();
+    if (!reach) return null;
+    const release = list
+      .filter((r) => cmpSemver(r.node, reach) >= 0)
+      .map((r) => r.version)
+      .sort(cmpSemver)[0];
+    return { release, node: reach };
+  };
+  const sameMajor = best(newer.filter((r) => r.version.split('.')[0] === eMajor));
+  const anyMajor = best(newer.filter((r) => r.version.split('.')[0] !== eMajor));
+  return {
+    bundled,
+    security,
+    sameMajor,
+    // Only worth naming when it reaches further than the same-major upgrade.
+    newerMajor:
+      anyMajor && (!sameMajor || cmpSemver(anyMajor.node, sameMajor.node) > 0) ? anyMajor : null,
+  };
+}
+
+// Release feeds, cached for six hours: gates run several times an hour and
+// releases.json is over a megabyte. The cache lives in a folder only this user can write (not the shared
+// temp folder, where another user could plant data that hides a gap), is
+// written to a fresh file and renamed into place, and is only used when it
+// has the expected shape.
+function fetchJSONCached(url, name, valid) {
+  const dirPath = path.join(os.homedir(), '.cache', 'build-policy');
+  const cache = path.join(dirPath, `${name}.json`);
+  try {
+    if (Date.now() - fs.lstatSync(cache).mtimeMs < 6 * 3600000) {
+      const data = JSON.parse(readFile(cache));
+      if (valid(data)) return data;
+    }
+  } catch {
+    /* no fresh cache */
+  }
+  const r = shArgs('curl', [
+    '-sfL',
+    '--proto',
+    '=https',
+    '--proto-redir',
+    '=https',
+    '--max-time',
+    '20',
+    '--',
+    url,
+  ]);
+  if (!r.ok) return null;
+  let data;
+  try {
+    data = JSON.parse(r.out);
+  } catch {
+    return null;
+  }
+  if (!valid(data)) return null;
+  try {
+    fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+    const tmp = `${cache}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, r.out, { flag: 'wx', mode: 0o600 });
+    fs.renameSync(tmp, cache);
+  } catch {
+    /* uncached is fine */
+  }
+  return data;
+}
+const validReleaseList = (data) =>
+  Array.isArray(data) &&
+  data.length > 100 &&
+  data.every((x) => x && typeof x === 'object' && typeof x.version === 'string');
+
+/**
+ * FAIL when an Electron release in the installed major carries the Node
+ * security fix (an in-major upgrade is routine); WARN when only a newer
+ * major does (a major upgrade needs its own decision record), or when none
+ * does yet, so the gap is visible without blocking work nothing can fix.
+ */
+function auditElectronBundledNode(dir) {
+  const pkg = readJSON(path.join(dir, 'node_modules', 'electron', 'package.json'));
+  if (!pkg || !pkg.version) return;
+  const releases = fetchJSONCached(
+    'https://releases.electronjs.org/releases.json',
+    'electron-releases',
+    validReleaseList,
+  );
+  const nodeIndex = fetchJSONCached(
+    'https://nodejs.org/dist/index.json',
+    'node-index',
+    validReleaseList,
+  );
+  if (!releases || !nodeIndex) {
+    warn(
+      'Could not fetch Electron or Node release data — the Node inside Electron was not checked',
+    );
+    return;
+  }
+  if (!releases.some((r) => r.version === pkg.version)) {
+    warn(`Electron ${pkg.version} is not in releases.json — the Node inside it was not checked`);
+    return;
+  }
+  const gap = electronNodeGap(pkg.version, releases, nodeIndex);
+  if (!gap) {
+    ok(`Node inside Electron ${pkg.version} has every Node security release of its line`);
+    return;
+  }
+  const what = `Electron ${pkg.version} bundles Node ${gap.bundled}, which lacks the Node security release${gap.security.length > 1 ? 's' : ''} ${gap.security.join(', ')}`;
+  const later = gap.newerMajor
+    ? ` Electron ${gap.newerMajor.release} (a new major) reaches Node ${gap.newerMajor.node}: plan it with policy upgrade electron.`
+    : '';
+  const rest = (reach) =>
+    cmpSemver(reach, gap.security[gap.security.length - 1]) < 0
+      ? ` No stable Electron carries ${gap.security[gap.security.length - 1]} yet; recheck before shipping.`
+      : '';
+  if (gap.sameMajor)
+    fail(
+      `${what}. Electron ${gap.sameMajor.release} carries Node ${gap.sameMajor.node}: upgrade electron within ${pkg.version.split('.')[0]}.x.${later}${rest((gap.newerMajor || gap.sameMajor).node)}`,
+    );
+  else if (gap.newerMajor) warn(`${what}.${later}${rest(gap.newerMajor.node)}`);
+  else warn(`${what}.${rest(gap.bundled)}`);
+}
+
 function auditShippedElectron(dir) {
   const raw = sh('npm audit --audit-level=high --json', dir);
   let report;
@@ -2096,6 +2254,7 @@ function auditShippedElectron(dir) {
     warn('Could not parse npm audit output — Electron not audited');
     return;
   }
+  auditElectronBundledNode(dir);
   const vuln = (report.vulnerabilities || {}).electron;
   if (!vuln) {
     ok('Electron has no known advisories (audited despite being a devDependency)');
@@ -3141,6 +3300,191 @@ function auditExceptionProblems(
 }
 
 /**
+ * Whether a version satisfies an npm audit range ("<1.20.9", ">=2.0.0 <2.2.1",
+ * "1.0.0 - 1.4.0", alternatives joined by ||). Null for anything it cannot
+ * read, so a caller treats an unknown range as unresolved, never as safe.
+ */
+function versionInRange(v, range) {
+  const valid = (x) => /^\d+\.\d+\.\d+$/.test(x);
+  if (!valid(v) || typeof range !== 'string' || !range.trim()) return null;
+  let any = false;
+  for (const set of range.split('||')) {
+    const hyphen = set.trim().match(/^(\S+)\s+-\s+(\S+)$/);
+    const comps = hyphen ? [`>=${hyphen[1]}`, `<=${hyphen[2]}`] : set.trim().split(/\s+/);
+    let all = true;
+    for (const c of comps) {
+      const m = c.match(/^(<=|>=|<|>|=)?v?(\d+\.\d+\.\d+)$/);
+      if (!m) return null;
+      const d = cmpSemver(v, m[2]);
+      const op = m[1] || '=';
+      const holds =
+        op === '<'
+          ? d < 0
+          : op === '<='
+            ? d <= 0
+            : op === '>'
+              ? d > 0
+              : op === '>='
+                ? d >= 0
+                : d === 0;
+      if (!holds) all = false;
+    }
+    if (all) any = true;
+  }
+  return any;
+}
+
+/**
+ * A fix that exists but is still inside npm's min-release-age quarantine.
+ * The fix is the lowest stable version above the installed one that the
+ * advisory's range does not cover. Returns { fix, clears } when that version
+ * is younger than the quarantine, otherwise null (no fix, an installable fix,
+ * or a range or version this cannot read).
+ */
+function quarantineHold(installed, range, times, releaseAgeDays, now = Date.now()) {
+  if (!(releaseAgeDays > 0) || !times) return null;
+  if (versionInRange(installed, range) !== true) return null;
+  const candidates = Object.keys(times)
+    .filter((x) => /^\d+\.\d+\.\d+$/.test(x) && cmpSemver(x, installed) > 0)
+    .sort(cmpSemver);
+  for (const x of candidates) {
+    const inRange = versionInRange(x, range);
+    if (inRange === null) return null;
+    if (inRange) continue;
+    const clears = Date.parse(times[x]) + releaseAgeDays * 86400000;
+    if (!(clears > now)) return null;
+    // A later release in the installed major, outside the range and already
+    // cleared, is installable now. A new major is not a drop-in fix: the
+    // parent that pins this package would have to move too.
+    const major = installed.split('.')[0];
+    const later = candidates.filter(
+      (y) => cmpSemver(y, x) > 0 && y.split('.')[0] === major && versionInRange(y, range) === false,
+    );
+    if (later.some((y) => !(Date.parse(times[y]) + releaseAgeDays * 86400000 > now))) return null;
+    return {
+      fix: x,
+      clears: new Date(clears).toISOString().slice(0, 16).replace('T', ' ') + ' UTC',
+    };
+  }
+  return null;
+}
+
+/** min-release-age in days: the project's .npmrc first, then ~/.npmrc. */
+function minReleaseAge(dir) {
+  for (const f of [path.join(dir, '.npmrc'), path.join(os.homedir(), '.npmrc')]) {
+    const m = readFile(f).match(/^min-release-age\s*=\s*(\d+)/m);
+    if (m) return Number(m[1]);
+  }
+  return 0;
+}
+
+const SEVERITY_RANK = { info: 0, low: 1, moderate: 2, high: 3, critical: 4 };
+
+/** Advisories at or above a level (default high) in an npm audit report, at their source package. */
+function highAdvisories(report, level = 'high') {
+  const min = SEVERITY_RANK[level] ?? SEVERITY_RANK.high;
+  const advisories = [];
+  for (const [name, v] of Object.entries((report && report.vulnerabilities) || {}))
+    for (const via of v.via || [])
+      if (via && typeof via === 'object' && (SEVERITY_RANK[via.severity] ?? 4) >= min)
+        advisories.push({
+          id: String(via.url || '')
+            .split('/')
+            .pop(),
+          pkg: via.name || name,
+          title: via.title,
+          range: via.range,
+        });
+  return advisories;
+}
+
+/**
+ * Advisories whose fix is held by min-release-age (report R-28). A fix newer
+ * than the quarantine cannot be installed, so the gate could not pass until it
+ * cleared, and the Stop hook re-fired every turn with nothing to do. A held
+ * advisory passes with a warning that names the fix and when it clears; the
+ * hold ends by itself on that date, after which the gate fails until the fix
+ * is installed. Each installed copy of the package must be held; one copy
+ * with an installable fix, or one this cannot read, leaves the advisory open.
+ * Returns Map of `${id} ${pkg}` -> { fix, clears }.
+ */
+function quarantineHolds(dir, report, advisories) {
+  const holds = new Map();
+  const age = minReleaseAge(dir);
+  if (!(age > 0)) return holds;
+  const times = {};
+  for (const a of advisories) {
+    if (!a.id || !/^(@[\w.-]+\/)?[\w.-]+$/.test(a.pkg)) continue;
+    if (!(a.pkg in times)) {
+      const r = shArgs('npm', ['view', '--json', '--', a.pkg, 'time'], dir);
+      try {
+        times[a.pkg] = r.ok ? JSON.parse(r.out) : null;
+      } catch {
+        times[a.pkg] = null;
+      }
+    }
+    const nodes = ((report.vulnerabilities || {})[a.pkg] || {}).nodes || [];
+    if (nodes.length === 0) continue;
+    let hold = null;
+    for (const n of nodes) {
+      const pkg =
+        /^node_modules\//.test(n) && !n.split('/').includes('..')
+          ? readJSON(path.join(dir, n, 'package.json'))
+          : null;
+      const h = pkg && quarantineHold(pkg.version, a.range, times[a.pkg], age);
+      if (!h) {
+        hold = null;
+        break;
+      }
+      if (!hold || h.clears > hold.clears) hold = h;
+    }
+    if (hold) holds.set(`${a.id} ${a.pkg}`, hold);
+  }
+  return holds;
+}
+
+function heldNote(advisories, holds) {
+  return advisories
+    .map((a) => {
+      const h = holds.get(`${a.id} ${a.pkg}`);
+      return `${a.id} in ${a.pkg}: fix ${a.pkg}@${h.fix} is inside the min-release-age quarantine until ${h.clears}; install it then (the gate fails from that time)`;
+    })
+    .join('\n');
+}
+
+/**
+ * The plain `security` gate (no exceptions file) after `npm run security`
+ * failed: passes only when every high or critical advisory is held.
+ */
+function auditHeldOnly(dir, failed, script) {
+  // Only a script that is a bare `npm audit` with plain flags: a chained
+  // command or another tool failing is not this check's to excuse. The audit
+  // is re-run with the script's own flags and judged at its own level.
+  const args = String(script || '')
+    .trim()
+    .split(/\s+/);
+  if (
+    args[0] !== 'npm' ||
+    args[1] !== 'audit' ||
+    !args.slice(2).every((a) => /^--[\w-]+(=[\w-]+)?$/.test(a))
+  )
+    return failed;
+  const level = (args.find((a) => a.startsWith('--audit-level=')) || '').split('=')[1] || 'low';
+  const r = shArgs('npm', [...args.slice(1), '--json'], dir);
+  let report;
+  try {
+    report = JSON.parse(r.out.slice(r.out.indexOf('{')));
+  } catch {
+    return failed;
+  }
+  const advisories = highAdvisories(report, level);
+  if (advisories.length === 0) return failed;
+  const holds = quarantineHolds(dir, report, advisories);
+  if (advisories.some((a) => !holds.has(`${a.id} ${a.pkg}`))) return failed;
+  return { ok: true, out: failed.out, note: heldNote(advisories, holds) };
+}
+
+/**
  * The audit gate, honouring exceptions. Fails on every high or critical
  * advisory (the source behind a finding, not the parents that inherit it)
  * that no valid exception covers for that package.
@@ -3199,19 +3543,14 @@ function auditWithExceptions(dir) {
   } catch {
     return { ok: false, out: `could not read npm audit output: ${r.out.slice(0, 300)}` };
   }
-  const advisories = [];
-  for (const [name, v] of Object.entries(report.vulnerabilities || {}))
-    for (const via of v.via || [])
-      if (via && typeof via === 'object' && /high|critical/.test(via.severity || ''))
-        advisories.push({
-          id: String(via.url || '')
-            .split('/')
-            .pop(),
-          pkg: via.name || name,
-          title: via.title,
-        });
-  const open = advisories.filter((a) => !(exceptions[a.id] && exceptions[a.id].package === a.pkg));
-  const covered = advisories.length - open.length;
+  const advisories = highAdvisories(report);
+  const uncovered = advisories.filter(
+    (a) => !(exceptions[a.id] && exceptions[a.id].package === a.pkg),
+  );
+  const covered = advisories.length - uncovered.length;
+  const holds = uncovered.length ? quarantineHolds(dir, report, uncovered) : new Map();
+  const held = uncovered.filter((a) => holds.has(`${a.id} ${a.pkg}`));
+  const open = uncovered.filter((a) => !holds.has(`${a.id} ${a.pkg}`));
   if (open.length)
     return {
       ok: false,
@@ -3222,6 +3561,7 @@ function auditWithExceptions(dir) {
     out: covered
       ? `${covered} advisory finding(s) covered by audit-exceptions.json`
       : 'no high or critical advisories',
+    note: held.length ? heldNote(held, holds) : undefined,
   };
 }
 
@@ -5774,6 +6114,10 @@ function cmdGates(dir, flags) {
     else if (g.script === 'sast') r = runSast(dir);
     else if (g.script === ASSISTANT_GATE) r = runAssistantSuite(assistantSuite);
     else r = sh(`npm run ${safeToken(g.script, 'script name')}`, dir);
+    // A plain audit that failed only on fixes still inside the min-release-age
+    // quarantine passes with a warning (see quarantineHolds).
+    if (!r.ok && g.script === 'security' && !exists(path.join(dir, AUDIT_EXCEPTIONS)))
+      r = auditHeldOnly(dir, r, scripts.security);
     // The MCP project's suites skip an app whose checkout is missing, and a
     // skipped describe() counts as zero skipped tests, so its gates passed
     // with apps untested. There a skip is a failure.
@@ -5810,7 +6154,14 @@ function cmdGates(dir, flags) {
       const count = typeof r.scanned === 'number' ? ` ${r.scanned} files` : '';
       console.log(`${GREEN}pass${RESET} ${DIM}${secs}s${cost}${count}${RESET}`);
       if (r.judged && r.judged.findings.length > 0) console.log(formatFindings(r.judged.findings));
-      report.push({ gate: g.name, pass: true });
+      if (r.note)
+        for (const line of r.note.split('\n')) console.log(`    ${YELLOW}⚠${RESET} ${line}`);
+      report.push({
+        gate: g.name,
+        script: g.script,
+        pass: true,
+        ...(r.note ? { note: r.note } : {}),
+      });
       // Keep the review the moment it passes (see alreadyReviewed above).
       if (g.script === 'review' && srcHash !== null) {
         fs.mkdirSync(path.join(dir, '.policy'), { recursive: true });
@@ -5910,6 +6261,11 @@ function cmdGates(dir, flags) {
         : reviewCarried
           ? { reviewer: carriedReviewer, reason: 'carried forward' }
           : null,
+      // Advisories that passed only because their fix was still quarantined.
+      // verify-ready --release refuses a marker that carries any.
+      ...(report.some((r) => r.note && r.script === 'security')
+        ? { auditHeld: report.find((r) => r.note && r.script === 'security').note }
+        : {}),
     };
     fs.mkdirSync(path.join(dir, '.policy'), { recursive: true });
     // Trailing newline keeps the marker prettier-clean in projects where
@@ -6525,6 +6881,14 @@ function verifyRelease(dir, proj, flags) {
     fail(
       `The gates marker records no code review — a release must not ship code the reviewer never opened. ` +
         `Re-run with the review forced on: policy gates --reviewer coderabbit`,
+    );
+
+  // A pass that carried a quarantined fix is fine for day-to-day work, not for
+  // a release: the advisory is still in the tree being shipped.
+  if (relMarker && relMarker.auditHeld)
+    fail(
+      `The gates marker passed the dependency audit on a fix still in the min-release-age quarantine — ${relMarker.auditHeld.split('\n')[0]}. ` +
+        `Install the fix once it clears, then re-run: policy gates --reviewer coderabbit`,
     );
 
   // Version bumped vs last tag. Tag-at-release flow: pkg == tag is CORRECT
@@ -9911,6 +10275,12 @@ module.exports = {
   assistantCoverageGaps,
   isAssistantProject,
   skippedSuites,
+  versionInRange,
+  quarantineHold,
+  quarantineHolds,
+  auditHeldOnly,
+  highAdvisories,
+  electronNodeGap,
   HELP_CAPTURE_INVOCATION,
   auditProjectId,
   auditEntryHash,
