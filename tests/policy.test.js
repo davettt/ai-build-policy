@@ -1805,3 +1805,71 @@ test('renderTodayFindings: today read once at render, unless something subscribe
   assert.deepEqual(policy.renderTodayFindings(app), []);
   fs.rmSync(app, { recursive: true, force: true });
 });
+
+test('utcTodayFindings: a day stored from UTC, except filenames and opt-outs', () => {
+  const app = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-utc-'));
+  fs.mkdirSync(path.join(app, 'server'), { recursive: true });
+  fs.mkdirSync(path.join(app, 'tests'), { recursive: true });
+  const iso = "new Date().toISOString().split('T')[0]";
+  fs.writeFileSync(
+    path.join(app, 'server', 'router.js'),
+    [
+      `const today = ${iso};`,
+      `  startDate: req.body.startDate || new Date().toISOString().slice(0, 10),`,
+      `const name = \`backup-\${${iso}}.json\`;`,
+      `const stamp = ${iso}; // policy:utc-date-ok`,
+      '// policy:utc-date-ok',
+      `const day = ${iso};`,
+      `const createdAt = new Date().toISOString();`,
+      `if (x.date === ${iso}) {}`,
+    ].join('\n'),
+  );
+  fs.writeFileSync(path.join(app, 'tests', 'a.test.js'), `const today = ${iso};\n`);
+  assert.deepEqual(policy.utcTodayFindings(app), ['server/router.js:1', 'server/router.js:2']);
+});
+
+test('routeReport: a routed report stays open, names its project, and closes', () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'policy-route-')), 'REPORTS.md');
+  policy.appendReport(file, { project: 'app-one', version: '2.91', text: 'goal form bug' });
+  assert.equal(policy.routeReport(file, 'R-1', 'app-one'), true);
+  assert.equal(policy.routeReport(file, 'R-1', 'app-two'), false, 'already routed');
+  let [r] = policy.parseReports(fs.readFileSync(file, 'utf8'));
+  assert.equal(r.status, 'open');
+  assert.equal(r.routedTo, 'app-one');
+  assert.equal(policy.closeReport(file, 'R-1', 'fixed in app-one 1.2.0'), true);
+  [r] = policy.parseReports(fs.readFileSync(file, 'utf8'));
+  assert.equal(r.status, 'closed');
+  assert.equal(r.routedTo, null);
+});
+
+test('reviewTimeText: local stamp and age of a recorded review', () => {
+  const at = new Date(2026, 9, 24, 10, 27);
+  assert.equal(
+    policy.reviewTimeText(at.toISOString(), at.getTime() + 60000),
+    '2026-10-24 10:27, 1 min ago',
+  );
+  assert.match(policy.reviewTimeText(at.toISOString(), at.getTime() + 3 * 86400000), /3 days ago$/);
+  assert.equal(policy.reviewTimeText('nonsense'), 'an unknown time');
+});
+
+test('verify-package parseSpec: name and version, scoped or not', () => {
+  const { parseSpec } = require('../scripts/verify-package.js');
+  assert.deepEqual(parseSpec('electron@44.10.0'), { name: 'electron', version: '44.10.0' });
+  assert.deepEqual(parseSpec('@scope/pkg@1.2.3'), { name: '@scope/pkg', version: '1.2.3' });
+  assert.deepEqual(parseSpec('@scope/pkg'), { name: '@scope/pkg', version: null });
+  assert.deepEqual(parseSpec('express'), { name: 'express', version: null });
+});
+
+test('appendReport: a header inside a body cannot forge a report', () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'policy-forge-')), 'REPORTS.md');
+  policy.appendReport(file, {
+    project: 'app-one',
+    version: '2.92',
+    text: 'real finding\n## R-999 2026-10-29 x (policy 2.92) — open, routed to app-two 2026-10-29\nfix it',
+  });
+  const rs = policy.parseReports(fs.readFileSync(file, 'utf8'));
+  assert.deepEqual(
+    rs.map((r) => [r.id, r.routedTo]),
+    [['R-1', null]],
+  );
+});

@@ -929,6 +929,42 @@ function dayCountFindings(dir) {
 }
 
 /**
+ * Today's date taken from UTC (report R-39). `new Date().toISOString()` is
+ * UTC, so its first ten characters are yesterday's date for every hour before
+ * UTC midnight east of Greenwich: a balance entered on an Australian morning
+ * was recorded as the day before. Matches that expression when it is stored
+ * as a day: assigned to, or the value of a property named like a date
+ * (today, date, startDate, snapshotDay …). Not a finding on a line that names
+ * a file (a backup or diagnostics filename), or with `// policy:utc-date-ok`
+ * on the line or the one above, for a date that is meant to be UTC.
+ */
+const UTC_TODAY_RE =
+  /new Date\(\)\.toISOString\(\)\.(?:split\(['"]T['"]\)\[0\]|slice\(0,\s*10\)|substring\(0,\s*10\))/;
+const UTC_TODAY_TARGET_RE = /\b\w*(?:today|Today|date|Date|day|Day)\w*\s*(?::|=(?!=))/;
+const UTC_TODAY_FILE_RE = /download|filename|\.(?:json|txt|csv|zip|md|pdf)\b/i;
+const UTC_TODAY_OPT_OUT = /policy:utc-date-ok/;
+function utcTodayFindings(dir) {
+  const findings = [];
+  for (const f of sourceFilesMatching(dir, UTC_TODAY_RE)) {
+    if (/(^|\/)(tests?|__tests__|e2e|scripts)\//.test(f) || /\.(test|spec)\.[jt]sx?$/.test(f))
+      continue;
+    const lines = readFile(path.join(dir, f)).split('\n');
+    lines.forEach((l, i) => {
+      const m = l.match(UTC_TODAY_RE);
+      if (
+        m &&
+        UTC_TODAY_TARGET_RE.test(l.slice(0, m.index)) &&
+        !UTC_TODAY_FILE_RE.test(l) &&
+        !UTC_TODAY_OPT_OUT.test(l) &&
+        !UTC_TODAY_OPT_OUT.test(lines[i - 1] || '')
+      )
+        findings.push(`${f}:${i + 1}`);
+    });
+  }
+  return findings;
+}
+
+/**
  * "Today" read once at render in a React component (report R-38). A view
  * that computes the date in its body with nothing subscribed to it shows
  * yesterday's "due today" after a night left open, until something remounts
@@ -1509,12 +1545,37 @@ function auditSiteImages(siteDir, reg = loadRegistry()) {
       );
     }
   }
+  // An app with capture flows whose screenshots were never captured: they are
+  // still recorded as hand-made, so only a minor bump puts them behind and a
+  // patch release passes with the old screenshots. One app's did exactly
+  // that at a patch release (R-33, 2026-10-24), until its first site-capture
+  // run marked them captured.
+  const neverCaptured = [];
+  for (const [app, cfg] of siteAppEntries(reg)) {
+    const own = Object.values(manifest.images).filter((e) => e && e.app === app);
+    if (own.length === 0 || own.some((e) => e.captured)) continue;
+    const appPkg = readJSON(
+      path.join(path.dirname(path.resolve(siteDir)), cfg.repo || app, 'package.json'),
+    );
+    if (appPkg && appPkg.scripts && appPkg.scripts['site:capture']) neverCaptured.push(app);
+  }
+  for (const app of neverCaptured)
+    fail(
+      `Site: ${app} has a site:capture script but none of its screenshots were captured with it — they are checked as hand-made, so a patch release passes with old screenshots. Run: policy site-capture ${app}`,
+    );
   for (const [app, b] of Object.entries(behind)) {
     fail(
       `Site: ${app}/version.json advertises ${b.version} but ${b.images.length} screenshot(s) were verified against an older version: ${b.images.slice(0, 5).join(', ')}${b.images.length > 5 ? ', …' : ''} — regenerate: policy site-capture ${app}; hand-made images: confirm, then policy site-images --verify ${app}`,
     );
   }
-  if (unmapped.length + untracked.length + gone.length + Object.keys(behind).length === 0) {
+  if (
+    unmapped.length +
+      untracked.length +
+      gone.length +
+      neverCaptured.length +
+      Object.keys(behind).length ===
+    0
+  ) {
     ok(
       `Site: ${Object.keys(manifest.images).length} screenshot(s) tracked in ${SITE_IMAGE_MANIFEST}, all at their app's advertised minor`,
     );
@@ -1785,7 +1846,8 @@ const REPORTS_HEADER =
 
 function parseReports(text) {
   const reports = [];
-  const head = /^## (R-\d+) (\S+) (\S+) \(policy ([^)]+)\) — (open|closed.*)$/;
+  const head =
+    /^## (R-\d+) (\S+) (\S+) \(policy ([^)]+)\) — (open(?:, routed to \S+ \S+)?|closed.*)$/;
   for (const block of String(text || '').split(/^(?=## R-)/m)) {
     const nl = block.indexOf('\n');
     const m = head.exec(nl === -1 ? block : block.slice(0, nl));
@@ -1797,6 +1859,7 @@ function parseReports(text) {
       version: m[4],
       status: m[5].startsWith('open') ? 'open' : 'closed',
       closed: m[5].startsWith('closed') ? m[5].slice('closed'.length).trim() : null,
+      routedTo: (/^open, routed to (\S+)/.exec(m[5]) || [])[1] || null,
       body: (nl === -1 ? '' : block.slice(nl + 1)).trim(),
     });
   }
@@ -1812,14 +1875,20 @@ function appendReport(file, { project, version, text }) {
   const n = parseReports(existing).reduce((max, r) => Math.max(max, Number(r.id.slice(2))), 0) + 1;
   const id = `R-${n}`;
   const date = new Date().toISOString().slice(0, 10);
-  const entry = `\n## ${id} ${date} ${project} (policy ${version}) — open\n\n${text.trim()}\n`;
+  // A body line that starts "## " would parse as a header of its own: a forged
+  // routed report would put one session's text in another app's check.
+  const body = text.trim().replace(/^##/gm, '\\##');
+  const entry = `\n## ${id} ${date} ${project} (policy ${version}) — open\n\n${body}\n`;
   fs.writeFileSync(file, existing.replace(/\n*$/, '\n') + entry);
   return id;
 }
 
 function closeReport(file, id, resolution) {
   const text = readFile(file);
-  const re = new RegExp(`^(## ${id} \\S+ \\S+ \\(policy [^)]+\\)) — open$`, 'm');
+  const re = new RegExp(
+    `^(## ${id} \\S+ \\S+ \\(policy [^)]+\\)) — open(?:, routed to \\S+ \\S+)?$`,
+    'm',
+  );
   if (!re.test(text)) return false;
   const date = new Date().toISOString().slice(0, 10);
   fs.writeFileSync(
@@ -1830,10 +1899,40 @@ function closeReport(file, id, resolution) {
 }
 
 /**
+ * Hand an open report to the app session that owns the work. A report about an
+ * app's own bug used to have two endings: stay open here, where no app session
+ * sees it, or be closed here, which loses it. Routed, it stays open and the
+ * app's own check lists it at session start until that session closes it.
+ */
+function routeReport(file, id, project) {
+  const text = readFile(file);
+  const re = new RegExp(`^(## ${id} \\S+ \\S+ \\(policy [^)]+\\)) — open$`, 'm');
+  if (!re.test(text)) return false;
+  const date = new Date().toISOString().slice(0, 10);
+  fs.writeFileSync(
+    file,
+    text.replace(re, (_, head) => `${head} — open, routed to ${project} ${date}`),
+  );
+  return true;
+}
+
+/** An app's check: the reports routed to this project, still open. */
+function auditRoutedReports(dir, file = REPORTS_FILE) {
+  const project = path.basename(path.resolve(dir));
+  const mine = exists(file) ? openReports(file).filter((r) => r.routedTo === project) : [];
+  for (const r of mine)
+    warn(
+      `${r.id} routed to this project by build-policy: ${r.body.split('\n')[0]} — fix it, then close it: policy report --close ${r.id} "<what was done>"`,
+    );
+}
+
+/**
  * policy report "<finding>"            log a finding from any project
  * policy report -                      read the finding from stdin (multi-line)
  * policy report --list                 open reports
- * policy report --close R-<n> "<done>" close one (from a build-policy session)
+ * policy report --close R-<n> "<done>" close one (from a build-policy session,
+ *                                      or from the project it was routed to)
+ * policy report --route R-<n> <project> hand one to an app session
  */
 function cmdReport(dir, rest, flags) {
   const words = rest.filter((a) => !a.startsWith('--'));
@@ -1842,7 +1941,9 @@ function cmdReport(dir, rest, flags) {
     const open = openReports();
     if (open.length === 0) ok('No open reports');
     for (const r of open) {
-      console.log(`  ${BOLD}${r.id}${RESET} ${r.date} ${r.project} (policy ${r.version})`);
+      console.log(
+        `  ${BOLD}${r.id}${RESET} ${r.date} ${r.project} (policy ${r.version})${r.routedTo ? ` ${DIM}→ routed to ${r.routedTo}${RESET}` : ''}`,
+      );
       console.log(`    ${r.body.split('\n').join('\n    ')}`);
     }
     return finish();
@@ -1855,12 +1956,41 @@ function cmdReport(dir, rest, flags) {
       fail('Usage: policy report --close R-<n> "<what was done>"');
       return finish();
     }
-    if (!isUnderPolicyRoot(path.resolve(dir))) {
-      fail('Reports are closed from a build-policy session, which reviews and fixes them');
+    const routed = openReports().find((r) => r.id === id);
+    const ownProject = routed && routed.routedTo === path.basename(path.resolve(dir));
+    if (!isUnderPolicyRoot(path.resolve(dir)) && !ownProject) {
+      fail(
+        'Reports are closed from a build-policy session, which reviews and fixes them, or from the project a report was routed to',
+      );
       return finish();
     }
     if (closeReport(REPORTS_FILE, id, resolution)) ok(`${id} closed: ${resolution}`);
     else fail(`${id} is not an open report (policy report --list)`);
+    return finish();
+  }
+  const routeId = flagValue(flags, '--route');
+  if (routeId !== null) {
+    const id = routeId || words.shift();
+    const project = words[0];
+    if (!/^R-\d+$/.test(id || '') || !project) {
+      fail('Usage: policy report --route R-<n> <project>');
+      return finish();
+    }
+    if (!isUnderPolicyRoot(path.resolve(dir))) {
+      fail('Reports are routed from a build-policy session');
+      return finish();
+    }
+    if (!/^\w[\w.-]*$/.test(project)) {
+      fail(`${project} is not a project folder name`);
+      return finish();
+    }
+    if (!exists(path.join(path.dirname(POLICY_ROOT), project))) {
+      fail(`No project folder ${project} beside build-policy`);
+      return finish();
+    }
+    if (routeReport(REPORTS_FILE, id, project))
+      ok(`${id} routed to ${project}: its check lists it until that session closes it`);
+    else fail(`${id} is not an open, unrouted report (policy report --list)`);
     return finish();
   }
   let text = words.join(' ');
@@ -1888,7 +2018,11 @@ function cmdReport(dir, rest, flags) {
 function auditPolicyRepo(root) {
   auditPolicyDocVersions(root, 'policy docs');
   {
-    const open = openReports(path.join(root, 'REPORTS.md'));
+    const all = openReports(path.join(root, 'REPORTS.md'));
+    const open = all.filter((r) => !r.routedTo);
+    const routed = all.length - open.length;
+    if (routed > 0)
+      ok(`${routed} open report(s) routed to app sessions, listed by each app's check`);
     if (open.length > 0)
       warn(
         `${open.length} open report(s) from app sessions: ${open
@@ -1896,7 +2030,7 @@ function auditPolicyRepo(root) {
           .map((r) => `${r.id} ${r.project}`)
           .join(
             ', ',
-          )}${open.length > 4 ? ', …' : ''} — review: policy report --list; close each with: policy report --close R-<n> "<what was done>"`,
+          )}${open.length > 4 ? ', …' : ''} — review: policy report --list; close each with: policy report --close R-<n> "<what was done>", or hand an app's own bug to its session: policy report --route R-<n> <project>`,
       );
     else ok('No open reports from app sessions');
   }
@@ -4252,6 +4386,7 @@ function cmdCheck(dir, flags = []) {
   // scripts name no real site.
   const siteProject = loadRegistry().siteProject;
   if (siteProject && path.basename(path.resolve(dir)) === siteProject) auditSite(dir);
+  auditRoutedReports(dir);
 
   if (!proj.hasPkg) {
     // A project carrying scaffolding but no package.json is mid-setup, not
@@ -4620,6 +4755,13 @@ function cmdCheck(dir, flags = []) {
   if (dayCounts.length > 0) {
     fail(
       `Day counts rounded up with Math.ceil in: ${dayCounts.join(', ')} — across a DST fall-back the day between two local midnights is 25h, so the count is one too many. Use Math.round on the difference between two local midnights (project-standards § Locale & Date Formatting)`,
+    );
+  }
+  const utcToday = utcTodayFindings(dir);
+  if (utcToday.length > 0) {
+    fail(
+      `Today's date taken from UTC in: ${utcToday.join(', ')} — new Date().toISOString() is UTC, so before UTC midnight east of Greenwich it gives yesterday's date (an Australian morning's entry is recorded the day before). ` +
+        `Build the date from local parts (getFullYear, getMonth, getDate) or use the app's local-date helper; where UTC is intended, add // policy:utc-date-ok on the line (project-standards § Locale & Date Formatting)`,
     );
   }
   const renderToday = renderTodayFindings(dir);
@@ -5235,6 +5377,22 @@ const GATE_ORDER = [
   { name: 'Code review', script: 'review', whenSourceChanges: true },
 ];
 const REVIEW_RECORD = path.join('.policy', 'review.json');
+
+/** "2026-10-24 10:27, 3 min ago" in local time, for a recorded review. */
+function reviewTimeText(iso, now = Date.now()) {
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return 'an unknown time';
+  const p = (n) => String(n).padStart(2, '0');
+  const stamp = `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}`;
+  const min = Math.max(0, Math.round((now - t.getTime()) / 60000));
+  const ago =
+    min < 60
+      ? `${min} min ago`
+      : min < 2880
+        ? `${Math.round(min / 60)} h ago`
+        : `${Math.round(min / 1440)} days ago`;
+  return `${stamp}, ${ago}`;
+}
 const ASSISTANT_GATE = 'assistant:e2e';
 
 // ------------------------------------------------------- assistant access
@@ -5957,6 +6115,18 @@ function cmdGates(dir, flags) {
       reviewerOf(prevMarker) ||
       'coderabbit'
     : null;
+  // When the carried review ran. The skip line names it, so a reader can match
+  // it to the run that did the review: a run whose output was cut off before
+  // its review line looks like it never reviewed, and the next run's carry
+  // forward then looks wrong when it is not (R-29, 2026-10-24).
+  const carriedAt = reviewCarried
+    ? (alreadyReviewed &&
+        reviewRecord &&
+        reviewRecord.reviewedSourceHash === srcHash &&
+        reviewRecord.timestamp) ||
+      (prevMarker && prevMarker.review && prevMarker.review.at) ||
+      null
+    : null;
   const skipReview =
     !withReview &&
     ((workFiles.length > 0 && workFiles.filter(isSourceFile).length === 0) ||
@@ -6128,7 +6298,7 @@ function cmdGates(dir, flags) {
     if (g.whenSourceChanges && skipReview) {
       console.log(
         reviewCarried
-          ? `  ${DIM}skipped${RESET} ${g.name} ${DIM}(source unchanged since the last ${carriedReviewer} review — carried forward; force: gates --reviewer coderabbit)${RESET}`
+          ? `  ${DIM}skipped${RESET} ${g.name} ${DIM}(source unchanged since the ${carriedReviewer} review${carriedAt ? ` of ${reviewTimeText(carriedAt)}` : ''} — carried forward; force: gates --reviewer coderabbit)${RESET}`
           : `  ${DIM}skipped${RESET} ${g.name} ${DIM}(no source in this diff — nothing for a reviewer to read; force: gates --reviewer coderabbit)${RESET}`,
       );
       continue;
@@ -6322,9 +6492,9 @@ function cmdGates(dir, flags) {
       // Who reviewed, and why that reviewer: verify-ready --release reads
       // this, since only a CodeRabbit pass releases.
       review: report.some((r) => r.gate === 'Code review')
-        ? { reviewer: review.reviewer, reason: review.reason }
+        ? { reviewer: review.reviewer, reason: review.reason, at: new Date().toISOString() }
         : reviewCarried
-          ? { reviewer: carriedReviewer, reason: 'carried forward' }
+          ? { reviewer: carriedReviewer, reason: 'carried forward', at: carriedAt }
           : null,
       // Advisories that passed only because their fix was still quarantined.
       // verify-ready --release refuses a marker that carries any.
@@ -6967,6 +7137,19 @@ function verifyRelease(dir, proj, flags) {
       else if (tagShips)
         ok(
           `Release ${proj.pkg.version} tagged at ${tag.out}; the ${ahead.out.trim()} commit(s) after it change only tests or docs`,
+        );
+      // The sign-off run itself: the ack is recorded at the end of this run,
+      // so judging it unsigned here printed a FAIL in the very run that signed
+      // it, and only the next run passed (R-34). The review
+      // check above still judged the marker, so this skips nothing.
+      else if (
+        flags.includes('--ack-manual') &&
+        ahead.ok &&
+        Number(ahead.out.trim()) > 0 &&
+        afterTag.length === 0
+      )
+        ok(
+          `Release ${proj.pkg.version} tagged at ${tag.out}; the ${ahead.out.trim()} commit(s) after it change only tests or docs, and this run records the sign-off`,
         );
       else
         fail(
@@ -9683,7 +9866,7 @@ function cmdHookPretool() {
     if (input.tool_name === 'Bash' && /--min-release-age(=|\s+)\d/.test(cmd))
       refuse(
         'BUILD-POLICY: overriding min-release-age installs a version younger than the quarantine. For an urgent security fix ' +
-          "that is the developer's call: score the exact version first (verify-package.js), then give the developer the command " +
+          "that is the developer's call: score the exact version first (node <build-policy>/scripts/verify-package.js <pkg>@<version>), then give the developer the command " +
           'to run themselves, e.g. ! npm install <pkg>@<version> --min-release-age=0',
       );
   }
@@ -9934,19 +10117,28 @@ function cmdHookPretool() {
 // changes) come from `npm view`, and the record carries them forward so the
 // next session reads the finding instead of re-deriving it differently.
 function cmdUpgrade(dir, rest) {
-  const args = rest.filter((a) => !a.startsWith('--'));
-  const pkgName = args[0];
-  if (!pkgName) {
-    console.error('Usage: node policy.js upgrade <package> [targetVersion] [projectDir]');
+  const norm = normalizeValueFlags(rest, ['--to']);
+  const args = norm.filter((a) => !a.startsWith('--'));
+  if (!args[0]) {
+    console.error(
+      'Usage: node policy.js upgrade <package>[@<version>] [--to <version>] [projectDir]',
+    );
     process.exit(1);
   }
+  // "electron@44.9.3" names the package and the target. Taken whole, it wrote
+  // a record named after the whole spec, with "From: (not installed)" and npm's
+  // EINVALIDTAGNAME text as the upstream source (R-22, 2026-10-22).
+  const at = args[0].lastIndexOf('@');
+  const pkgName = at > 0 ? args[0].slice(0, at) : args[0];
+  const specVersion = at > 0 ? args[0].slice(at + 1) || null : null;
   safeToken(pkgName, 'package name');
   // Remaining positional args: an explicit target version (starts with a digit)
   // and/or a project dir. Everything defaults sensibly.
   // NOTE: `dir` from main() is the first non-flag positional, which for this
   // command is the package name — never a directory. Resolve the project dir
   // from the args after the package name only, else default to cwd.
-  const explicit = args.slice(1).find((a) => /^\d/.test(a)) || null;
+  const explicit =
+    flagValue(norm, '--to') || specVersion || args.slice(1).find((a) => /^\d/.test(a)) || null;
   const projDir =
     args.slice(1).find((a) => a !== explicit && exists(path.join(a, 'package.json'))) || '.';
   if (explicit) safeToken(explicit, 'target version');
@@ -9971,6 +10163,16 @@ function cmdUpgrade(dir, rest) {
     );
     return finish();
   }
+  // A target npm does not know would scaffold a record of facts about nothing.
+  if (explicit) {
+    const known = sh(`npm view ${pkgName}@${explicit} version`, projDir);
+    if (!known.ok || known.out.trim() !== explicit) {
+      fail(
+        `${pkgName}@${explicit} is not a published version (npm view found ${known.ok && known.out.trim() ? known.out.trim().split('\n').pop() : 'nothing'}). Use an exact version: policy upgrade ${pkgName} --to <x.y.z>`,
+      );
+      return finish();
+    }
+  }
   const targetMajor = semverMajor(targetVersion);
   const installedJson = readJSON(path.join(projDir, 'node_modules', pkgName, 'package.json'));
   const installedVersion = installedJson ? installedJson.version : '(not installed)';
@@ -9987,16 +10189,18 @@ function cmdUpgrade(dir, rest) {
     projDir,
   );
   let repoUrl = '';
-  try {
-    const r = JSON.parse(repoRaw.out || '{}');
-    repoUrl = ((r && (r['repository.url'] || r.homepage)) || repoRaw.out || '')
-      .toString()
-      .replace(/^git\+/, '')
-      .replace(/\.git$/, '')
-      .trim();
-  } catch {
-    repoUrl = repoRaw.out.trim();
-  }
+  // npm's error text is not a URL: an empty source sends the reader to npmjs.
+  if (repoRaw.ok)
+    try {
+      const r = JSON.parse(repoRaw.out || '{}');
+      repoUrl = ((r && (r['repository.url'] || r.homepage)) || repoRaw.out || '')
+        .toString()
+        .replace(/^git\+/, '')
+        .replace(/\.git$/, '')
+        .trim();
+    } catch {
+      repoUrl = repoRaw.out.trim();
+    }
 
   // Peer-constraint analysis — the exact class of fact that gets fabricated.
   const peerLines = Object.entries(peers).map(([p, need]) => {
@@ -10181,7 +10385,13 @@ function cmdApproveException(ids, flags = []) {
 
 function main() {
   const [, , command, ...rawRest] = process.argv;
-  const rest = normalizeValueFlags(rawRest, ['--reviewer', '--verify', '--version', '--close']);
+  const rest = normalizeValueFlags(rawRest, [
+    '--reviewer',
+    '--verify',
+    '--version',
+    '--close',
+    '--route',
+  ]);
   const flags = rest.filter((a) => a.startsWith('--'));
   const dir = rest.find((a) => !a.startsWith('--')) || '.';
   hookMode = flags.includes('--hook');
@@ -10333,6 +10543,9 @@ module.exports = {
   securitySensitiveFiles,
   dayCountFindings,
   renderTodayFindings,
+  utcTodayFindings,
+  routeReport,
+  reviewTimeText,
   packagedImportGaps,
   builderGlobRe,
   helpHandoffMessage,

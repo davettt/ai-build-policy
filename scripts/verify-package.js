@@ -6,13 +6,30 @@
  * flags risks, and prints the allowlist entry with the score recorded.
  * Includes maintenance lifecycle assessment.
  *
- * Usage: node verify-package.js <package-name>
+ * Usage: node verify-package.js <package-name>[@<version>]
+ *
+ * With a version, the deprecation, provenance and Socket checks judge that
+ * version, the one about to be installed, instead of latest. The name alone
+ * still judges latest.
  */
 
 const https = require('https');
 const { execFileSync } = require('child_process');
 
-const pkg = process.argv[2];
+/**
+ * Split "name@version" (scoped or not) into its parts. The registry is asked
+ * for the name; the whole string used to be encoded into the URL, so
+ * "electron@44.10.0" came back "not found on npm registry" (R-40, R-41).
+ */
+function parseSpec(spec) {
+  const s = String(spec || '');
+  const at = s.lastIndexOf('@');
+  if (at > 0) return { name: s.slice(0, at), version: s.slice(at + 1) || null };
+  return { name: s, version: null };
+}
+
+const spec = parseSpec(process.argv[2]);
+const pkg = spec.name;
 
 const RED = '\x1b[31m';
 const YELLOW = '\x1b[33m';
@@ -190,6 +207,12 @@ async function main() {
   // Basic info
   const versions = Object.keys(registry.versions || {}).length;
   const latest = registry['dist-tags']?.latest || 'unknown';
+  // The version being judged: the one asked for, or latest.
+  if (spec.version && !(registry.versions && Object.hasOwn(registry.versions, spec.version))) {
+    flag(`${pkg}@${spec.version} is not a published version (latest is ${latest})`);
+    process.exit(1);
+  }
+  const target = spec.version || latest;
   const description = registry.description || '(none)';
   const repoUrl =
     typeof registry.repository === 'string'
@@ -202,13 +225,17 @@ async function main() {
   const timeData = registry.time || {};
   const latestPublishDate = latest !== 'unknown' && timeData[latest] ? timeData[latest] : null;
   const deprecated =
-    registry.versions && latest !== 'unknown' && registry.versions[latest]
-      ? registry.versions[latest].deprecated || null
+    registry.versions && target !== 'unknown' && registry.versions[target]
+      ? registry.versions[target].deprecated || null
       : null;
 
   console.log(`  Name:        ${registry.name}`);
   console.log(`  Description: ${description}`);
   console.log(`  Latest:      ${latest}`);
+  if (target !== latest) {
+    const at = timeData[target] ? ` (published ${timeData[target].split('T')[0]})` : '';
+    console.log(`  Checking:    ${target}${at}`);
+  }
   console.log(`  Versions:    ${versions}`);
   console.log(`  Downloads:   ${weeklyDownloads.toLocaleString()}/week`);
   console.log(`  Repository:  ${repoUrl}`);
@@ -291,8 +318,8 @@ async function main() {
   }
 
   // Provenance: published from CI with a signed attestation (npm --provenance)
-  const provenance = hasProvenance(registry.versions && registry.versions[latest]);
-  if (provenance) pass('Provenance attestation on the latest version');
+  const provenance = hasProvenance(registry.versions && registry.versions[target]);
+  if (provenance) pass(`Provenance attestation on ${target === latest ? 'the latest version' : target}`);
   else warn('No provenance attestation — the publish cannot be tied to the repository\'s CI');
 
   // Description check
@@ -361,7 +388,7 @@ async function main() {
   let socket = { checked: null, status: 'unavailable' };
   try {
     const scoreOnce = () => {
-      const out = execFileSync('socket', ['package', 'score', 'npm', `${pkg}@${latest}`, '--json'], {
+      const out = execFileSync('socket', ['package', 'score', 'npm', `${pkg}@${target}`, '--json'], {
         encoding: 'utf8',
         timeout: 60000,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -393,6 +420,7 @@ async function main() {
     socket = {
       checked: new Date().toISOString().split('T')[0],
       status: 'scored',
+      version: target,
       supplyChain: self.supplyChain,
       vulnerability: self.vulnerability,
       deepSupplyChain: deep.supplyChain,
@@ -489,11 +517,11 @@ async function main() {
   if (flags > 0) process.exit(1);
 }
 
-module.exports = { parseGithubRepo, repoNameMatch, hasProvenance, sharesMaintainer, safeDirectory };
+module.exports = { parseSpec, parseGithubRepo, repoNameMatch, hasProvenance, sharesMaintainer, safeDirectory };
 
 if (require.main === module) {
   if (!pkg) {
-    console.error('Usage: node verify-package.js <package-name>');
+    console.error('Usage: node verify-package.js <package-name>[@<version>]');
     process.exit(1);
   }
   main().catch((err) => {
