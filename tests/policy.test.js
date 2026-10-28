@@ -1761,3 +1761,47 @@ test('electronNodeGap: bundled Node against Node security releases', () => {
   );
   assert.equal(policy.electronNodeGap('99.0.0', releases, index), null);
 });
+
+test('renderTodayFindings: today read once at render, unless something subscribes', () => {
+  const app = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-today-'));
+  const src = path.join(app, 'src');
+  fs.mkdirSync(path.join(src, 'tests'), { recursive: true });
+  const write = (f, body) => fs.writeFileSync(path.join(src, f), body);
+  write(
+    'Dashboard.tsx',
+    [
+      'export function Dashboard() {',
+      '  const today = todayLocal();',
+      '  const onClick = () => {',
+      '    const now = new Date();',
+      '  };',
+      '  return <div>{today}</div>;',
+      '}',
+      'function helper() {',
+      '  const now = new Date();',
+      '}',
+    ].join('\n'),
+  );
+  write(
+    'Subscribed.tsx',
+    'export function List() {\n  const today = useToday();\n  const now = new Date();\n  return null;\n}\n',
+  );
+  write(
+    'Footer.tsx',
+    'export const Footer = () => {\n  const year = new Date().getFullYear();\n  return null;\n};\n',
+  );
+  write(
+    'Form.tsx',
+    'export function Form() {\n  // policy:today-ok remounts on open\n  const today = todayLocal();\n  return null;\n}\n',
+  );
+  write(
+    'Commented.tsx',
+    'export function C() {\n  // const today = useToday();\n  const today = todayLocal();\n  return null;\n}\n',
+  );
+  write('tests/Fixture.tsx', 'export function F() {\n  const now = new Date();\n}\n');
+  assert.deepEqual(policy.renderTodayFindings(app), ['src/Commented.tsx:3', 'src/Dashboard.tsx:2']);
+  // One subscription at the root re-renders the whole tree.
+  write('App.tsx', 'export default function App() {\n  useTodayStore((s) => s.today);\n}\n');
+  assert.deepEqual(policy.renderTodayFindings(app), []);
+  fs.rmSync(app, { recursive: true, force: true });
+});

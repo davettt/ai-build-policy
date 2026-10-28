@@ -928,6 +928,63 @@ function dayCountFindings(dir) {
   return findings;
 }
 
+/**
+ * "Today" read once at render in a React component (report R-38). A view
+ * that computes the date in its body with nothing subscribed to it shows
+ * yesterday's "due today" after a night left open, until something remounts
+ * it (project-standards § External State Must Be Subscribed; found in an
+ * app's dashboard). Matches a statement directly in a capitalised
+ * component's body (prettier's two-space indent, so handlers and effects
+ * nested deeper are not read) that takes `new Date()` or a `*today*()`
+ * helper. Not a finding when:
+ *   - the component calls a `use…Today…(` / `use…Now…(` hook, so it
+ *     re-renders when the date changes;
+ *   - src/App calls one, so the whole tree re-renders (a root store
+ *     subscription);
+ *   - the line reads only the year (a footer copyright);
+ *   - the line, or the one above, says `policy:today-ok` (a form's default
+ *     date that remounts on open, say).
+ */
+const RENDER_TODAY_RE = /^ {2}(?:const|let) \w+ = (?:new Date\(\)|(?!use)\w*[Tt]oday\w*\(\))/;
+const RENDER_TODAY_DECL_RE =
+  /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s+(\w+)|const\s+(\w+)\s*(?::[^=]+)?=)/;
+const TODAY_HOOK_RE = /\buse\w*(?:Today|Now)\w*\(/;
+const RENDER_TODAY_OPT_OUT = /policy:today-ok/;
+function renderTodayFindings(dir) {
+  const root = ['src/App.tsx', 'src/App.jsx'].find((f) => exists(path.join(dir, f)));
+  if (
+    root &&
+    readFile(path.join(dir, root))
+      .split('\n')
+      .some((l) => TODAY_HOOK_RE.test(l) && !/^\s*(\/\/|\/?\*)/.test(l))
+  )
+    return [];
+  const findings = [];
+  for (const f of sourceFilesMatching(dir, /new Date\(\)|[Tt]oday\w*\(\)/, /\.(tsx|jsx)$/)) {
+    if (/(^|\/)(tests?|__tests__|e2e)\//.test(f) || /\.(test|spec)\.[jt]sx?$/.test(f)) continue;
+    const lines = readFile(path.join(dir, f)).split('\n');
+    // Group lines by the top-level declaration they sit under.
+    const bodies = [];
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(RENDER_TODAY_DECL_RE);
+      if (m) bodies.push({ name: m[1] || m[2], hits: [], hook: false });
+      const body = bodies[bodies.length - 1];
+      if (!body) continue;
+      if (TODAY_HOOK_RE.test(lines[i]) && !/^\s*(\/\/|\/?\*)/.test(lines[i])) body.hook = true;
+      if (
+        RENDER_TODAY_RE.test(lines[i]) &&
+        !/\.getFullYear\(\)\s*;?\s*$/.test(lines[i]) &&
+        !RENDER_TODAY_OPT_OUT.test(lines[i]) &&
+        !RENDER_TODAY_OPT_OUT.test(lines[i - 1] || '')
+      )
+        body.hits.push(i + 1);
+    }
+    for (const b of bodies)
+      if (/^[A-Z]/.test(b.name) && !b.hook) for (const n of b.hits) findings.push(`${f}:${n}`);
+  }
+  return findings;
+}
+
 function diffHash(dir) {
   // Hash the changed-file list + their current contents. Deliberately
   // staging-invariant: `git add` must not invalidate a gates marker, so we
@@ -4563,6 +4620,14 @@ function cmdCheck(dir, flags = []) {
   if (dayCounts.length > 0) {
     fail(
       `Day counts rounded up with Math.ceil in: ${dayCounts.join(', ')} — across a DST fall-back the day between two local midnights is 25h, so the count is one too many. Use Math.round on the difference between two local midnights (project-standards § Locale & Date Formatting)`,
+    );
+  }
+  const renderToday = renderTodayFindings(dir);
+  if (renderToday.length > 0) {
+    fail(
+      `"Today" read once at render with nothing subscribed to the date in: ${renderToday.join(', ')} — an app left open overnight keeps showing yesterday until the view remounts. ` +
+        `Take the date from a hook that rechecks on focus and once a minute (a useToday hook: state set from today's date, rechecked on window focus, visibilitychange and a one-minute interval), or subscribe once in src/App. ` +
+        `Where a stale date is harmless (a form default that remounts on open), add // policy:today-ok on the line (project-standards § External State Must Be Subscribed)`,
     );
   }
   // Unconditional: servers also live outside server/ (monorepo apps/server,
@@ -10267,6 +10332,7 @@ module.exports = {
   helpSlugFolder,
   securitySensitiveFiles,
   dayCountFindings,
+  renderTodayFindings,
   packagedImportGaps,
   builderGlobRe,
   helpHandoffMessage,
