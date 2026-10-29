@@ -1,6 +1,6 @@
 # Build & Development Policy
 
-**Version:** 2.92
+**Version:** 2.93
 **Last updated:** 2026-10-28
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
@@ -32,7 +32,7 @@ node ../build-policy/scripts/policy.js <command>
 | Command | What it does | When it runs |
 |---|---|---|
 | `setup-machine` | Installs per-machine wiring (hook script, hooks, agents) from `machine/` | New machine, once |
-| `doctor` | Machine setup checks: tools, npmrc, hooks, agents, notary profile | New machine; troubleshooting |
+| `doctor` | Machine setup checks: tools, npmrc, hooks, agents, notary profile; everything still on a Node other than the pin (launchd agents, pm2 processes, MCP client configs) and dev servers left running for over a day | New machine; troubleshooting |
 | `check` | Project compliance: required scripts/files/configs, template drift, staleness. `--all` runs it for every project beside build-policy and prints one table | **Automatically at every session start** (Claude hook); after fixing gaps; `--all` to see the portfolio backlog |
 | `scaffold` | Creates missing standard files and scripts; never overwrites | New projects; fixing `check` gaps |
 | `sync-templates` | Overwrites the drift-checked files (ci.yml, dependabot.yml, pre-commit, AGENTS.md, .nvmrc) from the templates and resets the two secret-scan scripts to the standard, one project per run. Not a destructive action: it is the sanctioned fix, gated like any change | When `check` reports template drift or a drifted secret-scan script |
@@ -152,6 +152,7 @@ Root commit exception: CodeRabbit cannot review before HEAD exists, so the initi
 | Dependency health: outdated, audit, a Socket score due for risk-flagged packages (dormant, deprecated, archived, under 1,000 weekly downloads) | `policy health`; `check` flags every session once >30 days overdue |
 | Every project is measured on a timeline, opened or not; retired projects are marked archived rather than failing forever | `policy health --all` sweeps every sibling project and records `.policy/health-sweep.json`; the launchd job from `setup-machine` runs it on the 1st of each month (`doctor` checks it is loaded); the policy repo's `check` WARNs on a stale sweep or failing projects; `"policy": {"archived": true}` skips maintenance checks and the sweep |
 | Dependencies refreshed before feature work, advisories a patch bump clears fixed the same day, Dependabot kept below its cap | `check` runs a cached daily probe: drift past the limit AND the window FAILs (blocks gates), either alone WARNs; fixable high/critical advisories WARN with `npm audit fix`; superseded Dependabot PRs WARN with the `gh pr close` command, reviewed PRs still open WARN with their verdict until the developer merges or closes them, and the open-PR cap WARNs |
+| A Node upgrade reaches everything that recorded the old Node: the health-sweep and pm2 launchd agents, running pm2 processes, and MCP client configs, each of which stores a versioned nvm path. Removing the old Node before these move breaks them with no error | `doctor` FAILs a recorded Node that is no longer installed and WARNs one that is not the pin, with the fix for each. It also WARNs dev and preview servers running for over a day, which keep their Node in use. Remove an old Node only once `doctor` lists nothing on it |
 | Homebrew installs verify bottle attestations, refuse insecure redirects and require cask checksums | `~/.homebrew/brew.env` written by `setup-machine`; `doctor` FAILs a missing setting, `HOMEBREW_NO_VERIFY_ATTESTATIONS`, or a signed-out `gh`; PreToolUse refuses `brew install`/`upgrade`/`reinstall`/`bundle` while attestation checks are off |
 | Tooling currency: model IDs, action versions, tool choices re-verified on schedule | `registry.json` verified-dates; `check`/`health` flag stale entries — then web-search, update, propagate; `check` WARNs per project on AI model IDs that drift from the registry |
 | Claude responses read by content-block type, so a thinking-by-default model cannot break parsing | `check` FAILs `content[0].text` in a project that names a thinking-by-default model (Sonnet 5, Opus 5/5.5, Fable, Mythos) and WARNs on it anywhere else |

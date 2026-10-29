@@ -1873,3 +1873,42 @@ test('appendReport: a header inside a body cannot forge a report', () => {
     [['R-1', null]],
   );
 });
+
+test('nvmNodePathFindings: old and missing nvm Node paths, PATH lists split', () => {
+  const have = new Set([
+    '/u/.nvm/versions/node/v24.22.1/bin/npx',
+    '/u/.nvm/versions/node/v24.20.0/bin/node',
+  ]);
+  const text = [
+    '"command": "/u/.nvm/versions/node/v24.22.1/bin/npx",',
+    '<string>/u/.nvm/versions/node/v24.20.0/bin/node</string>',
+    '<string>/opt/bin:/u/.nvm/versions/node/v24.18.0/bin:/usr/bin</string>',
+    '"x": "sk-ABC/u/.nvm/versions/node/v24.10.0/bin/node?key=SECRET"',
+  ].join('\n');
+  assert.deepEqual(
+    policy.nvmNodePathFindings(text, '24.22.1', (p) => have.has(p)),
+    [
+      { path: '/u/.nvm/versions/node/v24.20.0/bin/node', version: '24.20.0', missing: false },
+      { path: '/u/.nvm/versions/node/v24.18.0/bin', version: '24.18.0', missing: true },
+    ],
+  );
+});
+
+test('staleDevServers: astro and vite servers up for a day or more', () => {
+  const ps = [
+    '  101 3-02:11:09 node /p/help/node_modules/.bin/astro dev --json',
+    '  102    05:10 node /p/site/node_modules/.bin/astro preview',
+    '  103 1-00:00:01 node /p/app/node_modules/.bin/vite',
+    '  104 2-00:00:01 node /p/app/node_modules/.bin/vite build',
+    '  105 9-00:00:00 node server.js',
+    '  106 4-00:00:00 grep vite dev',
+    '  107 4-00:00:00 tail -f /tmp/vite',
+  ].join('\n');
+  assert.deepEqual(
+    policy.staleDevServers(ps).map((s) => [s.pid, s.days]),
+    [
+      [101, 3],
+      [103, 1],
+    ],
+  );
+});

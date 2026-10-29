@@ -2426,7 +2426,7 @@ function auditElectronBundledNode(dir) {
     : '';
   const rest = (reach) =>
     cmpSemver(reach, gap.security[gap.security.length - 1]) < 0
-      ? ` No stable Electron carries ${gap.security[gap.security.length - 1]} yet; recheck before shipping.`
+      ? ` No stable Electron carries ${gap.security[gap.security.length - 1]} yet; recheck before shipping. Until then, send the main process's outbound HTTP through Electron's net.fetch, which uses Chromium's network stack rather than Node's (project-standards § Electron Desktop Apps).`
       : '';
   if (gap.sameMajor)
     fail(
@@ -8772,6 +8772,52 @@ function brewAttestationsOn(settings) {
 
 // ------------------------------------------------------------------ doctor
 
+/**
+ * Versioned nvm Node paths recorded in a file (a launchd plist, an MCP client
+ * config). Each is judged against the pinned version: `missing` when the
+ * folder is gone (the job or server is already broken, and launchd and the
+ * clients say nothing), `old` when it still exists but is not the pin (it
+ * breaks the day that version is removed). Reports R-30 and R-35: after the
+ * 24.20.0 -> 24.22.1 upgrade the health sweep, pm2's startup agent and two
+ * MCP client configs all still named the old Node.
+ */
+// Path characters only, starting at a boundary, so a token beside a path in
+// a config is never part of the capture.
+const NVM_NODE_PATH_RE =
+  /(?:^|[\s"'=:(>])(\/[\w.\/-]*\/\.nvm\/versions\/node\/v(\d+\.\d+\.\d+)(?:\/[\w.\/-]*)?)/g;
+function nvmNodePathFindings(text, want, existsFn = exists) {
+  const seen = new Map();
+  for (const m of String(text || '').matchAll(NVM_NODE_PATH_RE)) {
+    const [, p, version] = m;
+    if (seen.has(p)) continue;
+    const missing = !existsFn(p);
+    if (missing || version !== want) seen.set(p, { path: p, version, missing });
+  }
+  return [...seen.values()];
+}
+
+/**
+ * Dev and preview servers left running for over a day (report R-31). A
+ * session that starts `astro dev` or `vite` and ends without stopping it
+ * leaves a process that holds its port and keeps the Node it started on in
+ * use, which blocks removing that Node. `ps -o etime` shows days as `d-`.
+ */
+const DEV_SERVER_RE =
+  /node_modules\/[\w.\/-]*?\b(astro|vite)(?:\.m?js)?(?:\s+(dev|preview)\b|\s*$)/;
+function staleDevServers(psOut) {
+  return String(psOut || '')
+    .split('\n')
+    .map((l) => /^\s*(\d+)\s+(\S+)\s+(.*)$/.exec(l))
+    .map((m) => m && m[2].includes('-') && [m, DEV_SERVER_RE.exec(m[3])])
+    .filter((x) => x && x[1])
+    .map(([m, d]) => ({
+      pid: Number(m[1]),
+      days: parseInt(m[2], 10),
+      // Tool and mode only: a full command line can carry an argument secret.
+      what: `${d[1]} ${d[2] || 'dev'}`,
+    }));
+}
+
 function cmdDoctor() {
   section('Machine setup (policy doctor)');
   guardLocalPath(POLICY_ROOT);
@@ -8937,19 +8983,118 @@ function cmdDoctor() {
       warn(`Monthly health sweep not installed (${SWEEP_LABEL}) — run: policy setup-machine`);
     else if (!sweepLoaded())
       warn(`Monthly health sweep written but not loaded in launchd — run: policy setup-machine`);
-    else {
-      // The plist pins the node binary that ran setup-machine (under nvm, a
-      // versioned path), so a Node upgrade leaves the job pointing at nothing
-      // and launchd reports it loaded all the same.
-      const prog = /<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]+)<\/string>/.exec(
-        readFile(sweepPlistPath()),
-      );
-      if (prog && !exists(prog[1]))
-        warn(
-          `Monthly health sweep points at ${prog[1]}, which no longer exists — run: policy setup-machine`,
+    else ok(`Monthly health sweep scheduled (${SWEEP_LABEL})`);
+  }
+
+  // Everything that recorded the Node it was set up with. A launchd job and an
+  // MCP client config each keep a versioned nvm path, so a Node upgrade leaves
+  // them on the old version, and removing that version breaks them with no
+  // error anywhere. Before removing an old Node, this list must be empty of it.
+  if (wantNode && wantNode.value) {
+    const home = os.homedir();
+    const recorded = [
+      ['Monthly health sweep (launchd)', sweepPlistPath(), 'policy setup-machine'],
+      [
+        'pm2 startup agent (launchd)',
+        path.join(home, 'Library', 'LaunchAgents', `pm2.${os.userInfo().username}.plist`),
+        'pm2 unstartup launchd, then pm2 startup and run the command it prints',
+      ],
+      [
+        'Claude Desktop MCP config',
+        path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json'),
+        "re-run that MCP server's install command",
+      ],
+      [
+        'Codex / ChatGPT MCP config',
+        path.join(home, '.codex', 'config.toml'),
+        "re-run that MCP server's install command",
+      ],
+      [
+        'Claude Code MCP config',
+        path.join(home, '.claude.json'),
+        "re-run that MCP server's install command",
+      ],
+    ];
+    // ~/.claude.json also holds permission rules and project history, whose
+    // paths are not servers: read only its MCP server entries.
+    const mcpOnly = (file) => {
+      if (path.basename(file) !== '.claude.json') return readFile(file);
+      const j = readJSON(file) || {};
+      return JSON.stringify([
+        j.mcpServers || {},
+        ...Object.values(j.projects || {}).map((p) => (p && p.mcpServers) || {}),
+      ]);
+    };
+    let stale = 0;
+    for (const [label, file, fix] of recorded) {
+      if (!exists(file)) continue;
+      for (const f of nvmNodePathFindings(mcpOnly(file), wantNode.value)) {
+        stale++;
+        (f.missing ? fail : warn)(
+          f.missing
+            ? `${label} runs Node ${f.version}, which is no longer installed (${f.path}), so it fails without a message — ${fix}`
+            : `${label} still runs Node ${f.version}, not the pinned ${wantNode.value}; it breaks when ${f.version} is removed — ${fix}`,
         );
-      else ok(`Monthly health sweep scheduled (${SWEEP_LABEL})`);
+      }
     }
+    // pm2 keeps the Node each process started on until it is restarted with
+    // a fresh environment; `pm2 update` alone kept the old PATH (R-30).
+    // Only a running daemon is asked: `pm2 jlist` starts one otherwise.
+    const pm2Pid = Number(readFile(path.join(os.homedir(), '.pm2', 'pm2.pid')).trim());
+    let pm2Up = false;
+    try {
+      pm2Up = pm2Pid > 0 && process.kill(pm2Pid, 0);
+    } catch {
+      pm2Up = false;
+    }
+    if (pm2Up && sh('command -v pm2').ok) {
+      const jl = require('child_process').spawnSync('pm2', ['jlist'], {
+        encoding: 'utf8',
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      const line = String(jl.stdout || '')
+        .split('\n')
+        .find((l) => l.startsWith('[{') || l.trim() === '[]');
+      let procs = [];
+      try {
+        procs = JSON.parse(line || '[]') || [];
+      } catch {
+        /* pm2 printed no list */
+      }
+      if (!line)
+        warn('pm2 is running but printed no process list — pm2 processes were not checked');
+      const old = procs.filter(
+        (p) =>
+          p && p.pm2_env && p.pm2_env.node_version && p.pm2_env.node_version !== wantNode.value,
+      );
+      if (old.length > 0) {
+        stale++;
+        warn(
+          `${old.length} pm2 process(es) still run an old Node (${[...new Set(old.map((p) => p.pm2_env.node_version))].join(', ')}): ${old
+            .slice(0, 5)
+            .map((p) => p.name)
+            .join(
+              ', ',
+            )}${old.length > 5 ? ', …' : ''} — run: pm2 restart all --update-env && pm2 save`,
+        );
+      }
+    }
+    if (stale === 0)
+      ok(`Launchd agents, pm2 and MCP client configs all run the pinned Node ${wantNode.value}`);
+  }
+
+  if (process.platform === 'darwin' || process.platform === 'linux') {
+    const servers = staleDevServers(sh('ps -Ao pid=,etime=,command=').out);
+    if (servers.length > 0)
+      warn(
+        `${servers.length} dev/preview server(s) running for over a day: ${servers
+          .slice(0, 5)
+          .map((s) => `${s.what} (pid ${s.pid}, ${s.days} d)`)
+          .join(
+            '; ',
+          )} — they hold their ports and keep the Node they started on in use. Stop the ones no session needs: kill ${servers.map((s) => s.pid).join(' ')}`,
+      );
+    else ok('No dev or preview server left running for over a day');
   }
 
   const agentsDir = path.join(os.homedir(), '.claude', 'agents');
@@ -10544,6 +10689,8 @@ module.exports = {
   dayCountFindings,
   renderTodayFindings,
   utcTodayFindings,
+  nvmNodePathFindings,
+  staleDevServers,
   routeReport,
   reviewTimeText,
   packagedImportGaps,
