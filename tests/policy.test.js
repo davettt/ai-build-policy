@@ -454,6 +454,16 @@ test('releaseBump / marketingStep: the marketing step is a question, with a reco
   for (const b of ['patch', 'minor', 'major', null]) assert.match(policy.marketingStep(b), /marketing/i);
 });
 
+test('pre-commit template: finds build-policy via git, and localizes and reads back for a deeper project', () => {
+  const tpl = fs.readFileSync(path.join(ROOT, 'templates', 'pre-commit'), 'utf8');
+  assert.match(tpl, /POLICY="\$\(git rev-parse --git-common-dir\)\/\.\.\/\.\.\/build-policy\/scripts\/policy\.js"/);
+  assert.doesNotMatch(tpl, /^\s*node \.\.\/build-policy/m);
+  const deep = path.join(PARENT, 'clients', 'acme', 'app');
+  const local = policy.localizePolicyPath(tpl, deep);
+  assert.match(local, /git-common-dir\)\/\.\.\/\.\.\/\.\.\/\.\.\/build-policy\/scripts\/policy\.js/);
+  assert.equal(policy.canonicalPolicyPath(local, deep), tpl);
+});
+
 test('GATE_ORDER: the code review is the last gate, after build and every test tier', () => {
   const { GATE_ORDER } = policy;
   const scripts = GATE_ORDER.map((g) => g.script);

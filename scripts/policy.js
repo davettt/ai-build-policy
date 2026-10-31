@@ -2167,7 +2167,10 @@ function auditPolicyRepo(root) {
   // as the policy repo was absent, which skipped the staged secret scan on
   // every machine but the developer's (found in an app
   // session, 2026-10-16). The early-exit branch must name the scan.
-  for (const needle of ['leak-scan', 'verify-marker', 'gates --fast', 'secrets:staged']) {
+  // git-common-dir: the hook finds build-policy from the main checkout, so a
+  // commit from an agent worktree runs the gates instead of taking the
+  // no-policy-repo exit (2.96).
+  for (const needle of ['leak-scan', 'verify-marker', 'gates --fast', 'secrets:staged', 'git rev-parse --git-common-dir']) {
     if (preCommit.includes(needle)) ok(`pre-commit template includes ${needle}`);
     else fail(`pre-commit template missing ${needle}`);
   }
@@ -10795,6 +10798,8 @@ module.exports = {
   TEMPLATE_SYNC_HINT,
   secretScriptSyncs,
   policyScriptSyncs,
+  localizePolicyPath,
+  canonicalPolicyPath,
   releaseBump,
   marketingStep,
   pruneResolvedStale,

@@ -4,19 +4,23 @@
 # without the staged secret scan: a leaked key is a leak on any machine. betterleaks is a brew
 # install; where it is absent the scan is skipped rather than failed, so the hook never blocks
 # a machine that cannot run it.
-if [ ! -f ../build-policy/scripts/policy.js ]; then
+# build-policy is found from the main checkout's .git, not the current directory: in an agent
+# worktree (.claude/worktrees/<name>) "../build-policy" does not exist, and the hook took the
+# no-policy-repo exit and committed without the gates.
+POLICY="$(git rev-parse --git-common-dir)/../../build-policy/scripts/policy.js"
+if [ ! -f "$POLICY" ]; then
   if command -v betterleaks >/dev/null 2>&1 && grep -q '"secrets:staged"' package.json; then
     npm run --silent secrets:staged || exit 1
   fi
   exit 0
 fi
-node ../build-policy/scripts/policy.js leak-scan || exit 1
+node "$POLICY" leak-scan || exit 1
 
 # Full gates must have passed on this exact tree before any source commit
-node ../build-policy/scripts/policy.js verify-marker || exit 1
-node ../build-policy/scripts/policy.js gates --fast || {
+node "$POLICY" verify-marker || exit 1
+node "$POLICY" gates --fast || {
   echo ""
   echo "Pre-commit gates failed. Fix the issues above, or run:"
-  echo "  node ../build-policy/scripts/policy.js gates --fast"
+  echo "  node $POLICY gates --fast"
   exit 1
 }
