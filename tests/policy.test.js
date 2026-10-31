@@ -441,6 +441,19 @@ test('pruneResolvedStale: drops entries deps-update applied, keeps ones still be
   assert.deepEqual(policy.pruneResolvedStale(undefined, listing), []);
 });
 
+test('releaseBump / marketingStep: the marketing step is a question, with a recommendation from the bump', () => {
+  assert.equal(policy.releaseBump('1.4.2', '1.4.3'), 'patch');
+  assert.equal(policy.releaseBump('v1.4.2', '1.5.0'), 'minor');
+  assert.equal(policy.releaseBump('1.4.2', '2.0.0'), 'major');
+  assert.equal(policy.releaseBump('1.4.2', '1.4.2'), null);
+  assert.equal(policy.releaseBump('1.5.0', '1.4.9'), null);
+  assert.equal(policy.releaseBump(null, '1.0.0'), null);
+  assert.match(policy.marketingStep('patch'), /ask the developer.*recommend skipping/);
+  assert.match(policy.marketingStep('minor'), /ask the developer.*recommend drafts/);
+  assert.match(policy.marketingStep(null), /ask the developer/);
+  for (const b of ['patch', 'minor', 'major', null]) assert.match(policy.marketingStep(b), /marketing/i);
+});
+
 test('GATE_ORDER: the code review is the last gate, after build and every test tier', () => {
   const { GATE_ORDER } = policy;
   const scripts = GATE_ORDER.map((g) => g.script);
@@ -902,7 +915,7 @@ test('helpPagesStatus: pages are read from the app side by slug or source, pendi
   assert.match(handoff, /docs:capture in \.\.\/app-one/);
   const back = policy.helpHandbackMessage('app-one', '2.1.0', s, today, 'helpsite', 'abc1234');
   assert.match(back, /^Help pages ready for app-one 2\.1\.0/);
-  assert.match(back, /verify-ready --release, then prep the release marketing drafts/);
+  assert.match(back, /verify-ready --release, then ask the developer whether they want release marketing drafts/);
   fs.rmSync(parent, { recursive: true, force: true });
 });
 

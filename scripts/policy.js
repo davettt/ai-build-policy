@@ -6795,6 +6795,44 @@ function cmdVerifyReady(dir, flags) {
 // but is not distributed yet, so there is nothing to upload and no site version
 // to compare a banner against. `internal` covers everything with no DMG at all:
 // PM2 web apps, CLIs, libraries.
+// Marketing drafts are the developer's call per release: a security or bug
+// fix rarely needs posts, and the step used to say "prepped" for every
+// release, so sessions wrote drafts for patch releases nobody wanted
+// (2026-11-01). verify-ready replaces this line with the question to ask and
+// a recommendation from the version bump (marketingStep).
+const MARKETING_STEP = 'Release marketing drafts: asked the developer whether they want them; prepped in app-marketing only if yes';
+
+/** 'major' | 'minor' | 'patch' from the previous release to this one, or null if unknown. */
+function releaseBump(prev, cur) {
+  const num = (v) => String(v || '').replace(/^v/, '').split(/[-+]/)[0].split('.').map((n) => parseInt(n, 10));
+  const [a, b] = [num(prev), num(cur)];
+  if (a.length < 3 || b.length < 3 || [...a, ...b].some((n) => Number.isNaN(n))) return null;
+  if (b[0] !== a[0]) return b[0] > a[0] ? 'major' : null;
+  if (b[1] !== a[1]) return b[1] > a[1] ? 'minor' : null;
+  return b[2] > a[2] ? 'patch' : null;
+}
+
+/** The checklist's marketing line for this release, with the recommendation the AI asks with. */
+function marketingStep(bump) {
+  const ask = 'Release marketing drafts: ask the developer whether they want them for this release';
+  if (bump === 'patch')
+    return `${ask} (patch release: a security or bug fix usually needs none, so recommend skipping); prep in app-marketing only if yes`;
+  if (bump === 'minor' || bump === 'major')
+    return `${ask} (${bump} release: recommend drafts for the new features); prep in app-marketing only if yes`;
+  return `${ask}; prep in app-marketing only if yes`;
+}
+
+/** The release before `version`: the newest tag that is not this version. */
+function previousReleaseVersion(dir, version) {
+  const tags = sh('git tag --list --sort=-v:refname', dir);
+  if (!tags.ok) return null;
+  const prev = tags.out
+    .split('\n')
+    .map((t) => t.trim().replace(/^v/, ''))
+    .find((t) => /^\d+\.\d+\.\d+/.test(t) && t !== String(version) && releaseBump(t, version));
+  return prev || null;
+}
+
 const RELEASE_CHECKLISTS = {
   gumroad: [
     'Installed new DMG over previous (dogfood): data migrated, settings intact, first-run + one core flow work',
@@ -6802,7 +6840,7 @@ const RELEASE_CHECKLISTS = {
     'Uploaded new DMG to Gumroad, then updated site version.json + changelog + listing',
     'Settings Check for updates refreshes immediately after the site update, reports up to date and clears the banner',
     'Relaunched after the site update: the automatic check on launch also shows no banner (versions match)',
-    'Release marketing drafts prepped in app-marketing',
+    MARKETING_STEP,
   ],
   none: [
     'Installed new DMG over previous (dogfood): data migrated, settings intact, first-run + one core flow work',
@@ -7073,7 +7111,7 @@ function helpHandbackMessage(app, version, status, lastVerified, helpProject, co
     `Help pages ready for ${app} ${version}: ${status.pages.length} page(s) verified against ` +
     `${status.verified.join(', ')} (last verified ${lastVerified || 'n/a'}), pages and screenshots committed in ` +
     `${helpProject} at ${commit}. The help step of the release checklist now passes: run ` +
-    `node ../build-policy/scripts/policy.js verify-ready --release, then prep the release marketing drafts in app-marketing.`
+    `node ../build-policy/scripts/policy.js verify-ready --release, then ask the developer whether they want release marketing drafts (its checklist gives the recommendation).`
   );
 }
 
@@ -7326,6 +7364,13 @@ function verifyRelease(dir, proj, flags) {
   const help = helpPagesStatus(dir);
   const helpPending = !!(help && help.pending.length);
   const checklist = [...RELEASE_CHECKLISTS[profile]];
+  {
+    const at = checklist.indexOf(MARKETING_STEP);
+    if (at !== -1)
+      checklist[at] = marketingStep(
+        releaseBump(previousReleaseVersion(dir, proj.pkg.version), proj.pkg.version),
+      );
+  }
   if (help && help.pages.length) {
     const step = helpPending
       ? `Help pages brought up to date in the help site session (${help.pending.length} pending; paste its hand-back message here before the marketing drafts)`
@@ -10229,7 +10274,7 @@ function cmdHookPretool() {
               `BUILD-POLICY: help screenshots and pages are the ${helpProject} session's work, not this session's. ` +
               'Do not run docs:capture here. Run `node ../build-policy/scripts/policy.js verify-ready --release`: it prints the ' +
               `hand-off for the developer to paste into a ${helpProject} session, and that session hands back a message ` +
-              'to paste here when the pages are current. Then the marketing drafts follow.',
+              'to paste here when the pages are current. Then ask the developer whether they want release marketing drafts.',
           },
         }),
       );
@@ -10750,6 +10795,8 @@ module.exports = {
   TEMPLATE_SYNC_HINT,
   secretScriptSyncs,
   policyScriptSyncs,
+  releaseBump,
+  marketingStep,
   pruneResolvedStale,
   repoHasNoCommits,
   offTrunkBranch,
