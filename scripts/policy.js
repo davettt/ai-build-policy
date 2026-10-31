@@ -4578,6 +4578,17 @@ function cmdCheck(dir, flags = []) {
       );
   }
 
+  // Policy-path scripts: the pre-2.94 form resolves "../build-policy" from the
+  // current directory and fails in an agent worktree. A WARN, not a FAIL: the
+  // old form still works in the main checkout.
+  {
+    const drift = Object.keys(policyScriptSyncs(scripts, dir)).filter((n) => scripts[n]);
+    if (drift.length > 0)
+      warn(
+        `${drift.join(', ')} script(s) differ from the standard — the old "../build-policy" form fails inside agent worktrees (.claude/worktrees/). Standard: "${localizePolicyPath(STANDARD_SCRIPTS[drift[0]], dir)}" — ${TEMPLATE_SYNC_HINT}`,
+      );
+  }
+
   // Review gate scope — the CLI default reviews tracked changes only, so a gate
   // run before staging (the normal order) never saw new files at all.
   if (scripts.review && !scripts.review.includes('--include-untracked')) {
@@ -5975,6 +5986,19 @@ function cmdGates(dir, flags) {
       for (const f of failures) console.log(`  ${RED}✗${RESET} ${f}`);
       console.log(`\nFix, then re-run: policy gates\n`);
       process.exit(1);
+    }
+    // build-policy's pre-commit hook blocks on the public mirror check, and
+    // gates did not run it, so mirror drift surfaced only when the developer
+    // tried to commit work a session had called ready (2026-10-31). Run the
+    // same check here, as its own process, so gates fails where the hook would.
+    if (path.resolve(dir) === POLICY_ROOT) {
+      const m = sh(`node ${JSON.stringify(path.join(POLICY_ROOT, 'scripts', 'policy.js'))} mirror`, POLICY_ROOT);
+      if (!m.ok) {
+        console.log(`\n${RED}${BOLD}Gate failed: public mirror check (the pre-commit hook would block).${RESET}`);
+        for (const l of m.out.split('\n').filter((l) => l.includes('✗'))) console.log(l);
+        console.log(`\nSync with: policy mirror-sync (then the hand-written parts), re-run: policy gates\n`);
+        process.exit(1);
+      }
     }
     const files = changedFiles(dir)
       .filter((f) => !f.startsWith('.policy/'))
@@ -7478,6 +7502,27 @@ function verifyRelease(dir, proj, flags) {
  * needs a range change. `current !== wanted` is reachable by `npm update`;
  * anything else is a major and goes through `policy upgrade <pkg>`.
  */
+/** `npm outdated --json` parsed, or null when its output is unreadable. */
+function npmOutdatedListing(dir) {
+  try {
+    return JSON.parse(sh('npm outdated --json', dir).out || '{}');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Recorded stale entries ("name a.b.c -> x.y.z (Nd old)") that still apply:
+ * the package is still listed by npm outdated and behind its wanted version.
+ */
+function pruneResolvedStale(recorded, listing) {
+  return (recorded || []).filter((entry) => {
+    const name = /^(\S+) /.exec(String(entry || ''));
+    const info = name && (listing || {})[name[1]];
+    return !!info && behindWanted(info.current, info.wanted);
+  });
+}
+
 function outdatedSplit(dir) {
   const raw = sh('npm outdated --json', dir);
   let list = {};
@@ -7756,6 +7801,23 @@ function cmdDepsUpdate(dir) {
 
   const state = loadState(dir);
   state.lastDepsUpdate = new Date().toISOString();
+  // Drop the overdue updates health recorded that this run applied. Only health
+  // wrote staleDeps, so check kept FAILing "run: policy deps-update" after it
+  // had run (report R-46). No network: an entry stays while its package is
+  // still behind its range, and nothing is dropped if npm outdated is unreadable.
+  if (Array.isArray(state.staleDeps) && state.staleDeps.length > 0) {
+    const listing = npmOutdatedListing(dir);
+    if (listing) {
+      const before = state.staleDeps.length;
+      state.staleDeps = pruneResolvedStale(state.staleDeps, listing);
+      const cleared = before - state.staleDeps.length;
+      if (cleared > 0) ok(`${cleared} overdue update(s) recorded by health now applied — cleared`);
+      if (state.staleDeps.length > 0)
+        warn(
+          `${state.staleDeps.length} overdue update(s) still behind: ${state.staleDeps.slice(0, 4).join('; ')} — usually a transitive pin; check FAILs until they move`,
+        );
+    }
+  }
   saveState(dir, state);
 
   if (inRange.length > 0) {
@@ -8080,8 +8142,14 @@ const STANDARD_SCRIPTS = {
   // root is stripped directly. `.` is the project's own entry.
   'licenses:file':
     'license-checker --production --relativeLicensePath | sed -e "s|$PWD/||g" -e "s|$PWD|.|g" > THIRD-PARTY-LICENSES.txt',
-  'deps:check': 'node ../build-policy/scripts/check-allowlist.js .',
-  'deps:verify': 'node ../build-policy/scripts/verify-package.js',
+  // build-policy is found from the main checkout's .git, not the current
+  // directory. In an agent worktree (.claude/worktrees/<name>) "../build-policy"
+  // is some other folder, so every dependabot-reviewer run with worktree
+  // isolation failed deps:check (reports R-21, R-36, R-45). git prints ".git"
+  // in the main checkout, so the path is the old "../build-policy" there, and
+  // the main checkout's absolute .git in a worktree.
+  'deps:check': 'node "$(git rev-parse --git-common-dir)/../../build-policy/scripts/check-allowlist.js" .',
+  'deps:verify': 'node "$(git rev-parse --git-common-dir)/../../build-policy/scripts/verify-package.js"',
   // --include-untracked is load-bearing: the CLI's default reviews TRACKED
   // changes only, and gates run before staging, so every brand-new file went
   // through the review gate unseen — the files most in need of review were the
@@ -8328,6 +8396,17 @@ function secretScriptSyncs(scripts) {
   return out;
 }
 
+/** The standard scripts that run a build-policy script, localized to the project. */
+const POLICY_PATH_SCRIPTS = ['deps:check', 'deps:verify'];
+function policyScriptSyncs(scripts, dir) {
+  const out = {};
+  for (const name of POLICY_PATH_SCRIPTS) {
+    const want = localizePolicyPath(STANDARD_SCRIPTS[name], dir);
+    if ((scripts || {})[name] !== want) out[name] = want;
+  }
+  return out;
+}
+
 function cmdSyncTemplates(dir) {
   guardLocalPath(dir);
   if (path.resolve(dir) === POLICY_ROOT) {
@@ -8366,7 +8445,7 @@ function cmdSyncTemplates(dir) {
   const pkgPath = path.join(dir, 'package.json');
   const pkg = readJSON(pkgPath);
   if (pkg) {
-    const syncs = secretScriptSyncs(pkg.scripts);
+    const syncs = { ...secretScriptSyncs(pkg.scripts), ...policyScriptSyncs(pkg.scripts, dir) };
     for (const [name, cmd] of Object.entries(syncs)) {
       pkg.scripts = pkg.scripts || {};
       pkg.scripts[name] = cmd;
@@ -10670,6 +10749,8 @@ module.exports = {
   SECRET_SCAN_LEAKY_FLAG_RE,
   TEMPLATE_SYNC_HINT,
   secretScriptSyncs,
+  policyScriptSyncs,
+  pruneResolvedStale,
   repoHasNoCommits,
   offTrunkBranch,
   semverGte,

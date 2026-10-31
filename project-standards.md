@@ -1,7 +1,7 @@
 # Project Standards
 
-**Version:** 2.93
-**Last updated:** 2026-10-28
+**Version:** 2.94
+**Last updated:** 2026-10-31
 
 Reference material for consistent project setup and development — stack choices, security rules, and file templates. The workflow these standards operate within is `BUILD-POLICY.md`; the machinery that enforces them is `scripts/policy.js`. Nothing in this document needs to be memorised to stay compliant — `policy check` verifies the checkable parts.
 
@@ -581,8 +581,8 @@ These are the ONLY sanctioned global exclusions (`check` FAILs any other). Anyth
   "secrets:staged": "betterleaks git --staged --redact",
   "licenses": "license-checker --production --failOn 'GPL-2.0;GPL-3.0;AGPL-1.0;AGPL-3.0' --summary",
   "licenses:file": "license-checker --production --relativeLicensePath | sed -e \"s|$PWD/||g\" -e \"s|$PWD|.|g\" > THIRD-PARTY-LICENSES.txt",
-  "deps:check": "node ../build-policy/scripts/check-allowlist.js .",
-  "deps:verify": "node ../build-policy/scripts/verify-package.js",
+  "deps:check": "node \"$(git rev-parse --git-common-dir)/../../build-policy/scripts/check-allowlist.js\" .",
+  "deps:verify": "node \"$(git rev-parse --git-common-dir)/../../build-policy/scripts/verify-package.js\"",
   "review": "coderabbit review --agent",
   "validate": "npm run lint && npm run lint:html && npm run lint:css && npm run format:check && npm run type-check",
   "quality": "npm run validate && npm run sast && npm run security && npm run secrets && npm run licenses && npm run deps:check && npm run review",
@@ -1193,8 +1193,8 @@ node ../build-policy/scripts/bootstrap-allowlist.js .    # Generate initial allo
 **Standard package.json scripts:**
 ```json
 {
-  "deps:check": "node ../build-policy/scripts/check-allowlist.js .",
-  "deps:verify": "node ../build-policy/scripts/verify-package.js"
+  "deps:check": "node \"$(git rev-parse --git-common-dir)/../../build-policy/scripts/check-allowlist.js\" .",
+  "deps:verify": "node \"$(git rev-parse --git-common-dir)/../../build-policy/scripts/verify-package.js\""
 }
 ```
 

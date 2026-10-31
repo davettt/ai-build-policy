@@ -406,6 +406,41 @@ test('secretScriptSyncs: rewrites a drifted or missing secret-scan script, leave
   });
 });
 
+test('policyScriptSyncs: deps scripts find build-policy from git, localized to the project', () => {
+  const std = policy.STANDARD_SCRIPTS;
+  for (const n of ['deps:check', 'deps:verify'])
+    assert.match(std[n], /^node "\$\(git rev-parse --git-common-dir\)\/\.\.\/\.\.\/build-policy\/scripts\//);
+  const sibling = path.join(PARENT, 'some-app');
+  assert.deepEqual(
+    policy.policyScriptSyncs({ 'deps:check': std['deps:check'], 'deps:verify': std['deps:verify'] }, sibling),
+    {},
+  );
+  assert.deepEqual(
+    policy.policyScriptSyncs(
+      { 'deps:check': 'node ../build-policy/scripts/check-allowlist.js .', 'deps:verify': std['deps:verify'] },
+      sibling,
+    ),
+    { 'deps:check': std['deps:check'] },
+  );
+  const deep = path.join(PARENT, 'clients', 'acme', 'app');
+  const out = policy.policyScriptSyncs({}, deep);
+  assert.equal(
+    out['deps:check'],
+    'node "$(git rev-parse --git-common-dir)/../../../../build-policy/scripts/check-allowlist.js" .',
+  );
+});
+
+test('pruneResolvedStale: drops entries deps-update applied, keeps ones still behind (R-46)', () => {
+  const recorded = ['a 1.0.0 -> 1.2.0 (40d old)', 'b 2.0.0 -> 2.0.5 (35d old)', 'c 3.0.0 -> 3.1.0 (31d old)'];
+  const listing = {
+    b: { current: '2.0.0', wanted: '2.0.5', latest: '2.0.5' },
+    c: { current: '3.1.0', wanted: '3.1.0', latest: '4.0.0' },
+  };
+  assert.deepEqual(policy.pruneResolvedStale(recorded, listing), ['b 2.0.0 -> 2.0.5 (35d old)']);
+  assert.deepEqual(policy.pruneResolvedStale(recorded, {}), []);
+  assert.deepEqual(policy.pruneResolvedStale(undefined, listing), []);
+});
+
 test('GATE_ORDER: the code review is the last gate, after build and every test tier', () => {
   const { GATE_ORDER } = policy;
   const scripts = GATE_ORDER.map((g) => g.script);
