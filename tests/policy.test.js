@@ -154,6 +154,25 @@ test('gated files: dependency manifests and source, not docs or tests', () => {
   assert.equal(policy.isSourceFile('tests/smoke.js'), false);
 });
 
+test('binary assets are not source, so a content-only diff skips the reviewer', () => {
+  assert.equal(policy.isSourceFile('src/content/ideas/post/featured_image.jpg'), false);
+  assert.equal(policy.isSourceFile('src/content/ideas/post/index.md'), false);
+  assert.equal(policy.isSourceFile('public/img/shot.PNG'), false);
+  assert.equal(policy.isSourceFile('public/fonts/inter.woff2'), false);
+  // SVG can carry script, so it stays source
+  assert.equal(policy.isSourceFile('public/logo.svg'), true);
+  assert.equal(policy.isSourceFile('src/pages/index.astro'), true);
+  assert.equal(policy.isSourceFile('src/App.tsx'), true);
+});
+
+test('release sign-off refuses the site and help projects, which publish a release', () => {
+  const reg = { siteProject: 'the-site', helpProject: 'the-help' };
+  assert.equal(policy.publishingProject('/x/the-site', reg), 'the-site');
+  assert.equal(policy.publishingProject('/x/the-help/', reg), 'the-help');
+  assert.equal(policy.publishingProject('/x/some-app', reg), null);
+  assert.equal(policy.publishingProject('/x/some-app', {}), null);
+});
+
 test('model regexes: thinking-off detection and the models that reject it', () => {
   assert.match("thinking: { type: 'disabled' }", policy.THINKING_DISABLED_RE);
   assert.doesNotMatch("type: 'adaptive'", policy.THINKING_DISABLED_RE);

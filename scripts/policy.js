@@ -470,8 +470,14 @@ const SOURCE_PATTERNS = [
   /^styles\//,
   /\.(js|ts|tsx|jsx|css|html)$/,
 ];
+// Binary assets are not code even under src/ or public/: a post's featured
+// image matched /^src\// and sent a content-only commit to the paid reviewer,
+// which cannot read an image anyway (2.97). SVG is left off this list on
+// purpose: it can carry script, so it stays source.
+const ASSET_FILE = /\.(png|jpe?g|gif|webp|avif|ico|icns|woff2?|ttf|otf|eot|mp3|mp4|m4a|wav|webm|mov|pdf)$/i;
 function isSourceFile(f) {
   if (/^tests?\//.test(f) || f === 'CHANGELOG.md' || f.endsWith('.md')) return false;
+  if (ASSET_FILE.test(f)) return false;
   return SOURCE_PATTERNS.some((re) => re.test(f));
 }
 
@@ -542,9 +548,10 @@ const SECURITY_CONTENT_PATTERNS = [
   /fs\.(rm|rmSync|unlink|unlinkSync|rmdir)\b|rimraf/,
   /DELETE\s+FROM|DROP\s+TABLE/i,
 ];
-// Images, fonts and media under src/ or public/ count as source for the gates,
-// but carry no code: a screenshot named sessions-and-journeys.png is not a
-// session handler (R-3, 2026-10-17). Content pages are the same: a help page
+// Images, fonts and media carry no code: a screenshot named
+// sessions-and-journeys.png is not a session handler (R-3, 2026-10-17). Since
+// 2.97 isSourceFile drops the binary ones (ASSET_FILE); SVG, .mdx and text
+// stay source for the gates, so this list still screens them here. Content pages are the same: a help page
 // named payments-and-overdue.mdx is prose, not payment code (R-17).
 const MEDIA_ASSET =
   /\.(png|jpe?g|webp|gif|avif|svg|ico|woff2?|ttf|otf|mp4|webm|mov|mdx|markdown|txt)$/i;
@@ -6653,6 +6660,13 @@ function apiRoutes(dir) {
   return [...routes];
 }
 
+/** The project's name when it is the marketing site or the help centre (the
+ *  projects that publish a release rather than make one), else null. */
+function publishingProject(dir, reg = loadRegistry()) {
+  const here = path.basename(path.resolve(dir));
+  return [reg.siteProject, reg.helpProject].filter(Boolean).includes(here) ? here : null;
+}
+
 function cmdVerifyReady(dir, flags) {
   guardLocalPath(dir);
   const proj = detectProject(dir);
@@ -6662,6 +6676,21 @@ function cmdVerifyReady(dir, flags) {
   if (!proj.isGit) {
     fail('Not a git repository');
     return finish();
+  }
+
+  // The marketing site and the help centre publish an app's release; they do
+  // not have one. Run there, the checks below invent a 1.0.0 release, ask for
+  // a tag and a CodeRabbit pass, and fail on all of it. The checklist's last
+  // step (banner cleared) comes straight after the site push, so the site
+  // session is where the sign-off gets typed by mistake (2.97).
+  if (release) {
+    const here = publishingProject(dir);
+    if (here) {
+      fail(
+        `${here} is not an app and has no release of its own. Run verify-ready --release in the app project being released`,
+      );
+      return finish();
+    }
   }
 
   // 0. Releases are built from main. A branch is not where a shipped version
@@ -10179,7 +10208,8 @@ function cmdHookPretool() {
           permissionDecisionReason:
             "BUILD-POLICY: --ack-manual is the DEVELOPER's signature that the manual release checks were personally performed — the AI must never run it. " +
             'Show the developer the checklist and ask them to run: node ../build-policy/scripts/policy.js verify-ready --release --ack-manual ' +
-            '(they can type it with a ! prefix to run it in this session).',
+            '(they can type it with a ! prefix to run it in this session). ' +
+            'To mention the flag in a report or a doc, write the text to a file with the file tools and pass it in: policy report - < <file>.',
         },
       }),
     );
@@ -10771,6 +10801,7 @@ module.exports = {
   brewAttestationsOn,
   isSourceFile,
   isGatedFile,
+  publishingProject,
   releaseProfile,
   shippedDmgVersions,
   THINKING_DISABLED_RE,
