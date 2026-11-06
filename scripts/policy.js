@@ -47,6 +47,11 @@
  *   health [dir]        Maintenance run: outdated, audit, registry staleness; records timestamp
  *                         --all      every sibling project in turn (the monthly launchd job runs this)
  *                         --socket   include a Socket supply-chain scan (uses quota)
+ *   advisory <pkg>[@range] | <CVE|GHSA|MAL id>  Where a package is installed across every project
+ *                         and the global npm root, and whether it shipped in the last release
+ *                         --track [--note "<why>"]  record it: every project's check FAILs on a match
+ *                         --untrack <pkg> | --list   manage tracked-advisories.json
+ *                         --sweep    ask OSV.dev about every lockfile, global npm and Node (daily launchd job)
  *   upgrade <pkg>       Ground a MAJOR dependency upgrade: pull real peer-dep constraints
  *                         + migration source from npm, scaffold a decision record under
  *                         .claude/specs/deps/. check/verify-ready FAIL on an un-recorded major.
@@ -5155,6 +5160,8 @@ function checkStaleness(dir, reg) {
     ok('Archived project (package.json policy.archived): maintenance checks skipped');
     return;
   }
+  // What the daily advisory sweep found here, read from a file: no network.
+  const advisoryReported = reportAdvisories(dir);
   const state = loadState(dir);
   // Enforce the verdict health recorded, at no cost here. This is the half that
   // makes staleness bite: health does the network work and writes what it
@@ -5219,11 +5226,35 @@ function checkStaleness(dir, reg) {
       );
     }
 
-    if (refresh.fixable && refresh.fixable.length) {
-      const names = refresh.fixable.map((f) => `${f.name} (${f.severity})`);
+    const fixable = (refresh.fixable || []).filter((f) => !advisoryReported.has(f.name));
+    if (fixable.length) {
+      const names = fixable.map((f) => `${f.name} (${f.severity})`);
       warn(
-        `${refresh.fixable.length} high/critical advisor${refresh.fixable.length === 1 ? 'y' : 'ies'} with an in-range fix: ` +
+        `${fixable.length} high/critical advisor${fixable.length === 1 ? 'y' : 'ies'} with an in-range fix: ` +
           `${names.slice(0, 5).join(', ')}${names.length > 5 ? ', …' : ''} — run: npm audit fix, then gates`,
+      );
+    }
+
+    const exceptions = loadAuditExceptions(dir);
+    const excepted = (name) =>
+      Object.entries(exceptions).some(
+        ([id, e]) =>
+          e &&
+          e.package === name &&
+          e.expires >= new Date().toISOString().slice(0, 10) &&
+          auditExceptionApproved(dir, id, e),
+      );
+    const unfixed = (refresh.unfixed || []).filter(
+      (f) => !advisoryReported.has(f.name) && !excepted(f.name),
+    );
+    if (unfixed.length) {
+      const list = unfixed
+        .slice(0, 5)
+        .map((f) => `${f.name} (${f.severity}, ${f.fix ? `fix in ${f.fix}` : 'no fix yet'})`);
+      warn(
+        `${unfixed.length} high/critical advisor${unfixed.length === 1 ? 'y' : 'ies'} with no in-range fix: ` +
+          `${list.join(', ')}${unfixed.length > 5 ? ', …' : ''} — a major goes through policy upgrade <pkg>; ` +
+          `with no fix, draft a dated exception (policy approve-exception <GHSA-id>) for the developer to approve`,
       );
     }
 
@@ -7671,6 +7702,32 @@ function fixableAdvisories(audit) {
   );
 }
 
+/**
+ * The other half: high/critical advisories that `npm audit fix` cannot clear
+ * inside the declared ranges, at the package that carries the advisory (an
+ * entry whose `via` is only other package names inherits it and is left out).
+ * `fix` names the major npm proposes, or is null when no fixed version exists.
+ * These were silent at session start until gates failed on them.
+ */
+function unfixedAdvisories(audit) {
+  const out = [];
+  for (const [name, v] of Object.entries((audit && audit.vulnerabilities) || {})) {
+    if (!/^(high|critical)$/.test(v.severity)) continue;
+    if (v.fixAvailable === true) continue;
+    if (!(v.via || []).some((x) => x && typeof x === 'object')) continue;
+    const f = v.fixAvailable && typeof v.fixAvailable === 'object' ? v.fixAvailable : null;
+    out.push({
+      name,
+      severity: v.severity,
+      direct: !!v.isDirect,
+      fix: f ? `${f.name}@${f.version}${f.isSemVerMajor ? ' (major)' : ''}` : null,
+    });
+  }
+  return out.sort((a, b) =>
+    a.severity === b.severity ? a.name.localeCompare(b.name) : a.severity === 'critical' ? -1 : 1,
+  );
+}
+
 /** "Bump x from 1.2.3 to 1.2.4" -> { name, from, to }; null for group PRs and anything else. */
 function parseDependabotTitle(title) {
   const m = /^(?:build\(deps(?:-dev)?\):\s*)?[Bb]ump (\S+) from (\S+) to (\S+)/.exec(title || '');
@@ -7775,10 +7832,17 @@ function sessionRefresh(dir, state) {
     ? (Date.now() - Date.parse(state.lastRefreshProbe)) / 3600000
     : Infinity;
   if (ageHours <= 24 && state.refresh) return state.refresh;
-  const refresh = { driftCount: outdatedSplit(dir).inRange.length, fixable: [], prs: null };
+  const refresh = {
+    driftCount: outdatedSplit(dir).inRange.length,
+    fixable: [],
+    unfixed: [],
+    prs: null,
+  };
   const audit = sh('npm audit --json', dir);
   try {
-    refresh.fixable = fixableAdvisories(JSON.parse(audit.out));
+    const report = JSON.parse(audit.out);
+    refresh.fixable = fixableAdvisories(report);
+    refresh.unfixed = unfixedAdvisories(report);
   } catch {
     /* offline or non-JSON: no advisory data this time */
   }
@@ -8161,11 +8225,630 @@ function reportHealthSweep(reg) {
 }
 
 /** The launchd agent that runs the sweep monthly, from machine/health-sweep.plist. */
-function sweepPlistPath() {
-  return path.join(os.homedir(), 'Library', 'LaunchAgents', `${SWEEP_LABEL}.plist`);
+function sweepPlistPath(label = SWEEP_LABEL) {
+  return path.join(os.homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
 }
-function sweepLoaded() {
-  return sh(`launchctl print gui/${process.getuid()}/${SWEEP_LABEL}`, os.homedir()).ok;
+function sweepLoaded(label = SWEEP_LABEL) {
+  return sh(`launchctl print gui/${process.getuid()}/${label}`, os.homedir()).ok;
+}
+
+// -------------------------------------------------------------- advisories
+//
+// The session-start audit saw only the project being opened, and only
+// advisories a patch bump would clear; the monthly sweep saw every project but
+// recorded pass/fail, not which advisory. A critical published the day after a
+// sweep waited a month unless a session happened to open that project, and
+// news of a compromised package reached the developer from social feeds first.
+//
+// The daily advisory sweep (launchd, setup-machine) asks OSV.dev about every
+// package in every project's lockfile plus the global npm packages and the
+// Node runtime, and writes .policy/advisories.json. OSV carries the GitHub
+// advisories and the OpenSSF malicious-packages feed (MAL- ids), which records
+// reported malicious releases. Each project's check reads that file with
+// no network call and re-checks every finding against the current lockfile, so
+// an upgrade clears it at once. `policy advisory` is the manual lane for news
+// that is ahead of every database: it finds a package across all projects and,
+// with --track, records it in the committed tracked-advisories.json, which
+// every project's check FAILs on until the bad version is gone.
+const ADVISORIES = path.join(POLICY_ROOT, '.policy', 'advisories.json');
+const TRACKED_ADVISORIES = path.join(POLICY_ROOT, 'tracked-advisories.json');
+const ADVISORY_LABEL = 'com.build-policy.advisory-sweep';
+const ADVISORY_SWEEP_MAX_DAYS = 3;
+const OSV_API = 'https://api.osv.dev/v1';
+const ADVISORY_RANK = { ...SEVERITY_RANK, unknown: 0, malicious: 5 };
+
+/**
+ * Installed packages from a package-lock.json (v2/v3 `packages`): one entry per
+ * name@version, `dev` only when every copy is dev-only, `direct` when the
+ * project's own package.json names it (a top-level node_modules entry alone
+ * is not direct: npm hoists transitive packages there). devOptional counts as
+ * production: an optional dependency of a production package installs with it.
+ */
+function lockPackages(lock) {
+  const seen = new Map();
+  const root = ((lock && lock.packages) || {})[''] || {};
+  const own = new Set(
+    Object.keys({
+      ...root.dependencies,
+      ...root.devDependencies,
+      ...root.optionalDependencies,
+    }),
+  );
+  for (const [key, v] of Object.entries((lock && lock.packages) || {})) {
+    if (!key || !v || v.link || !v.version) continue;
+    // Only registry packages: a file:, git or tarball dependency can carry a
+    // private package's name, which OSV cannot know and should not be sent.
+    if (v.resolved && !/^https:\/\/registry\.npmjs\.org\//.test(v.resolved)) continue;
+    const i = key.lastIndexOf('node_modules/');
+    if (i === -1) continue;
+    const keyName = key.slice(i + 'node_modules/'.length);
+    const name = v.name || keyName;
+    const id = `${name}@${v.version}`;
+    const dev = v.dev === true;
+    const direct = key === `node_modules/${keyName}` && own.has(keyName);
+    const prev = seen.get(id);
+    if (prev) {
+      prev.dev = prev.dev && dev;
+      prev.direct = prev.direct || direct;
+    } else seen.set(id, { name, version: v.version, dev, direct });
+  }
+  return [...seen.values()];
+}
+
+/** Packages under a node_modules folder with no lockfile (the global npm root), nested ones included. */
+function installedTree(root, depth = 0, out = new Map(), top = null) {
+  if (depth > 8 || out.size > 20000) return [...out.values()];
+  let entries = [];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return [...out.values()];
+  }
+  for (const e of entries) {
+    if (!e.isDirectory() || e.name.startsWith('.')) continue;
+    const dirs = e.name.startsWith('@')
+      ? fs
+          .readdirSync(path.join(root, e.name), { withFileTypes: true })
+          .filter((s) => s.isDirectory())
+          .map((s) => path.join(root, e.name, s.name))
+      : [path.join(root, e.name)];
+    for (const d of dirs) {
+      const pkg = readJSON(path.join(d, 'package.json'));
+      // A package.json here is third-party text printed into session context:
+      // only an npm-shaped name and a plain version are taken.
+      const npmName = /^(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/i;
+      if (pkg && npmName.test(String(pkg.name)) && /^\d+\.\d+\.\d+[\w.+-]*$/.test(String(pkg.version))) {
+        const id = `${pkg.name}@${pkg.version}`;
+        if (!out.has(id))
+          out.set(id, {
+            name: pkg.name,
+            version: pkg.version,
+            dev: false,
+            direct: depth === 0,
+            via: top || pkg.name,
+          });
+      }
+      const nested = path.join(d, 'node_modules');
+      if (exists(nested))
+        installedTree(nested, depth + 1, out, top || (pkg && npmName.test(String(pkg.name)) ? pkg.name : path.basename(d)));
+    }
+  }
+  return [...out.values()];
+}
+
+/** An OSV record's severity: malicious for a MAL- entry, else the GitHub rating, else unknown. */
+function osvSeverity(v) {
+  if (!v) return 'unknown';
+  if ([v.id, ...(v.aliases || [])].some((a) => /^MAL-/.test(String(a)))) return 'malicious';
+  const s = String((v.database_specific || {}).severity || '').toLowerCase();
+  return s in SEVERITY_RANK ? s : 'unknown';
+}
+
+/**
+ * The npm version ranges an OSV record gives for one package, as ranges
+ * versionInRange reads: introduced/fixed/last_affected events become
+ * ">=a <b" or "<=c", listed versions stay exact, an open start is "*".
+ */
+function osvRanges(v, name) {
+  const ranges = [];
+  for (const a of (v && v.affected) || []) {
+    if (!a.package || a.package.ecosystem !== 'npm' || (name && a.package.name !== name)) continue;
+    for (const r of a.ranges || []) {
+      if (r.type !== 'SEMVER' && r.type !== 'ECOSYSTEM') continue;
+      let start = null;
+      for (const e of r.events || []) {
+        if ('introduced' in e) start = e.introduced === '0' ? '' : `>=${e.introduced}`;
+        else if ('fixed' in e && start !== null) {
+          ranges.push(`${start} <${e.fixed}`.trim());
+          start = null;
+        } else if ('last_affected' in e && start !== null) {
+          ranges.push(`${start} <=${e.last_affected}`.trim());
+          start = null;
+        }
+      }
+      if (start !== null) ranges.push(start || '*');
+    }
+    for (const ver of a.versions || []) ranges.push(ver);
+  }
+  return [...new Set(ranges)];
+}
+
+/** The npm packages an OSV record names. */
+function osvPackages(v) {
+  return [
+    ...new Set(
+      ((v && v.affected) || [])
+        .filter((a) => a.package && a.package.ecosystem === 'npm')
+        .map((a) => a.package.name),
+    ),
+  ];
+}
+
+/** Whether a version is in a tracked range: "*" for every version, else ranges joined by ||. */
+function trackedMatches(version, range) {
+  return String(range || '')
+    .split('||')
+    .map((s) => s.trim())
+    .some((s) => s === '*' || versionInRange(version, s) === true);
+}
+
+/** "name@range", scoped names included; no version means every version. */
+function parsePackageSpec(spec, range) {
+  const s = String(spec || '').trim();
+  const at = s.lastIndexOf('@');
+  if (at > 0) return { package: s.slice(0, at), range: s.slice(at + 1) || '*' };
+  return { package: s, range: (range && String(range).trim()) || '*' };
+}
+
+/**
+ * The reportable findings for a set of installed packages, from the OSV ids
+ * each hit and the records behind them: high, critical or malicious only,
+ * one per package version at its worst severity.
+ */
+function advisoryFindings(pkgs, hits, details) {
+  const out = [];
+  for (const p of pkgs) {
+    const ids = hits.get(`${p.name}@${p.version}`) || [];
+    const recs = ids.map((id) => (details && details[id]) || { id, severity: 'unknown' });
+    const worst = recs.reduce(
+      (w, r) => (ADVISORY_RANK[r.severity] > ADVISORY_RANK[(w || {}).severity] ? r : w || r),
+      null,
+    );
+    if (!worst || ADVISORY_RANK[worst.severity] < ADVISORY_RANK.high) continue;
+    out.push({
+      name: p.name,
+      version: p.version,
+      dev: p.dev,
+      direct: p.direct,
+      ...(p.via ? { via: p.via } : {}),
+      severity: worst.severity,
+      ids: recs.filter((r) => ADVISORY_RANK[r.severity] >= ADVISORY_RANK.high).map((r) => r.id),
+      summary: worst.summary || '',
+    });
+  }
+  return out.sort(
+    (a, b) => ADVISORY_RANK[b.severity] - ADVISORY_RANK[a.severity] || a.name.localeCompare(b.name),
+  );
+}
+
+/**
+ * A Node security release this runtime is missing: the newest release in the
+ * same major, newer than `current`, marked security in nodejs.org's index.
+ * Null when there is none. Pure: takes the index.
+ */
+function nodeSecurityGap(current, releases) {
+  const cur = String(current || '').replace(/^v/, '');
+  const major = cur.split('.')[0];
+  const newer = (releases || [])
+    .map((r) => ({ ...r, v: String(r.version || '').replace(/^v/, '') }))
+    .filter((r) => /^\d+\.\d+\.\d+$/.test(r.v) && r.v.split('.')[0] === major)
+    .filter((r) => cmpSemver(r.v, cur) > 0);
+  if (!newer.some((r) => r.security)) return null;
+  return newer.sort((a, b) => cmpSemver(b.v, a.v))[0].v;
+}
+
+async function osvFetch(pathname, body) {
+  const r = await fetch(`${OSV_API}${pathname}`, {
+    method: body ? 'POST' : 'GET',
+    headers: body ? { 'content-type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(30000),
+  });
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`OSV ${pathname.split('/')[1]} answered ${r.status}`);
+  return r.json();
+}
+
+/** OSV ids per name@version, a thousand queries per request. */
+async function osvBatch(pkgs) {
+  const hits = new Map();
+  for (let i = 0; i < pkgs.length; i += 1000) {
+    const chunk = pkgs.slice(i, i + 1000);
+    const res = await osvFetch('/querybatch', {
+      queries: chunk.map((p) => ({
+        package: { name: p.name, ecosystem: 'npm' },
+        version: p.version,
+      })),
+    });
+    ((res && res.results) || []).forEach((r, j) => {
+      if (r && r.vulns && r.vulns.length)
+        hits.set(
+          `${chunk[j].name}@${chunk[j].version}`,
+          r.vulns.map((v) => v.id),
+        );
+    });
+  }
+  return hits;
+}
+
+/**
+ * An advisory summary as one plain line of at most 120 characters. It is
+ * third-party text that check prints into every session's context, so
+ * control characters and line breaks go.
+ */
+function plainSummary(s) {
+  // Control characters and the two Unicode line separators (U+2028, U+2029).
+  const breaks = (c) => c < 32 || c === 127 || c === 0x2028 || c === 0x2029;
+  return [...String(s || '')]
+    .map((ch) => (breaks(ch.codePointAt(0)) ? ' ' : ch))
+    .join('')
+    .replace(/ {2,}/g, ' ')
+    .trim()
+    .slice(0, 120);
+}
+
+/** id -> { id, severity, summary } for each OSV id, eight requests at a time. */
+async function osvDetails(ids) {
+  const queue = [...new Set(ids)];
+  const out = {};
+  await Promise.all(
+    Array.from({ length: 8 }, async () => {
+      while (queue.length) {
+        const id = queue.shift();
+        try {
+          const v = await osvFetch(`/vulns/${encodeURIComponent(id)}`);
+          out[id] = { id, severity: osvSeverity(v), summary: plainSummary(v && v.summary) };
+        } catch {
+          out[id] = { id, severity: 'unknown', summary: '' };
+        }
+      }
+    }),
+  );
+  return out;
+}
+
+function loadTracked(file = TRACKED_ADVISORIES) {
+  const t = readJSON(file);
+  return Array.isArray(t && t.tracked) ? t.tracked.filter((e) => e && e.package && e.range) : [];
+}
+
+/** The project a directory belongs to: the main checkout's folder, also from an agent worktree. */
+function advisoryProjectName(dir) {
+  const r = sh('git rev-parse --path-format=absolute --git-common-dir', dir);
+  if (r.ok && r.out && path.basename(r.out) === '.git') return path.basename(path.dirname(r.out));
+  return path.basename(path.resolve(dir));
+}
+
+/** Whether approved, unexpired audit exceptions cover every advisory id of a finding. */
+function advisoryExcepted(dir, f, exceptions, today = new Date().toISOString().slice(0, 10)) {
+  const covered = (id) => {
+    const e = exceptions[id];
+    return Boolean(
+      e && e.package === f.name && e.expires >= today && auditExceptionApproved(dir, id, e),
+    );
+  };
+  return f.ids.length > 0 && f.ids.every(covered);
+}
+
+function advisoryLine(f) {
+  const where = f.via
+    ? f.via === f.name
+      ? 'global'
+      : `global, in ${f.via}`
+    : f.dev
+      ? 'dev'
+      : 'production';
+  return `${f.name}@${f.version} ${f.severity} (${where}${f.direct ? ', direct' : ''}): ${f.ids
+    .slice(0, 2)
+    .join(', ')}${f.summary ? ` ${f.summary}` : ''}`;
+}
+
+/**
+ * A project's check: what the daily sweep found here, still installed, and
+ * any tracked advisory the lockfile matches. A malicious package FAILs
+ * anywhere in the tree (its install script ran on this Mac); a high or
+ * critical advisory FAILs in production dependencies and WARNs in dev ones,
+ * as the security gate does. Machine-level findings (global npm packages,
+ * Node) WARN in every project. Returns the package names reported, so the
+ * npm audit lines below do not repeat them.
+ */
+function reportAdvisories(dir, opts = {}) {
+  const file = opts.file || ADVISORIES;
+  const trackedFile = opts.trackedFile || TRACKED_ADVISORIES;
+  const reported = new Set();
+  const sweep = readJSON(file);
+  const lock = readJSON(path.join(dir, 'package-lock.json'));
+  const installed = lock ? lockPackages(lock) : [];
+  const have = new Map(installed.map((p) => [`${p.name}@${p.version}`, p]));
+
+  if (!sweep || !sweep.time) {
+    warn(
+      'No advisory sweep recorded — run: policy advisory --sweep (setup-machine installs the daily launchd job)',
+    );
+  } else {
+    const days = daysSince(sweep.time);
+    if (days > ADVISORY_SWEEP_MAX_DAYS)
+      warn(
+        `Advisory sweep ${days} days old${sweep.lastError ? ` (last attempt: ${sweep.lastError})` : ''} — ` +
+          `the daily launchd job is not running (policy doctor), or run: policy advisory --sweep`,
+      );
+    const exceptions = loadAuditExceptions(dir);
+    const failing = [];
+    const warning = [];
+    const project = opts.project || advisoryProjectName(dir);
+    for (const f of (sweep.projects || {})[project] || []) {
+      const now = have.get(`${f.name}@${f.version}`);
+      if (!now || advisoryExcepted(dir, f, exceptions)) continue;
+      reported.add(f.name);
+      const line = advisoryLine({ ...f, dev: now.dev, direct: now.direct });
+      if (f.severity === 'malicious' || !now.dev) failing.push(line);
+      else warning.push(line);
+    }
+    if (failing.length)
+      fail(
+        `${failing.length} advisor${failing.length === 1 ? 'y' : 'ies'} from the daily sweep (OSV.dev): ` +
+          `${failing.slice(0, 4).join('; ')}${failing.length > 4 ? '; …' : ''} — upgrade past the affected ` +
+          `version (npm audit fix, or policy upgrade <pkg> for a major), then gates; a malicious package also ` +
+          `means checking this Mac for what its install script did`,
+      );
+    if (warning.length)
+      warn(
+        `${warning.length} dev-only advisor${warning.length === 1 ? 'y' : 'ies'} from the daily sweep: ` +
+          `${warning.slice(0, 4).join('; ')}${warning.length > 4 ? '; …' : ''}`,
+      );
+    const machine = sweep.machine || [];
+    const bad = machine.filter((f) => f.severity === 'malicious');
+    const lines = (list) =>
+      list
+        .slice(0, 4)
+        .map((f) => (f.name === 'node' ? `Node ${f.version} (security release ${f.fix})` : advisoryLine(f)))
+        .join('; ');
+    if (bad.length)
+      fail(
+        `Malicious global package on this Mac: ${lines(bad)} — remove it (npm uninstall -g <pkg>) and check what it ran`,
+      );
+    const rest = machine.filter((f) => f.severity !== 'malicious');
+    if (rest.length)
+      warn(
+        `Machine advisories: ${lines(rest)}${rest.length > 4 ? '; …' : ''} — update with npm install -g <pkg>@latest, or nvm install for Node`,
+      );
+    for (const t of sweep.superseded || [])
+      warn(
+        `Tracked advisory ${t.package}@${t.range} is now in OSV (${t.ids.slice(0, 2).join(', ')}): the daily sweep ` +
+          `covers it — untrack it: policy advisory --untrack ${t.package}`,
+      );
+  }
+
+  const matched = [];
+  for (const t of loadTracked(trackedFile))
+    for (const p of installed)
+      if (p.name === t.package && trackedMatches(p.version, t.range)) {
+        reported.add(p.name);
+        matched.push(
+          `${p.name}@${p.version} (${p.dev ? 'dev' : 'production'}; tracked ${t.range}` +
+            `${t.id ? `, ${t.id}` : ''}${t.note ? `: ${t.note}` : ''})`,
+        );
+      }
+  if (matched.length)
+    fail(
+      `Tracked advisory matches this lockfile: ${matched.join('; ')} — move off the version ` +
+        `(npm install <pkg>@<safe version>, then gates); see tracked-advisories.json in build-policy`,
+    );
+  return reported;
+}
+
+/** The daily job: every project's lockfile, the global npm packages and Node, asked of OSV. */
+async function cmdAdvisorySweep() {
+  section('Advisory sweep (OSV.dev)');
+  const projects = {};
+  const all = new Map();
+  for (const d of siblingProjects()) {
+    if (isArchived(d)) continue;
+    const lock = readJSON(path.join(d, 'package-lock.json'));
+    if (!lock) continue;
+    const pkgs = lockPackages(lock);
+    projects[path.basename(d)] = pkgs;
+    for (const p of pkgs) all.set(`${p.name}@${p.version}`, p);
+  }
+  const g = sh('npm root -g', os.homedir());
+  const globals = g.ok && g.out ? installedTree(g.out) : [];
+  for (const p of globals) all.set(`${p.name}@${p.version}`, p);
+  const tracked = loadTracked().filter((t) => /^\d+\.\d+\.\d+$/.test(t.range));
+  for (const t of tracked)
+    all.set(`${t.package}@${t.range}`, { name: t.package, version: t.range });
+
+  const prev = readJSON(ADVISORIES) || {};
+  let hits;
+  let details;
+  try {
+    hits = await osvBatch([...all.values()]);
+    details = await osvDetails([...hits.values()].flat());
+  } catch (e) {
+    fs.mkdirSync(path.dirname(ADVISORIES), { recursive: true });
+    fs.writeFileSync(
+      ADVISORIES,
+      JSON.stringify({ ...prev, lastAttempt: new Date().toISOString(), lastError: String(e.message || e) }, null, 2) +
+        '\n',
+    );
+    fail(`OSV.dev could not be reached (${e.message || e}) — the previous sweep stays in place`);
+    return finish();
+  }
+
+  const result = { time: new Date().toISOString(), packages: all.size, projects: {}, machine: [] };
+  for (const [name, pkgs] of Object.entries(projects)) {
+    const f = advisoryFindings(pkgs, hits, details);
+    if (f.length) result.projects[name] = f;
+  }
+  result.machine = advisoryFindings(globals, hits, details);
+  try {
+    const r = await fetch('https://nodejs.org/dist/index.json', { signal: AbortSignal.timeout(30000) });
+    const fix = r.ok ? nodeSecurityGap(process.version, await r.json()) : null;
+    if (fix)
+      result.machine.push({
+        name: 'node',
+        version: process.version.replace(/^v/, ''),
+        fix,
+        severity: 'high',
+        ids: [],
+        summary: `security release ${fix}`,
+      });
+  } catch {
+    /* nodejs.org unreachable: no runtime finding this time */
+  }
+  result.superseded = tracked
+    .filter((t) => (hits.get(`${t.package}@${t.range}`) || []).length)
+    .map((t) => ({ package: t.package, range: t.range, ids: hits.get(`${t.package}@${t.range}`) }));
+
+  fs.mkdirSync(path.dirname(ADVISORIES), { recursive: true });
+  fs.writeFileSync(ADVISORIES, JSON.stringify(result, null, 2) + '\n');
+
+  const names = Object.keys(result.projects);
+  ok(`Asked OSV about ${all.size} package versions across ${Object.keys(projects).length} projects and the global npm root`);
+  for (const n of names) {
+    const f = result.projects[n];
+    const prodOrMal = f.filter((x) => !x.dev || x.severity === 'malicious');
+    (prodOrMal.length ? fail : warn)(`${n}: ${f.slice(0, 3).map(advisoryLine).join('; ')}${f.length > 3 ? '; …' : ''}`);
+  }
+  if (!names.length) ok('No high, critical or malicious advisories in any project');
+  if (result.machine.length)
+    warn(`Machine: ${result.machine.map((f) => (f.name === 'node' ? `Node ${f.version} → ${f.fix}` : advisoryLine(f))).join('; ')}`);
+  else ok('Global npm packages and Node: no advisories');
+  console.log(`  ${DIM}recorded in ${path.relative(POLICY_ROOT, ADVISORIES)}${RESET}`);
+  return finish();
+}
+
+/** The lockfile at a project's last release tag, or null. */
+function releaseLock(dir) {
+  const tag = sh('git describe --tags --abbrev=0', dir);
+  if (!tag.ok || !/^[\w.][\w.\-/]*$/.test(tag.out)) return null; // no leading - (a git option)
+  const lock = sh(`git show "${tag.out}:package-lock.json"`, dir);
+  if (!lock.ok) return null;
+  try {
+    return { tag: tag.out, pkgs: lockPackages(JSON.parse(lock.out)) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `policy advisory <pkg>[@range] | <CVE|GHSA|MAL id>`: where a package is
+ * installed across every project and the global npm root, and whether the
+ * affected version shipped in the last release. --track records it in
+ * tracked-advisories.json so every project's check FAILs on it; --untrack
+ * removes a package's entries; --list shows them; --sweep is the daily job.
+ */
+async function cmdAdvisory(rest, flags) {
+  if (flags.includes('--sweep')) return cmdAdvisorySweep();
+  const args = rest.filter((a) => !a.startsWith('--'));
+  const tracked = loadTracked();
+  const save = (list) =>
+    fs.writeFileSync(TRACKED_ADVISORIES, JSON.stringify({ tracked: list }, null, 2) + '\n');
+
+  if (flags.includes('--list')) {
+    section('Tracked advisories');
+    if (!tracked.length) console.log('  none');
+    for (const t of tracked)
+      console.log(`  ${t.package}@${t.range}  ${t.id || ''}  ${t.note || ''}  (added ${t.added})`);
+    return;
+  }
+  if (flags.includes('--untrack')) {
+    const pkg = args[0];
+    const left = tracked.filter((t) => t.package !== pkg);
+    if (left.length === tracked.length) {
+      console.log(`Nothing tracked for ${pkg}`);
+      process.exit(1);
+    }
+    save(left);
+    console.log(`Untracked ${pkg}. Commit tracked-advisories.json in build-policy.`);
+    return;
+  }
+  if (!args[0]) {
+    console.log('Usage: policy advisory <pkg>[@range] | <CVE-…|GHSA-…|MAL-…> [--track] [--note "<why>"]');
+    process.exit(1);
+  }
+
+  let targets;
+  if (/^(CVE|GHSA|MAL)-[\w-]+$/i.test(args[0])) {
+    const id = args[0].toUpperCase().startsWith('GHSA') ? args[0] : args[0].toUpperCase();
+    let v = await osvFetch(`/vulns/${encodeURIComponent(id)}`);
+    if (v && !osvPackages(v).length) {
+      const ghsa = (v.aliases || []).find((a) => /^GHSA-/.test(a));
+      if (ghsa) v = await osvFetch(`/vulns/${encodeURIComponent(ghsa)}`);
+    }
+    const pkgs = osvPackages(v);
+    if (!v || !pkgs.length) {
+      console.log(
+        `${id}: OSV has no npm package for it yet. Give the package instead: policy advisory <pkg>@<version> --track --note "${id}"`,
+      );
+      process.exit(1);
+    }
+    targets = pkgs.map((p) => ({
+      package: p,
+      range: osvRanges(v, p).join(' || ') || '*',
+      id: v.id,
+      note: plainSummary(v.summary),
+    }));
+  } else {
+    targets = [{ ...parsePackageSpec(args[0], args[1]), id: null, note: null }];
+  }
+  const noteFlag = flags.find((f) => f.startsWith('--note='));
+  const note = noteFlag ? noteFlag.slice('--note='.length) : null;
+
+  const places = [
+    ...siblingProjects()
+      .filter((d) => !isArchived(d) && exists(path.join(d, 'package-lock.json')))
+      .map((d) => ({ name: path.basename(d), dir: d, pkgs: lockPackages(readJSON(path.join(d, 'package-lock.json'))) })),
+  ];
+  const g = sh('npm root -g', os.homedir());
+  if (g.ok && g.out) places.push({ name: '(global npm)', dir: null, pkgs: installedTree(g.out) });
+
+  let found = 0;
+  for (const t of targets) {
+    section(`${t.package} ${t.range}${t.id ? ` (${t.id})` : ''}`);
+    for (const pl of places) {
+      const hits = pl.pkgs.filter((p) => p.name === t.package && trackedMatches(p.version, t.range));
+      if (!hits.length) continue;
+      const rel = pl.dir ? releaseLock(pl.dir) : null;
+      for (const p of hits) {
+        found++;
+        const shipped = rel
+          ? rel.pkgs.some((r) => r.name === p.name && r.version === p.version && !r.dev)
+            ? `in release ${rel.tag}`
+            : `not in release ${rel.tag}`
+          : 'no release tag';
+        console.log(
+          `  ${RED}✗${RESET} ${pl.name.padEnd(24)} ${p.name}@${p.version}  ${p.dev ? 'dev' : 'production'}, ${p.direct ? 'direct' : 'transitive'}, ${shipped}`,
+        );
+      }
+    }
+  }
+  if (!found) console.log(`\n  ${GREEN}✓${RESET} Not installed at an affected version in any project or the global npm root`);
+  else console.log(`\n${found} affected install(s).`);
+
+  if (flags.includes('--track')) {
+    const date = new Date().toISOString().slice(0, 10);
+    const next = [...tracked];
+    for (const t of targets)
+      if (!next.some((x) => x.package === t.package && x.range === t.range))
+        next.push({ package: t.package, range: t.range, id: t.id, note: note || t.note, added: date });
+    save(next);
+    console.log(
+      `Tracked in tracked-advisories.json: every project's check FAILs on a matching install until it is gone ` +
+        `or untracked. Commit it in build-policy.`,
+    );
+  } else if (found) {
+    console.log(`Add --track to make every project's check FAIL on it until it is gone.`);
+  }
 }
 
 // ---------------------------------------------------------------- scaffold
@@ -9151,6 +9834,11 @@ function cmdDoctor() {
     else if (!sweepLoaded())
       warn(`Monthly health sweep written but not loaded in launchd — run: policy setup-machine`);
     else ok(`Monthly health sweep scheduled (${SWEEP_LABEL})`);
+    if (!exists(sweepPlistPath(ADVISORY_LABEL)))
+      warn(`Daily advisory sweep not installed (${ADVISORY_LABEL}) — run: policy setup-machine`);
+    else if (!sweepLoaded(ADVISORY_LABEL))
+      warn(`Daily advisory sweep written but not loaded in launchd — run: policy setup-machine`);
+    else ok(`Daily advisory sweep scheduled (${ADVISORY_LABEL})`);
   }
 
   // Everything that recorded the Node it was set up with. A launchd job and an
@@ -9348,11 +10036,17 @@ function cmdSetupMachine() {
   // this command and a PATH that reaches npm, git and gh: launchd starts jobs
   // with almost no environment. StartCalendarInterval jobs missed while the
   // Mac slept run at the next wake.
-  if (process.platform === 'darwin') {
-    const log = path.join(POLICY_ROOT, '.policy', 'health-sweep.log');
+  // 2c. Daily advisory sweep, the same way (advisory --sweep, 08:30).
+  for (const job of process.platform === 'darwin'
+    ? [
+        { label: SWEEP_LABEL, file: 'health-sweep', when: '1st of the month 09:00', what: 'monthly health sweep' },
+        { label: ADVISORY_LABEL, file: 'advisory-sweep', when: 'daily 08:30', what: 'daily advisory sweep' },
+      ]
+    : []) {
+    const log = path.join(POLICY_ROOT, '.policy', `${job.file}.log`);
     fs.mkdirSync(path.dirname(log), { recursive: true });
-    const plist = readFile(path.join(MACHINE, 'health-sweep.plist'))
-      .replace(/__LABEL__/g, SWEEP_LABEL)
+    const plist = readFile(path.join(MACHINE, `${job.file}.plist`))
+      .replace(/__LABEL__/g, job.label)
       .replace(/__NODE__/g, process.execPath)
       .replace(/__POLICY__/g, __filename)
       .replace(/__LOG__/g, log)
@@ -9362,14 +10056,13 @@ function cmdSetupMachine() {
           .filter((p, i, a) => a.indexOf(p) === i)
           .join(':'),
       );
-    const dest = sweepPlistPath();
+    const dest = sweepPlistPath(job.label);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     fs.writeFileSync(dest, plist);
     const domain = `gui/${process.getuid()}`;
     sh(`launchctl bootout ${domain} "${dest}"`, os.homedir());
     const load = sh(`launchctl bootstrap ${domain} "${dest}"`, os.homedir());
-    if (load.ok || sweepLoaded())
-      ok(`Installed monthly health sweep (${SWEEP_LABEL}, 1st of the month 09:00)`);
+    if (load.ok || sweepLoaded(job.label)) ok(`Installed ${job.what} (${job.label}, ${job.when})`);
     else warn(`Wrote ${dest} but launchctl did not load it: ${load.out.slice(0, 200)}`);
   }
 
@@ -10704,6 +11397,7 @@ function main() {
     '--version',
     '--close',
     '--route',
+    '--note',
   ]);
   const flags = rest.filter((a) => a.startsWith('--'));
   const dir = rest.find((a) => !a.startsWith('--')) || '.';
@@ -10739,6 +11433,11 @@ function main() {
       return flags.includes('--all') ? cmdHealthAll() : cmdHealth(dir, flags);
     case 'deps-update':
       return cmdDepsUpdate(dir);
+    case 'advisory':
+      return cmdAdvisory(rest, flags).catch((e) => {
+        console.error(`advisory: ${e.message || e}`);
+        process.exit(1);
+      });
     case 'upgrade':
       return cmdUpgrade(dir, rest);
     case 'approve-exception':
@@ -10774,6 +11473,18 @@ if (require.main === module) main();
 
 // For tests/ only: the pure predicates the hooks and gates decide on.
 module.exports = {
+  lockPackages,
+  installedTree,
+  osvSeverity,
+  osvRanges,
+  osvPackages,
+  trackedMatches,
+  parsePackageSpec,
+  advisoryFindings,
+  nodeSecurityGap,
+  reportAdvisories,
+  unfixedAdvisories,
+  plainSummary,
   runSast,
   siteImageRefs,
   siteTrackedImages,

@@ -1999,3 +1999,203 @@ test('staleDevServers: astro and vite servers up for a day or more', () => {
     ],
   );
 });
+
+test('lockPackages: one entry per name@version; dev only when every copy is dev; direct from package.json', () => {
+  const lock = {
+    packages: {
+      '': { dependencies: { a: '^1.0.0' }, devDependencies: { d: '^2.0.0' } },
+      'node_modules/a': { version: '1.0.0' },
+      'node_modules/hoisted': { version: '3.0.0' },
+      'node_modules/d': { version: '2.0.0', dev: true },
+      'node_modules/a/node_modules/d': { version: '2.0.0' },
+      'node_modules/alias': { version: '4.0.0', name: 'real-pkg', dev: true },
+      'node_modules/linked': { link: true, resolved: '../x' },
+      'node_modules/@s/b': { version: '5.0.0', devOptional: true },
+    },
+  };
+  const by = Object.fromEntries(policy.lockPackages(lock).map((p) => [`${p.name}@${p.version}`, p]));
+  assert.deepEqual(Object.keys(by).sort(), [
+    '@s/b@5.0.0',
+    'a@1.0.0',
+    'd@2.0.0',
+    'hoisted@3.0.0',
+    'real-pkg@4.0.0',
+  ]);
+  assert.equal(by['a@1.0.0'].direct, true);
+  assert.equal(by['hoisted@3.0.0'].direct, false, 'hoisted to the top is not direct');
+  assert.equal(by['d@2.0.0'].dev, false, 'a production copy makes it production');
+  assert.equal(by['d@2.0.0'].direct, true);
+  assert.equal(by['real-pkg@4.0.0'].dev, true);
+  assert.equal(by['@s/b@5.0.0'].dev, false, 'devOptional counts as production');
+  assert.deepEqual(policy.lockPackages(null), []);
+});
+
+test('installedTree: global packages and their nested deps, each tagged with its top-level package', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-globals-'));
+  const put = (rel, name, version) => {
+    fs.mkdirSync(path.join(root, rel), { recursive: true });
+    fs.writeFileSync(path.join(root, rel, 'package.json'), JSON.stringify({ name, version }));
+  };
+  put('cli', 'cli', '1.0.0');
+  put('cli/node_modules/dep', 'dep', '0.1.0');
+  put('@s/tool', '@s/tool', '2.0.0');
+  const got = policy.installedTree(root).map((p) => `${p.name}@${p.version}<${p.via}`).sort();
+  assert.deepEqual(got, ['@s/tool@2.0.0<@s/tool', 'cli@1.0.0<cli', 'dep@0.1.0<cli']);
+  assert.deepEqual(policy.installedTree(path.join(root, 'missing')), []);
+});
+
+test('osvSeverity: MAL- ids are malicious, else the GitHub rating, else unknown', () => {
+  assert.equal(policy.osvSeverity({ id: 'MAL-2026-1' }), 'malicious');
+  assert.equal(policy.osvSeverity({ id: 'GHSA-x', aliases: ['MAL-2026-2'] }), 'malicious');
+  assert.equal(policy.osvSeverity({ id: 'GHSA-x', database_specific: { severity: 'HIGH' } }), 'high');
+  assert.equal(policy.osvSeverity({ id: 'GHSA-x', database_specific: { severity: 'MODERATE' } }), 'moderate');
+  assert.equal(policy.osvSeverity({ id: 'GHSA-x' }), 'unknown');
+  assert.equal(policy.osvSeverity(null), 'unknown');
+});
+
+test('osvRanges: OSV events become ranges versionInRange reads; listed versions stay exact', () => {
+  const v = {
+    affected: [
+      {
+        package: { ecosystem: 'npm', name: 'lodash' },
+        ranges: [{ type: 'SEMVER', events: [{ introduced: '0' }, { fixed: '4.17.21' }] }],
+      },
+      {
+        package: { ecosystem: 'npm', name: 'x' },
+        ranges: [
+          { type: 'SEMVER', events: [{ introduced: '1.0.0' }, { last_affected: '1.2.0' }] },
+          { type: 'SEMVER', events: [{ introduced: '2.0.0' }] },
+          { type: 'GIT', events: [{ introduced: 'abc' }] },
+        ],
+        versions: ['0.9.1'],
+      },
+      { package: { ecosystem: 'PyPI', name: 'x' }, versions: ['9.9.9'] },
+    ],
+  };
+  assert.deepEqual(policy.osvRanges(v, 'lodash'), ['<4.17.21']);
+  assert.deepEqual(policy.osvRanges(v, 'x'), ['>=1.0.0 <=1.2.0', '>=2.0.0', '0.9.1']);
+  assert.deepEqual(policy.osvPackages(v), ['lodash', 'x']);
+  assert.deepEqual(
+    policy.osvRanges({ affected: [{ package: { ecosystem: 'npm', name: 'm' }, ranges: [{ type: 'SEMVER', events: [{ introduced: '0' }] }] }] }, 'm'),
+    ['*'],
+  );
+});
+
+test('trackedMatches and parsePackageSpec: exact, ranges, every version, scoped names', () => {
+  assert.equal(policy.trackedMatches('1.12.3', '1.12.3'), true);
+  assert.equal(policy.trackedMatches('1.12.4', '1.12.3'), false);
+  assert.equal(policy.trackedMatches('1.12.4', '>=1.12.0 <1.12.5'), true);
+  assert.equal(policy.trackedMatches('0.9.1', '>=1.0.0 <=1.2.0 || 0.9.1'), true);
+  assert.equal(policy.trackedMatches('7.0.0', '*'), true);
+  assert.equal(policy.trackedMatches('1.0.0', 'garbage'), false, 'an unreadable range never matches');
+  assert.deepEqual(policy.parsePackageSpec('axios@1.12.3'), { package: 'axios', range: '1.12.3' });
+  assert.deepEqual(policy.parsePackageSpec('@s/pkg@2.0.0'), { package: '@s/pkg', range: '2.0.0' });
+  assert.deepEqual(policy.parsePackageSpec('@s/pkg'), { package: '@s/pkg', range: '*' });
+  assert.deepEqual(policy.parsePackageSpec('axios', '>=1.0.0 <2.0.0'), { package: 'axios', range: '>=1.0.0 <2.0.0' });
+});
+
+test('advisoryFindings: high, critical and malicious only, at the worst severity', () => {
+  const pkgs = [
+    { name: 'a', version: '1.0.0', dev: false, direct: true },
+    { name: 'b', version: '2.0.0', dev: true, direct: false },
+    { name: 'c', version: '3.0.0', dev: false, direct: false },
+    { name: 'd', version: '4.0.0', dev: true, direct: false },
+  ];
+  const hits = new Map([
+    ['a@1.0.0', ['G1', 'G2']],
+    ['b@2.0.0', ['MAL-1']],
+    ['c@3.0.0', ['G3']],
+    ['d@4.0.0', ['G9']],
+  ]);
+  const details = {
+    G1: { id: 'G1', severity: 'moderate' },
+    G2: { id: 'G2', severity: 'critical', summary: 'bad' },
+    'MAL-1': { id: 'MAL-1', severity: 'malicious' },
+    G3: { id: 'G3', severity: 'moderate' },
+  };
+  const f = policy.advisoryFindings(pkgs, hits, details);
+  assert.deepEqual(
+    f.map((x) => `${x.name}:${x.severity}:${x.ids.join(',')}`),
+    ['b:malicious:MAL-1', 'a:critical:G2'],
+    'moderates and unknown records are left out; malicious sorts first',
+  );
+  assert.equal(f[1].summary, 'bad');
+});
+
+test('nodeSecurityGap: the newest release in the same major when a newer one is a security release', () => {
+  const index = [
+    { version: 'v26.1.0', security: true },
+    { version: 'v24.23.0', security: false },
+    { version: 'v24.22.2', security: true },
+    { version: 'v24.22.1', security: false },
+  ];
+  assert.equal(policy.nodeSecurityGap('v24.22.1', index), '24.23.0');
+  assert.equal(policy.nodeSecurityGap('v24.22.2', index), null, 'nothing newer is a security release');
+  assert.equal(policy.nodeSecurityGap('v26.1.0', index), null);
+  assert.equal(policy.nodeSecurityGap('v24.22.1', null), null);
+});
+
+test('unfixedAdvisories: high/critical that npm audit fix cannot clear, at the source package', () => {
+  const audit = {
+    vulnerabilities: {
+      major: { severity: 'critical', fixAvailable: { name: 'major', version: '3.0.0', isSemVerMajor: true }, via: [{ url: 'x/GHSA-1' }] },
+      none: { severity: 'high', fixAvailable: false, via: [{ url: 'x/GHSA-2' }] },
+      inherits: { severity: 'high', fixAvailable: false, via: ['none'] },
+      inrange: { severity: 'high', fixAvailable: true, via: [{ url: 'x/GHSA-3' }] },
+      mild: { severity: 'moderate', fixAvailable: false, via: [{ url: 'x/GHSA-4' }] },
+    },
+  };
+  assert.deepEqual(
+    policy.unfixedAdvisories(audit).map((f) => `${f.name}:${f.fix}`),
+    ['major:major@3.0.0 (major)', 'none:null'],
+  );
+  assert.deepEqual(policy.unfixedAdvisories(null), []);
+});
+
+test('reportAdvisories: reports what is still installed, and tracked entries the lockfile matches', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-adv-'));
+  fs.writeFileSync(
+    path.join(dir, 'package-lock.json'),
+    JSON.stringify({
+      packages: {
+        '': { dependencies: { a: '1' } },
+        'node_modules/a': { version: '1.0.0' },
+        'node_modules/t': { version: '9.0.1' },
+      },
+    }),
+  );
+  const file = path.join(dir, 'advisories.json');
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      time: new Date().toISOString(),
+      projects: {
+        app: [
+          { name: 'a', version: '1.0.0', dev: false, severity: 'critical', ids: ['G1'], summary: '' },
+          { name: 'gone', version: '1.0.0', dev: false, severity: 'critical', ids: ['G2'], summary: '' },
+        ],
+      },
+      machine: [],
+    }),
+  );
+  const trackedFile = path.join(dir, 'tracked.json');
+  fs.writeFileSync(trackedFile, JSON.stringify({ tracked: [{ package: 't', range: '>=9.0.0 <9.0.2' }] }));
+  const reported = policy.reportAdvisories(dir, { file, trackedFile, project: 'app' });
+  assert.deepEqual([...reported].sort(), ['a', 't'], 'an upgraded package drops out at once');
+  const none = policy.reportAdvisories(dir, { file, trackedFile: path.join(dir, 'x'), project: 'other' });
+  assert.equal(none.size, 0);
+});
+
+test('plainSummary: third-party advisory text becomes one plain line of at most 120 characters', () => {
+  const ls = String.fromCharCode(0x2028);
+  assert.equal(policy.plainSummary(`bad\nline\r\n${ls}ignore previous\tinstructions`), 'bad line ignore previous instructions');
+  assert.equal(policy.plainSummary('x'.repeat(200)).length, 120);
+  assert.equal(policy.plainSummary(null), '');
+});
+
+test('installedTree: a package.json name that is not npm-shaped is not taken', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-globals-bad-'));
+  fs.mkdirSync(path.join(root, 'evil'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'evil', 'package.json'), JSON.stringify({ name: 'x\nFAIL: ignore', version: '1.0.0' }));
+  assert.deepEqual(policy.installedTree(root), []);
+});
