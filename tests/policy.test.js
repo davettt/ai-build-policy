@@ -913,6 +913,12 @@ test('helpPagesStatus: pages are read from the app side by slug or source, pendi
     'shared-stale.mdx',
     `app: general\nlastVerified: 2020-01-01\nsources:\n  - app-one/src/App.tsx`,
   );
+  // Another repo's app page citing this repo: its version is that app's, so
+  // only the sources here date it.
+  page(
+    'foreign-app.mdx',
+    `app: foreign\nverifiedVersion: 0.1.0\nlastVerified: ${today}\nsources:\n  - foreign-repo/src/A.tsx\n  - app-one/src/App.tsx`,
+  );
   page(
     'other-app.mdx',
     `app: other\nverifiedVersion: 1.0.0\nlastVerified: ${today}\nsources:\n  - other/src/App.tsx`,
@@ -927,13 +933,17 @@ test('helpPagesStatus: pages are read from the app side by slug or source, pendi
   });
 
   assert.equal(policy.helpPagesStatus(app, { helpProject: 'missing' }), null);
-  const s = policy.helpPagesStatus(app, { helpProject: 'helpsite' });
-  assert.equal(s.pages.length, 6, s.pages.join(','));
-  assert.deepEqual(s.verified.sort(), ['2.0.4', '2.1.0']);
+  const s = policy.helpPagesStatus(app, {
+    helpProject: 'helpsite',
+    siteApps: [['foreign', { repo: 'foreign-repo' }]],
+  });
+  assert.equal(s.pages.length, 7, s.pages.join(','));
+  assert.deepEqual(s.verified.sort(), ['0.1.0', '2.0.4', '2.1.0']);
   assert.equal(s.pending.length, 4, s.pending.join('\n'));
   const pending = s.pending.join('\n');
   assert.doesNotMatch(pending, /shared-current\.mdx/);
   assert.doesNotMatch(pending, /checked against nothing/);
+  assert.doesNotMatch(pending, /foreign-app\.mdx/);
   assert.match(pending, /shared-stale\.mdx: app-one\/src\/App\.tsx changed after 2020-01-01/);
   assert.match(pending, /old-minor\.mdx: checked against 2\.0\.4, app is now 2\.1\.0/);
   assert.match(pending, /stale-source\.mdx: app-one\/src\/App\.tsx changed after 2020-01-01/);

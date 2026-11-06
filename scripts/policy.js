@@ -6964,6 +6964,7 @@ function helpPagesStatus(dir, opts = {}) {
       if (e.isDirectory()) return walk(p);
       return /\.mdx?$/.test(e.name) ? [p] : [];
     });
+  const siteApps = opts.siteApps || siteAppEntries();
   const pages = [];
   const pending = [];
   const verified = new Set();
@@ -6980,7 +6981,17 @@ function helpPagesStatus(dir, opts = {}) {
     if (fm.verifiedVersion) verified.add(String(fm.verifiedVersion));
     // A shared page (app: general) covers several apps, so the help site's
     // schema gives it no verifiedVersion; only its sources date it (R-18).
-    if (fm.app !== 'general' && minorOf(current) > minorOf(fm.verifiedVersion)) {
+    // A page whose slug is another repo's app (registry siteApps) records that
+    // app's version, so only its sources here date it: one app's release
+    // compared another app's page (0.7.0) with its own version (0.9.0).
+    const otherRepo = (siteApps || []).some(
+      ([slug, cfg]) => slug === fm.app && (cfg.repo || slug) !== folder,
+    );
+    if (
+      fm.app !== 'general' &&
+      !otherRepo &&
+      minorOf(current) > minorOf(fm.verifiedVersion)
+    ) {
       pending.push(
         `${page}: checked against ${fm.verifiedVersion || 'nothing'}, app is now ${current}`,
       );
