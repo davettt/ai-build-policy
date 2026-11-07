@@ -2199,3 +2199,107 @@ test('installedTree: a package.json name that is not npm-shaped is not taken', (
   fs.writeFileSync(path.join(root, 'evil', 'package.json'), JSON.stringify({ name: 'x\nFAIL: ignore', version: '1.0.0' }));
   assert.deepEqual(policy.installedTree(root), []);
 });
+
+test('reports: a blocking report parses as blocking, closes, and is not routed', () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'policy-rep-')), 'REPORTS.md');
+  const a = policy.appendReport(file, { project: 'app', version: '2.100', text: 'gap', blocking: true });
+  const b = policy.appendReport(file, { project: 'app', version: '2.100', text: 'minor' });
+  const byId = Object.fromEntries(policy.parseReports(fs.readFileSync(file, 'utf8')).map((r) => [r.id, r]));
+  assert.equal(byId[a].blocking, true);
+  assert.equal(byId[a].status, 'open');
+  assert.equal(byId[a].routedTo, null);
+  assert.equal(byId[b].blocking, false);
+  assert.equal(policy.closeReport(file, a, 'fixed in 2.100'), true);
+  const after = policy.parseReports(fs.readFileSync(file, 'utf8')).find((r) => r.id === a);
+  assert.equal(after.status, 'closed');
+  assert.equal(after.blocking, false);
+});
+
+test('claimPolicyRepo: a session opened outside build-policy is refused and pointed at report --blocking', () => {
+  const why = policy.claimPolicyRepo({ session_id: 'test-not-a-session', cwd: ELSEWHERE });
+  assert.match(why, /only from a session opened in build-policy/);
+  assert.match(why, /report "<what you found>"/);
+  assert.match(why, /--blocking/);
+});
+
+test('bashWriteTargets: variables are never expanded, so each of these writes into the repo is caught', () => {
+  // Every command below writes into the repo in bash. An expansion draft in
+  // 2.100 let some through (unset, read, printf -v, eval and more change a
+  // variable without NAME=), so variables stay unexpanded and resolve as
+  // text against the cwd, which keeps each of these refused.
+  const writes = (c) =>
+    policy.writesUnder({ tool_name: 'Bash', tool_input: { command: c }, cwd: ELSEWHERE }, ROOT);
+  const R = ROOT;
+  for (const c of [
+    `cd ${R} && cp a $UNSET/b`,
+    `cd ${R} && rsync /tmp/e.js $PWD/scripts/policy.js`,
+    `cd ${R} && install -m644 /tmp/e.js $PWD/scripts/policy.js`,
+    `cd ${R} && ln -sf /tmp/e.js $PWD/scripts/policy.js`,
+    `cd ${R} && cd $PWD && git pull`,
+    `cd ${R} && git -C $PWD merge evil`,
+    `cd ${R} && S=/tmp && mkdir '$S' && cp evil '$S/../scripts/policy.js'`,
+    `cd ${R} && S=.; false && S=/tmp; cp evil $S/scripts/policy.js`,
+    `S=/tmp | cat; cd ${R} && cp evil $S/scripts/policy.js`,
+    `cd ${R} && S=/tmp; cp evil \${S:+.}/scripts/policy.js`,
+    `S=/tmp/x; cd ${R} && cp evil \${S#/tmp/x}scripts/policy.js`,
+    `cd ${R} && rsync /tmp/e.js $(pwd)/scripts/policy.js`,
+    `cd ${R} && install /tmp/e.js \`pwd\`/scripts/policy.js`,
+    `S=/tmp; cd ${R}; unset S; cp x "\${S}f"`,
+    `S=/tmp && cd ${R} && unset S && touch \${S}x`,
+    `S=/tmp; cd ${R}; printf -v S .; cp x $S/f`,
+    `S=/tmp; cd ${R}; S+=x; cp x $S/f`,
+  ])
+    assert.equal(writes(c), true, c);
+});
+
+test('bashWriteTargets: a file behind an unset variable is still named as a target', () => {
+  const name = ['audit', 'approvals.json'].join('-');
+  for (const c of [`sed -i "" s/a/b/ $PWD/${name}`, `rsync /tmp/a $D/${name}`, `ln -sf /tmp/a $D/${name}`])
+    assert.ok(policy.bashWriteTargets(c, ELSEWHERE).targets.some((t) => t.endsWith(name)), c);
+});
+
+test('hook: an app session cannot close a blocking report or route one; a build-policy session can', () => {
+  const { spawnSync } = require('child_process');
+  const reports = path.join(ROOT, 'REPORTS.md');
+  const before = fs.readFileSync(reports, 'utf8');
+  const id = policy.appendReport(reports, { project: 'test-app', version: '2.100', text: 'test only', blocking: true });
+  const hook = (command, cwd) =>
+    spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'policy.js'), 'hook-pretool'], {
+      input: JSON.stringify({ tool_name: 'Bash', tool_input: { command }, cwd, session_id: 'test' }),
+      encoding: 'utf8',
+    }).stdout;
+  try {
+    const close = `cd ${ROOT} && node scripts/policy.js report --close ${id} "fixed"`;
+    assert.match(hook(close, ELSEWHERE), /"deny"[\s\S]*blocking report/);
+    assert.match(hook(`node ../build-policy/scripts/policy.js report --route ${id} x`, ELSEWHERE), /"deny"/);
+    // However the script is named: a variable, or flag=value.
+    assert.match(hook(`P=${ROOT}/scripts/policy.js; cd ${ROOT} && node "$P" report --close ${id} x`, ELSEWHERE), /"deny"/);
+    assert.match(hook(`cd ${ROOT} && node scripts/policy.js report --close=${id} x`, ELSEWHERE), /"deny"/);
+    // Quoting that bash removes, an id split by quotes, and a decoy id.
+    const n = id.slice(2);
+    assert.match(hook(`cd ${ROOT} && node scripts/policy.js report --clo''se ${id} x`, ELSEWHERE), /"deny"/);
+    assert.match(hook(`cd ${ROOT} && node scripts/policy.js rep''ort --close ${id} x`, ELSEWHERE), /"deny"/);
+    assert.match(hook(`cd ${ROOT} && node scripts/policy.js report --close "R-"${n} "done, see R-999999"`, ELSEWHERE), /"deny"/);
+    assert.match(hook(`I=${n}; cd ${ROOT} && node scripts/policy.js report --close R-$I x`, ELSEWHERE), /"deny"/);
+    assert.match(hook(`cd ${ROOT} && node scripts/policy.js report --ro''ute ${id} x`, ELSEWHERE), /"deny"/);
+    assert.match(hook(`cd ${ROOT} && node scripts/policy.js report --cl{o,}se ${id} x`, ELSEWHERE), /"deny"/);
+    assert.match(hook(`cd ${ROOT} && node scripts/policy.js report --clos? ${id} x`, ELSEWHERE), /"deny"/);
+    // Filing a report from an app session, with braces in its text, still works.
+    assert.doesNotMatch(hook(`node ../build-policy/scripts/policy.js report "saw {a,b} and $X in a log"`, ELSEWHERE), /"deny"/);
+    assert.doesNotMatch(hook(`node scripts/policy.js report --close ${id} "fixed"`, ROOT), /"deny"/);
+  } finally {
+    fs.writeFileSync(reports, before);
+  }
+});
+
+test('privateMirroredLeaks: blocklisted terms in mirrored folders only', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-leak-'));
+  for (const d of ['scripts', 'tests', 'docs']) fs.mkdirSync(path.join(root, d));
+  fs.writeFileSync(path.join(root, 'scripts', 'a.js'), '// compared SecretApp page');
+  fs.writeFileSync(path.join(root, 'tests', 't.js'), 'clean');
+  fs.writeFileSync(path.join(root, 'docs', 'n.md'), 'SecretApp is fine here');
+  fs.writeFileSync(path.join(root, 'bl.txt'), '# comment\nSecretApp\n!Other\n');
+  const terms = policy.blocklistTerms(path.join(root, 'bl.txt'));
+  assert.deepEqual(terms, ['SecretApp', 'Other']);
+  assert.deepEqual(policy.privateMirroredLeaks(root, terms), ['scripts/a.js: "SecretApp"']);
+});

@@ -1859,7 +1859,7 @@ const REPORTS_HEADER =
 function parseReports(text) {
   const reports = [];
   const head =
-    /^## (R-\d+) (\S+) (\S+) \(policy ([^)]+)\) — (open(?:, routed to \S+ \S+)?|closed.*)$/;
+    /^## (R-\d+) (\S+) (\S+) \(policy ([^)]+)\) — (open(?:, blocking)?(?:, routed to \S+ \S+)?|closed.*)$/;
   for (const block of String(text || '').split(/^(?=## R-)/m)) {
     const nl = block.indexOf('\n');
     const m = head.exec(nl === -1 ? block : block.slice(0, nl));
@@ -1871,7 +1871,8 @@ function parseReports(text) {
       version: m[4],
       status: m[5].startsWith('open') ? 'open' : 'closed',
       closed: m[5].startsWith('closed') ? m[5].slice('closed'.length).trim() : null,
-      routedTo: (/^open, routed to (\S+)/.exec(m[5]) || [])[1] || null,
+      routedTo: (/^open(?:, blocking)?, routed to (\S+)/.exec(m[5]) || [])[1] || null,
+      blocking: /^open, blocking\b/.test(m[5]),
       body: (nl === -1 ? '' : block.slice(nl + 1)).trim(),
     });
   }
@@ -1882,7 +1883,7 @@ function openReports(file = REPORTS_FILE) {
   return parseReports(readFile(file)).filter((r) => r.status === 'open');
 }
 
-function appendReport(file, { project, version, text }) {
+function appendReport(file, { project, version, text, blocking = false }) {
   const existing = exists(file) ? readFile(file) : REPORTS_HEADER;
   const n = parseReports(existing).reduce((max, r) => Math.max(max, Number(r.id.slice(2))), 0) + 1;
   const id = `R-${n}`;
@@ -1890,7 +1891,7 @@ function appendReport(file, { project, version, text }) {
   // A body line that starts "## " would parse as a header of its own: a forged
   // routed report would put one session's text in another app's check.
   const body = text.trim().replace(/^##/gm, '\\##');
-  const entry = `\n## ${id} ${date} ${project} (policy ${version}) — open\n\n${body}\n`;
+  const entry = `\n## ${id} ${date} ${project} (policy ${version}) — open${blocking ? ', blocking' : ''}\n\n${body}\n`;
   fs.writeFileSync(file, existing.replace(/\n*$/, '\n') + entry);
   return id;
 }
@@ -1898,7 +1899,7 @@ function appendReport(file, { project, version, text }) {
 function closeReport(file, id, resolution) {
   const text = readFile(file);
   const re = new RegExp(
-    `^(## ${id} \\S+ \\S+ \\(policy [^)]+\\)) — open(?:, routed to \\S+ \\S+)?$`,
+    `^(## ${id} \\S+ \\S+ \\(policy [^)]+\\)) — open(?:, blocking)?(?:, routed to \\S+ \\S+)?$`,
     'm',
   );
   if (!re.test(text)) return false;
@@ -1954,7 +1955,7 @@ function cmdReport(dir, rest, flags) {
     if (open.length === 0) ok('No open reports');
     for (const r of open) {
       console.log(
-        `  ${BOLD}${r.id}${RESET} ${r.date} ${r.project} (policy ${r.version})${r.routedTo ? ` ${DIM}→ routed to ${r.routedTo}${RESET}` : ''}`,
+        `  ${BOLD}${r.id}${RESET} ${r.date} ${r.project} (policy ${r.version})${r.blocking ? ` ${RED}blocking${RESET}` : ''}${r.routedTo ? ` ${DIM}→ routed to ${r.routedTo}${RESET}` : ''}`,
       );
       console.log(`    ${r.body.split('\n').join('\n    ')}`);
     }
@@ -2017,22 +2018,75 @@ function cmdReport(dir, rest, flags) {
     fail('Usage: policy report "<what you found>"   (or: policy report - <<EOF … EOF)');
     return finish();
   }
-  const project = path.basename(path.resolve(dir));
+  // The main checkout's folder, also from an agent worktree, so a blocking
+  // report holds the release of the project it came from.
+  const project = advisoryProjectName(dir);
   const version = historyRows(readFile(path.join(POLICY_ROOT, 'HISTORY.md')))[0] || 'unknown';
-  const id = appendReport(REPORTS_FILE, { project, version, text });
+  const blocking = flags.includes('--blocking');
+  const id = appendReport(REPORTS_FILE, { project, version, text, blocking });
   ok(
-    `${id} logged in ${path.relative(path.dirname(POLICY_ROOT), REPORTS_FILE)} for the next build-policy session`,
+    `${id} logged in ${path.relative(path.dirname(POLICY_ROOT), REPORTS_FILE)} for the next build-policy session` +
+      (blocking ? ', as blocking' : ''),
   );
-  console.log(`  ${DIM}No need to edit build-policy for this: carry on with the task.${RESET}`);
+  if (blocking)
+    console.log(
+      `  ${DIM}verify-ready --release in ${project} FAILs until a build-policy session fixes it and closes ${id}. ` +
+        `Everything else here carries on: tell the developer to open a build-policy session for it.${RESET}`,
+    );
+  else console.log(`  ${DIM}No need to edit build-policy for this: carry on with the task.${RESET}`);
   return finish();
+}
+
+/**
+ * Blocklisted terms in files mirror-sync copies verbatim (scripts/, templates/,
+ * tests/). The mirror check finds them only after a sync, in the public copy;
+ * here they show at session start, where they were written. Pure apart from
+ * the reads: takes the root and the terms.
+ */
+function privateMirroredLeaks(root, terms) {
+  const hits = [];
+  for (const sub of ['scripts', 'templates', 'tests']) {
+    const d = path.join(root, sub);
+    if (!exists(d)) continue;
+    for (const f of fs.readdirSync(d).filter((n) => !n.startsWith('.'))) {
+      const text = readFile(path.join(d, f));
+      for (const t of terms) if (t && text.includes(t)) hits.push(`${sub}/${f}: "${t}"`);
+    }
+  }
+  return hits;
+}
+
+function blocklistTerms(file = BLOCKLIST_PATH) {
+  return readFile(file)
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'))
+    .map((l) => (l.startsWith('!') ? l.slice(1) : l));
 }
 
 function auditPolicyRepo(root) {
   auditPolicyDocVersions(root, 'policy docs');
   {
+    const leaks = privateMirroredLeaks(root, blocklistTerms(path.join(root, 'mirror-blocklist.txt')));
+    if (leaks.length)
+      fail(
+        `Blocklisted term in a file the public mirror copies verbatim: ${leaks.slice(0, 4).join('; ')}` +
+          `${leaks.length > 4 ? '; …' : ''} — rewrite it generically (registry.json holds the real names)`,
+      );
+  }
+  {
     const all = openReports(path.join(root, 'REPORTS.md'));
-    const open = all.filter((r) => !r.routedTo);
-    const routed = all.length - open.length;
+    // A blocking report holds an app's release: it is this session's first job.
+    const blocking = all.filter((r) => r.blocking);
+    if (blocking.length)
+      fail(
+        `${blocking.length} blocking report(s) holding an app's release: ${blocking
+          .map((r) => `${r.id} ${r.project}`)
+          .join(', ')} — fix each here (policy report --list for the text), then close it: ` +
+          `policy report --close R-<n> "<what was done>", which releases that app's verify-ready --release`,
+      );
+    const open = all.filter((r) => !r.routedTo && !r.blocking);
+    const routed = all.filter((r) => r.routedTo).length;
     if (routed > 0)
       ok(`${routed} open report(s) routed to app sessions, listed by each app's check`);
     if (open.length > 0)
@@ -6724,6 +6778,21 @@ function cmdVerifyReady(dir, flags) {
     }
   }
 
+  // A blocking policy report from this project holds its release until a
+  // build-policy session fixes the gap and closes it (2.100). Without --release
+  // it is a warning: the rest of the work here is not waiting on it.
+  {
+    const project = advisoryProjectName(dir);
+    const held = openReports().filter((r) => r.blocking && r.project === project);
+    for (const r of held) {
+      const msg =
+        `${r.id} is a blocking policy report from this project, still open: ${r.body.split('\n')[0].slice(0, 160)} — ` +
+        `a build-policy session fixes it and closes ${r.id}`;
+      if (release) fail(msg);
+      else warn(msg);
+    }
+  }
+
   // 0. Releases are built from main. A branch is not where a shipped version
   // comes from, and the DMG build hook refuses one for the same reason.
   if (release) {
@@ -10532,7 +10601,8 @@ function cmdHookStop() {
  * product plan under a neutral name the blocklist could not see.
  *
  * The lifecycle, in .policy/owner.json:
- *   editing     the first session to write to build-policy claims it; only
+ *   editing     the first session opened in build-policy to write claims it
+ *               (since 2.100 a session opened elsewhere never claims); only
  *               that session may write until it hands off. Its Stop hook
  *               blocks while `check` fails and, for an app session, until it
  *               runs `policy handoff`.
@@ -10549,8 +10619,12 @@ const POLICY_WRITE_OP =
 // REPORTS.md is appended by app sessions through `policy report`, outside any
 // claim, so counting it kept a finished session's claim alive for a day and
 // refused the next build-policy session (2026-10-18).
+// tracked-advisories.json is the same: `policy advisory --track` writes it
+// from any session (2.99).
 function policyTreeDirty() {
-  return changedFiles(POLICY_ROOT).some((f) => !f.startsWith('.policy/') && f !== 'REPORTS.md');
+  return changedFiles(POLICY_ROOT).some(
+    (f) => !f.startsWith('.policy/') && f !== 'REPORTS.md' && f !== 'tracked-advisories.json',
+  );
 }
 
 function isUnderRoot(p, cwd, root) {
@@ -10744,14 +10818,23 @@ function refuse(reason) {
 }
 
 const APP_SESSION_REFUSAL =
-  `Do not edit build-policy from this session. If the gap you found should be fixed there, describe it in your final ` +
-  `message; the developer takes it to a build-policy session once the current change is committed.`;
+  `Do not edit build-policy from this session. Log the gap instead and carry on: ` +
+  `node ${path.join(POLICY_ROOT, 'scripts', 'policy.js')} report "<what you found>". If it blocks this project's ` +
+  `release and nothing in this project can unblock it (a false flag can usually be recorded as checked), add ` +
+  `--blocking: verify-ready --release here then FAILs until a build-policy session fixes it and closes the report. ` +
+  `Tell the developer to open a build-policy session for it.`;
 
 /** May this session write to build-policy? Claims it when free. Returns a refusal or null. */
 function claimPolicyRepo(input) {
   const owner = readJSON(POLICY_OWNER);
   const session = input.session_id || 'unknown';
   const inPolicySession = isUnderPolicyRoot(input.cwd || process.cwd());
+  // App sessions never claim (2.100). They could while the tree was clean, so
+  // a fix written for one app's release landed in build-policy with its
+  // follow-through (security ack, mirror sync, public history, leak scan)
+  // split across two sessions, and a product name reached a mirrored script.
+  if (!inPolicySession && (!owner || !policyTreeDirty() || owner.session !== session))
+    return `BUILD-POLICY: build-policy is changed only from a session opened in build-policy. ` + APP_SESSION_REFUSAL;
   if (!owner || !policyTreeDirty()) {
     fs.mkdirSync(path.dirname(POLICY_OWNER), { recursive: true });
     fs.writeFileSync(
@@ -10827,6 +10910,48 @@ function cmdHookPretool() {
   if (writesUnder(input, POLICY_ROOT)) {
     const refusal = claimPolicyRepo(input);
     if (refusal) refuse(refusal);
+  }
+  // A blocking report holds an app's release until a build-policy session has
+  // fixed the gap. `report --close` checks the directory it runs in, which a
+  // cd inside the command can move, so the hook checks the session instead:
+  // an app session cannot lift its own hold (2.100). Routing is a build-policy
+  // session's act in every case.
+  // Matched on the command with quotes and backslashes taken out (bash
+  // removes them too: --clo''se is --close, "R-"1 is R-1), by the word and
+  // the flag rather than by how policy.js is named. A close from outside that
+  // builds anything at run time ($, backtick, eval, source) is refused: what
+  // it closes cannot be read from the text.
+  const flat = cmd.replace(/['"\\]/g, '');
+  // A flag that bash expands (--cl{o,}se, --clos?) is not readable here either.
+  if (
+    input.tool_name === 'Bash' &&
+    !isUnderPolicyRoot(input.cwd || process.cwd()) &&
+    /policy\.js|\breport\b/.test(flat) &&
+    /(^|\s)--\S*[{}*?[]/.test(flat)
+  )
+    refuse(
+      `BUILD-POLICY: a policy.js flag with brace or glob characters, from a session opened outside build-policy, ` +
+        `is refused: write the flag out plainly.`,
+    );
+  if (input.tool_name === 'Bash' && /report/.test(flat) && /--(close|route)/.test(flat)) {
+    const inPolicySession = isUnderPolicyRoot(input.cwd || process.cwd());
+    if (!inPolicySession && /--route/.test(flat))
+      refuse(`BUILD-POLICY: reports are routed from a session opened in build-policy.`);
+    if (!inPolicySession && /--close/.test(flat)) {
+      const ids = flat.match(/\bR-\d+\b/g) || [];
+      const blocking = openReports().filter((r) => r.blocking && ids.includes(r.id));
+      if (/[$`]|\beval\b|\bsource\b|(^|[\s;&|])\.\s/.test(flat))
+        refuse(
+          `BUILD-POLICY: a report close from a session opened outside build-policy must name its report plainly ` +
+            `(no variables, substitutions, eval or source), so the hook can see it is not a blocking one.`,
+        );
+      if (blocking.length || !ids.length)
+        refuse(
+          `BUILD-POLICY: ${blocking.length ? blocking.map((r) => r.id).join(', ') + ' is a blocking report' : 'this close names no report id'}. ` +
+            `A blocking report is closed from a session opened in build-policy, once the gap is fixed there; ` +
+            `that is what releases this project's verify-ready --release.`,
+        );
+    }
   }
   // The AI drafts advisory exceptions in audit-exceptions.json; approving one
   // is the developer's decision (policy 2.59), so the AI may neither run
@@ -11485,6 +11610,9 @@ module.exports = {
   reportAdvisories,
   unfixedAdvisories,
   plainSummary,
+  privateMirroredLeaks,
+  blocklistTerms,
+  claimPolicyRepo,
   runSast,
   siteImageRefs,
   siteTrackedImages,

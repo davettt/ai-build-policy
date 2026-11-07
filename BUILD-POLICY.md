@@ -1,7 +1,7 @@
 # Build & Development Policy
 
-**Version:** 2.99
-**Last updated:** 2026-11-06
+**Version:** 2.100
+**Last updated:** 2026-11-07
 
 Single source of truth for how we build, maintain, and ship software. Every AI assistant (Claude, Codex, or other) and every human developer follows this workflow.
 
