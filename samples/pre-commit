@@ -1,0 +1,27 @@
+#!/bin/sh
+# Sample from the guidebook (MIT licence). It shows how I do the quick checks at commit;
+# read it and adapt it to your project rather than copying it as is.
+# See guide 1.1 and 9.2. Use as .git/hooks/pre-commit (chmod +x) or call it from husky.
+
+fail() { echo "pre-commit: $1" >&2; exit 1; }
+
+# 1. Secret scan of the STAGED content. Fail closed: no scanner means no commit.
+#    I use Betterleaks (guide 5.1); gitleaks is shown here because it is widely installed.
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks git --pre-commit --staged --no-banner || fail "secret scan failed"
+else
+  fail "no secret scanner found. Install gitleaks (or another scanner) and edit this hook to call it."
+fi
+
+# 2. Quick checks, only if the project defines them.
+command -v node >/dev/null 2>&1 || fail "node not found"
+[ -f package.json ] || fail "no package.json"
+has_script() { node -e 'process.exit((require("./package.json").scripts||{})[process.argv[1]]?0:1)' "$1" 2>/dev/null; }
+for s in lint format:check; do
+  if has_script "$s"; then
+    npm run --silent "$s" || fail "npm run $s failed"
+  fi
+done
+
+# 3. Marker check. Uncomment at step 9.3, once scripts/gates.js and scripts/verify-marker.js exist.
+# node scripts/verify-marker.js || exit 1

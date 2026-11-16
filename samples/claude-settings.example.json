@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "node scripts/stop-hook-changelog.js" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "node scripts/pretool-hook-clean-build.js" }] }
+    ]
+  }
+}

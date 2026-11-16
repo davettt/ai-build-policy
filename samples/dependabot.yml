@@ -1,0 +1,23 @@
+# Sample from the guidebook (MIT licence). It shows how I configure Dependabot with a
+# cooldown and grouping; read it and adapt it to your project rather than copying it as is.
+# See guide 4.3 and 4.4.
+version: 2
+updates:
+  - package-ecosystem: 'npm'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    # A new version waits 7 days before Dependabot proposes it: most malicious
+    # publishes are found and pulled within that window.
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: '*'
+        update-types: ['version-update:semver-major']
+    # Electron and electron-builder move together, so one PR carries both.
+    groups:
+      electron:
+        patterns:
+          - 'electron'
+          - 'electron-builder'
+    open-pull-requests-limit: 10

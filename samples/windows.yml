@@ -1,0 +1,48 @@
+# Sample from the guidebook (MIT licence). It shows how I check that a Windows build and its
+# unit tests pass in CI; read it and adapt it to your project rather than copying it as is.
+# See guide 6.6.
+name: Windows build
+
+# Proves the app builds and its unit tests pass on Windows, and that it
+# packages for Windows. It ships nothing: the package is unpacked (--dir),
+# unsigned, and never uploaded. Windows does not ship until the signing
+# decision is made; this job keeps the code Windows-clean until then, so
+# macOS-only calls are found as they are written.
+#
+# For Electron apps only. Lint, audit, secret scanning and the rest stay in
+# ci.yml on Linux; repeating them here would only double the minutes.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # .nvmrc, as in ci.yml: one file both sides read.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build
+        run: npm run build --if-present
+
+      - name: Unit tests
+        run: npm run test:unit --if-present
+
+      # No signing identity on the runner, and none is looked for.
+      - name: Package for Windows (unpacked, unsigned, not published)
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx --no-install electron-builder --win --dir --publish never

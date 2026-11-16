@@ -1,0 +1,64 @@
+# Sample from the guidebook (MIT licence). It shows how I run a smoke test once a deploy goes
+# live; read it and adapt it to your project rather than copying it as is.
+# See guide 3.2.
+name: Post-deploy checks
+
+# Production smoke test after every deploy. The host deploys from the push; this job waits until the live
+# site serves the pushed commit, then runs npm run smoke:prod against it.
+# The build writes /deploy.json with { "commit": "<sha>" } from the host's
+# build environment's commit variable, so the wait can tell the new deploy
+# from the old.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-prod:
+    runs-on: ubuntu-latest
+    env:
+      PLAYWRIGHT_BASE_URL: https://example.com
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Wait for the live deploy
+        env:
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          node <<'NODE'
+          const target = process.env.TARGET_SHA;
+          const url = `${process.env.PLAYWRIGHT_BASE_URL.replace(/\/$/, '')}/deploy.json`;
+          const deadline = Date.now() + 20 * 60 * 1000;
+          while (Date.now() < deadline) {
+            try {
+              const res = await fetch(`${url}?t=${Date.now()}`, { headers: { 'cache-control': 'no-cache' } });
+              if (res.ok) {
+                const { commit } = await res.json();
+                console.log(`Live commit: ${commit || 'missing'}`);
+                if (typeof commit === 'string' && commit.length >= 7 && target.startsWith(commit)) process.exit(0);
+              } else console.log(`${url} returned HTTP ${res.status}`);
+            } catch (e) {
+              console.log(`${url} not ready: ${e.message}`);
+            }
+            await new Promise((r) => setTimeout(r, 30 * 1000));
+          }
+          console.error(`Timed out waiting for ${url} to report ${target}`);
+          process.exit(1);
+          NODE
+
+      - name: Production smoke test
+        run: npm run smoke:prod
